@@ -1368,7 +1368,429 @@ class ServiceContainer:
 
 
 # ======================================================================
-# Layer 10: facade
+# Layer 10: the LLVM lowering backend
+# ======================================================================
+
+
+class LlvmToolchainUnavailable(GlyphPlatformError):
+    """The optional llvmlite binding is not importable in this interpreter."""
+
+
+class LlvmLoweringError(GlyphPlatformError):
+    """The GVM object module could not be lowered to the LLVM IR dialect."""
+
+
+@dataclass(frozen=True, slots=True)
+class TargetProfile:
+    """Static description of the machine the IR is being lowered for."""
+
+    triple: str = "x86_64-unknown-linux-gnu"
+    identifier: str = "glyph.canonical"
+    source_filename: str = "canonical.gsl"
+
+
+_ORIENTATION_ENCODING: Final[Mapping[Orientation, int]] = {
+    Orientation.ROW: 0,
+    Orientation.COLUMN: 1,
+}
+
+_LLVM_RUNTIME_TEMPLATE: Final[string.Template] = string.Template(
+    """
+@gvm.canvas = internal global [$CELLS x i8] zeroinitializer
+@lattice.zero = internal constant i32 0
+@lattice.apothem = internal constant i32 $APOTHEM
+@lattice.extremum = internal constant i32 $EXTREMUM
+@lattice.magnitude = internal constant i32 $ORDER
+
+declare i32 @putchar(i32)
+declare i32 @fflush(ptr)
+
+define internal ptr @gvm.cell(i32 %row, i32 %col) {
+entry:
+  %o0 = mul nsw i32 %row, $ORDER
+  %o1 = add nsw i32 %o0, %col
+  %o2 = sext i32 %o1 to i64
+  %slot = getelementptr inbounds [$CELLS x i8], ptr @gvm.canvas, i64 0, i64 %o2
+  ret ptr %slot
+}
+
+define internal void @gvm.emit_run(i32 %index, i32 %lo, i32 %hi, i32 %orient) {
+entry:
+  %cursor = alloca i32, align 4
+  store i32 %lo, ptr %cursor, align 4
+  br label %head
+
+head:
+  %cur = load i32, ptr %cursor, align 4
+  %more = icmp sle i32 %cur, %hi
+  br i1 %more, label %body, label %exit
+
+body:
+  %scalar = load i32, ptr %cursor, align 4
+  %isrow = icmp eq i32 %orient, 0
+  %row = select i1 %isrow, i32 %index, i32 %scalar
+  %col = select i1 %isrow, i32 %scalar, i32 %index
+  %slot = call ptr @gvm.cell(i32 %row, i32 %col)
+  store i8 1, ptr %slot, align 1
+  %bumped = add nsw i32 %scalar, 1
+  store i32 %bumped, ptr %cursor, align 4
+  br label %head
+
+exit:
+  ret void
+}
+
+define internal void @gvm.close_group() {
+entry:
+  %pass = alloca i32, align 4
+  %row = alloca i32, align 4
+  %col = alloca i32, align 4
+  store i32 0, ptr %pass, align 4
+  br label %pass.head
+
+pass.head:
+  %p = load i32, ptr %pass, align 4
+  %pmore = icmp slt i32 %p, $PASSES
+  br i1 %pmore, label %pass.body, label %pass.exit
+
+pass.body:
+  store i32 0, ptr %row, align 4
+  br label %row.head
+
+row.head:
+  %r = load i32, ptr %row, align 4
+  %rmore = icmp slt i32 %r, $ORDER
+  br i1 %rmore, label %row.body, label %row.exit
+
+row.body:
+  store i32 0, ptr %col, align 4
+  br label %col.head
+
+col.head:
+  %c = load i32, ptr %col, align 4
+  %cmore = icmp slt i32 %c, $ORDER
+  br i1 %cmore, label %col.body, label %col.exit
+
+col.body:
+  %cr = load i32, ptr %row, align 4
+  %cc = load i32, ptr %col, align 4
+  %src = call ptr @gvm.cell(i32 %cr, i32 %cc)
+  %ink = load i8, ptr %src, align 1
+  %lit = icmp ne i8 %ink, 0
+  br i1 %lit, label %col.mark, label %col.step
+
+col.mark:
+  %mr = load i32, ptr %row, align 4
+  %mc = load i32, ptr %col, align 4
+  %image.column = sub nsw i32 $DIAMETER, %mr
+  %dst = call ptr @gvm.cell(i32 %mc, i32 %image.column)
+  store i8 1, ptr %dst, align 1
+  br label %col.step
+
+col.step:
+  %cnow = load i32, ptr %col, align 4
+  %cnext = add nsw i32 %cnow, 1
+  store i32 %cnext, ptr %col, align 4
+  br label %col.head
+
+col.exit:
+  %rnow = load i32, ptr %row, align 4
+  %rnext = add nsw i32 %rnow, 1
+  store i32 %rnext, ptr %row, align 4
+  br label %row.head
+
+row.exit:
+  %pnow = load i32, ptr %pass, align 4
+  %pnext = add nsw i32 %pnow, 1
+  store i32 %pnext, ptr %pass, align 4
+  br label %pass.head
+
+pass.exit:
+  ret void
+}
+
+define internal void @gvm.render() {
+entry:
+  %row = alloca i32, align 4
+  %col = alloca i32, align 4
+  %last = alloca i32, align 4
+  store i32 0, ptr %row, align 4
+  br label %row.head
+
+row.head:
+  %r = load i32, ptr %row, align 4
+  %rmore = icmp slt i32 %r, $ORDER
+  br i1 %rmore, label %scan.init, label %row.done
+
+scan.init:
+  store i32 -1, ptr %last, align 4
+  store i32 0, ptr %col, align 4
+  br label %scan.head
+
+scan.head:
+  %sc = load i32, ptr %col, align 4
+  %smore = icmp slt i32 %sc, $ORDER
+  br i1 %smore, label %scan.body, label %scan.exit
+
+scan.body:
+  %sr = load i32, ptr %row, align 4
+  %sc2 = load i32, ptr %col, align 4
+  %sp = call ptr @gvm.cell(i32 %sr, i32 %sc2)
+  %sink = load i8, ptr %sp, align 1
+  %slit = icmp ne i8 %sink, 0
+  br i1 %slit, label %scan.mark, label %scan.step
+
+scan.mark:
+  %sc3 = load i32, ptr %col, align 4
+  store i32 %sc3, ptr %last, align 4
+  br label %scan.step
+
+scan.step:
+  %sc4 = load i32, ptr %col, align 4
+  %sc5 = add nsw i32 %sc4, 1
+  store i32 %sc5, ptr %col, align 4
+  br label %scan.head
+
+scan.exit:
+  store i32 0, ptr %col, align 4
+  br label %print.head
+
+print.head:
+  %pc = load i32, ptr %col, align 4
+  %lastv = load i32, ptr %last, align 4
+  %pmore = icmp sle i32 %pc, %lastv
+  br i1 %pmore, label %print.body, label %print.newline
+
+print.body:
+  %pc2 = load i32, ptr %col, align 4
+  %needsep = icmp sgt i32 %pc2, 0
+  br i1 %needsep, label %print.separator, label %print.cell
+
+print.separator:
+  %sepres = call i32 @putchar(i32 32)
+  br label %print.cell
+
+print.cell:
+  %pr = load i32, ptr %row, align 4
+  %pc3 = load i32, ptr %col, align 4
+  %pp = call ptr @gvm.cell(i32 %pr, i32 %pc3)
+  %pink = load i8, ptr %pp, align 1
+  %plit = icmp ne i8 %pink, 0
+  %glyph = select i1 %plit, i32 42, i32 32
+  %cellres = call i32 @putchar(i32 %glyph)
+  %pc4 = load i32, ptr %col, align 4
+  %pc5 = add nsw i32 %pc4, 1
+  store i32 %pc5, ptr %col, align 4
+  br label %print.head
+
+print.newline:
+  %nlres = call i32 @putchar(i32 10)
+  %rn = load i32, ptr %row, align 4
+  %rn2 = add nsw i32 %rn, 1
+  store i32 %rn2, ptr %row, align 4
+  br label %row.head
+
+row.done:
+  ret void
+}
+"""
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LlvmModule:
+    """A textual LLVM IR translation unit plus its provenance metadata."""
+
+    text: str
+    profile: TargetProfile
+    order: int
+
+    def __str__(self) -> str:
+        return self.text
+
+
+class _VirtualRegisterAllocator:
+    """Monotonic namer guaranteeing uniqueness of SSA value identifiers."""
+
+    def __init__(self, prefix: str = "g") -> None:
+        self._prefix = prefix
+        self._counter = itertools.count()
+
+    def fresh(self) -> str:
+        return f"%{self._prefix}{next(self._counter)}"
+
+
+class LlvmLoweringBackend:
+    """Translates GVM object code into an equivalent LLVM IR translation unit.
+
+    The backend performs abstract interpretation of the operand stack at
+    lowering time, materializing each stack slot either as an SSA register
+    reference or as a half-open interval descriptor, and emits a call into the
+    hand-written IR runtime for every side-effecting instruction.
+    """
+
+    def __init__(self, profile: TargetProfile | None = None) -> None:
+        self._profile = profile or TargetProfile()
+
+    @instrumented
+    def lower(self, module: ObjectModule) -> LlvmModule:
+        apothem = module.order // 2
+        runtime = _LLVM_RUNTIME_TEMPLATE.substitute(
+            ORDER=module.order,
+            CELLS=module.order * module.order,
+            APOTHEM=apothem,
+            EXTREMUM=module.order - 1,
+            DIAMETER=2 * apothem,
+            PASSES=max(1, module.symmetry_cardinality - 1),
+        )
+        header = "\n".join(
+            (
+                f"; ModuleID = '{self._profile.identifier}'",
+                f'source_filename = "{self._profile.source_filename}"',
+                f'target triple = "{self._profile.triple}"',
+            )
+        )
+        return LlvmModule(
+            text="\n".join((header, runtime, self._lower_entry_point(module), "")),
+            profile=self._profile,
+            order=module.order,
+        )
+
+    def _lower_entry_point(self, module: ObjectModule) -> str:
+        registers = _VirtualRegisterAllocator()
+        stack: list[tuple[str, ...]] = []
+        body: list[str] = []
+
+        for instruction in module.instructions:
+            match instruction:
+                case PushConstant(value=value):
+                    stack.append(("scalar", str(value)))
+                case LoadIntrinsic(name=name):
+                    destination = registers.fresh()
+                    body.append(
+                        f"  {destination} = load i32, ptr @lattice.{name}, align 4"
+                    )
+                    stack.append(("scalar", destination))
+                case BinaryAdd() | BinarySubtract():
+                    right, left = self._pop_scalar(stack), self._pop_scalar(stack)
+                    destination = registers.fresh()
+                    mnemonic = "add" if isinstance(instruction, BinaryAdd) else "sub"
+                    body.append(
+                        f"  {destination} = {mnemonic} nsw i32 {left}, {right}"
+                    )
+                    stack.append(("scalar", destination))
+                case MakeInterval():
+                    upper, lower = self._pop_scalar(stack), self._pop_scalar(stack)
+                    stack.append(("interval", lower, upper))
+                case EmitOrientedRun(orientation=orientation):
+                    interval = self._pop_interval(stack)
+                    index = self._pop_scalar(stack)
+                    body.append(
+                        f"  call void @gvm.emit_run(i32 {index}, "
+                        f"i32 {interval[0]}, i32 {interval[1]}, "
+                        f"i32 {_ORIENTATION_ENCODING[orientation]})"
+                    )
+                case CloseUnderGroup():
+                    body.append("  call void @gvm.close_group()")
+                case Halt():
+                    break
+                case _:
+                    raise LlvmLoweringError(f"unlowerable instruction {instruction!r}")
+
+        if stack:
+            raise LlvmLoweringError(f"abstract stack not drained: {stack!r}")
+
+        body.append("  call void @gvm.render()")
+        body.append(f"  {registers.fresh()} = call i32 @fflush(ptr null)")
+        body.append("  ret i32 0")
+        return "\n".join(("define i32 @main() {", "entry:", *body, "}"))
+
+    @staticmethod
+    def _pop_scalar(stack: list[tuple[str, ...]]) -> str:
+        if not stack or stack[-1][0] != "scalar":
+            raise LlvmLoweringError("expected a scalar on the abstract stack")
+        return stack.pop()[1]
+
+    @staticmethod
+    def _pop_interval(stack: list[tuple[str, ...]]) -> tuple[str, str]:
+        if not stack or stack[-1][0] != "interval":
+            raise LlvmLoweringError("expected an interval on the abstract stack")
+        _, lower, upper = stack.pop()
+        return lower, upper
+
+
+class LlvmToolchainService:
+    """Adapter over the optional llvmlite binding: verify, optimize, JIT, link."""
+
+    @functools.cached_property
+    def _binding(self) -> Any:
+        try:
+            import llvmlite.binding as binding
+        except ImportError as exc:
+            raise LlvmToolchainUnavailable(
+                "llvmlite is not installed; `-emit-llvm` still works, but "
+                "verification, optimization, JIT and object emission do not"
+            ) from exc
+        binding.initialize_native_target()
+        binding.initialize_native_asmprinter()
+        return binding
+
+    @property
+    def version(self) -> str:
+        return ".".join(str(part) for part in self._binding.llvm_version_info)
+
+    def _parse(self, module: LlvmModule) -> Any:
+        parsed = self._binding.parse_assembly(module.text)
+        parsed.verify()
+        return parsed
+
+    @instrumented
+    def verify(self, module: LlvmModule) -> str:
+        self._parse(module)
+        return f"LLVM {self.version}: module verified"
+
+    @instrumented
+    def optimize(self, module: LlvmModule, level: int = 2) -> LlvmModule:
+        binding = self._binding
+        parsed = self._parse(module)
+        tuning = binding.PipelineTuningOptions(speed_level=level)
+        builder = binding.PassBuilder(self._target_machine(), tuning)
+        builder.getModulePassManager().run(parsed, builder)
+        return LlvmModule(str(parsed), module.profile, module.order)
+
+    def _target_machine(self) -> Any:
+        target = self._binding.Target.from_default_triple()
+        return target.create_target_machine()
+
+    @instrumented
+    def emit_object(self, module: LlvmModule, path: str) -> str:
+        machine = self._target_machine()
+        with open(path, "wb") as handle:
+            handle.write(machine.emit_object(self._parse(module)))
+        return path
+
+    @instrumented
+    def emit_assembly(self, module: LlvmModule) -> str:
+        return self._target_machine().emit_assembly(self._parse(module))
+
+    @instrumented
+    def jit_execute(self, module: LlvmModule) -> int:
+        import ctypes
+
+        binding = self._binding
+        machine = self._target_machine()
+        parsed = self._parse(module)
+        with binding.create_mcjit_compiler(parsed, machine) as engine:
+            engine.finalize_object()
+            engine.run_static_constructors()
+            entry = engine.get_function_address("main")
+            if not entry:
+                raise LlvmToolchainUnavailable("JIT could not resolve @main")
+            return ctypes.CFUNCTYPE(ctypes.c_int)(entry)()
+
+
+# ======================================================================
+# Layer 11: facade
 # ======================================================================
 
 
@@ -1381,6 +1803,7 @@ class CompilationArtifacts:
     tree: Program
     model: SemanticModel
     module: ObjectModule
+    llvm: LlvmModule
     support: FrozenSet[Coordinate]
     rendering: str
 
@@ -1412,6 +1835,7 @@ def compile_and_execute(source: str) -> CompilationArtifacts:
         tree=tree,
         model=model,
         module=module,
+        llvm=LlvmLoweringBackend().lower(module),
         support=support,
         rendering=pipeline(context),
     )
@@ -1438,6 +1862,16 @@ def _selftest(orders: Sequence[int]) -> int:
         expected = reference_pattern(order)
         artifacts = synthesize(order).unwrap_or_raise()
         tiers = [("gvm", artifacts.rendering)]
+        try:
+            toolchain = LlvmToolchainService()
+            toolchain.verify(artifacts.llvm)
+            with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
+                binary = link_executable(
+                    artifacts.llvm.text, Path(scratch) / "glyph", 2
+                )
+                tiers.append(("native", _run(binary, "").rstrip("\n")))
+        except (LlvmToolchainUnavailable, OSError) as exc:
+            print(f"  n={order:<3} llvm tiers skipped: {exc}", file=sys.stderr)
         verdict = "ok"
         for label, produced in tiers:
             if produced != expected:
@@ -1456,6 +1890,15 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument("-S", "--emit-assembly", action="store_true")
     parser.add_argument("-T", "--emit-tokens", action="store_true")
+
+    backend = parser.add_argument_group("LLVM backend")
+    backend.add_argument("--emit-llvm", action="store_true")
+    backend.add_argument("--emit-native-assembly", action="store_true")
+    backend.add_argument("--emit-object", metavar="PATH")
+    backend.add_argument("--verify-llvm", action="store_true")
+    backend.add_argument("--jit", action="store_true")
+    backend.add_argument("-O", "--opt-level", type=int, choices=range(4), default=0)
+    backend.add_argument("--triple", default=TargetProfile().triple)
 
     parser.add_argument("--selftest", action="store_true")
     return parser.parse_args(argv)
@@ -1484,7 +1927,43 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.emit_assembly:
         print(artifacts.module.disassembly(), file=sys.stderr)
 
-    sys.stdout.write(artifacts.rendering + "\n")
+    backend_requested = any(
+        (
+            namespace.emit_llvm,
+            namespace.emit_native_assembly,
+            namespace.emit_object,
+            namespace.verify_llvm,
+            namespace.jit,
+            namespace.opt_level,
+        )
+    )
+    if not backend_requested:
+        sys.stdout.write(artifacts.rendering + "\n")
+        return 0
+
+    module = LlvmLoweringBackend(
+        TargetProfile(triple=namespace.triple)
+    ).lower(artifacts.module)
+    toolchain = LlvmToolchainService()
+    try:
+        if namespace.opt_level:
+            module = toolchain.optimize(module, namespace.opt_level)
+        if namespace.verify_llvm:
+            print(toolchain.verify(module), file=sys.stderr)
+        if namespace.emit_object:
+            print(
+                f"wrote {toolchain.emit_object(module, namespace.emit_object)}",
+                file=sys.stderr,
+            )
+        if namespace.emit_native_assembly:
+            sys.stdout.write(toolchain.emit_assembly(module))
+        if namespace.emit_llvm:
+            sys.stdout.write(module.text)
+        if namespace.jit:
+            return toolchain.jit_execute(module)
+    except LlvmToolchainUnavailable as exc:
+        print(f"llvm backend unavailable: {exc}", file=sys.stderr)
+        return 3
     return 0
 
 
