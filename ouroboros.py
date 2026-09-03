@@ -3112,6 +3112,22 @@ class Assembler:
         )
 
 
+def _packed(layout: str, value: int, field: str) -> bytes:
+    """``struct.pack``, but a value the field cannot hold is a diagnostic.
+
+    The container's integers are fixed width, so a program can be perfectly
+    well typed, lower cleanly and still not fit in the object format.  Naming
+    the field it overflowed is more use than a ``struct.error`` raised four
+    frames further down.
+    """
+    try:
+        return struct.pack(layout, value)
+    except struct.error as exc:
+        raise ObjectFormatError(
+            f"{field} {value} does not fit the container's {layout} field"
+        ) from exc
+
+
 class ObjectCodec:
     """Serialises and reloads modules through a checksummed binary container.
 
@@ -3148,23 +3164,25 @@ class ObjectCodec:
             encoded.append((instruction.opcode, argument))
 
         buffer = io.BytesIO()
+        buffer.write(OBJECT_MAGIC)
+        buffer.write(_packed("<B", OBJECT_FORMAT_VERSION, "container version"))
+        buffer.write(_packed("<H", module.order, "lattice order"))
         buffer.write(
-            self._HEADER.pack(
-                OBJECT_MAGIC, OBJECT_FORMAT_VERSION, module.order,
-                list(SymmetryFamily).index(module.family), module.cardinality, module.frame_size,
-            )
+            _packed("<B", list(SymmetryFamily).index(module.family), "symmetry family")
         )
-        buffer.write(struct.pack("<H", len(constants)))
+        buffer.write(_packed("<B", module.cardinality, "symmetry cardinality"))
+        buffer.write(_packed("<H", module.frame_size, "frame size"))
+        buffer.write(_packed("<H", len(constants), "constant pool size"))
         for value in constants:
-            buffer.write(struct.pack("<i", value))
-        buffer.write(struct.pack("<H", len(names)))
+            buffer.write(_packed("<i", value, "constant"))
+        buffer.write(_packed("<H", len(names), "name pool size"))
         for name in names:
             payload = name.encode("utf-8")
-            buffer.write(struct.pack("<B", len(payload)))
+            buffer.write(_packed("<B", len(payload), f"length of name {name!r}"))
             buffer.write(payload)
-        buffer.write(struct.pack("<I", len(encoded)))
+        buffer.write(_packed("<I", len(encoded), "instruction count"))
         for op, argument in encoded:
-            buffer.write(struct.pack("<Bi", op, argument))
+            buffer.write(_packed("<B", op, "opcode") + _packed("<i", argument, "operand"))
         body = buffer.getvalue()
         return body + struct.pack("<I", binascii.crc32(body) & 0xFFFFFFFF)
 
