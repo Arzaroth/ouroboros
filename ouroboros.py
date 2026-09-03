@@ -64,6 +64,7 @@ import itertools
 import logging
 import operator
 import os
+import random
 import re
 import shutil
 import string
@@ -2399,6 +2400,7 @@ class SemanticAnalyzer(AstVisitor[TypeTerm]):
         self._unifier.unify(variable, INT_TYPE)
         symbol = Symbol(node.name, SymbolKind.BINDING, INT_TYPE, self._allocate())
         self._scope.declare(symbol, node.position)
+        self._model.resolutions[id(node)] = symbol
         return self._annotate(node, UNIT_TYPE)
 
     def visit_stroke_declaration(self, node: StrokeDeclaration) -> TypeTerm:
@@ -2683,7 +2685,10 @@ class BytecodeEmitter(AstVisitor[None]):
         return None
 
     def visit_binding(self, node: Binding) -> None:
-        symbol = self._model.scope.resolve(node.name, node.position)
+        symbol = self._model.resolutions.get(node_id := id(node))
+        if symbol is None:  # pragma: no cover - defensive
+            raise CodeGenerationError(f"binding {node.name!r} was never resolved")
+        del node_id
         self.visit(node.value)
         self._emit(StoreLocal(symbol.slot))
 
@@ -4008,11 +4013,17 @@ class CompilationArtifacts:
 class SynthesisOrchestrator:
     """Drives every layer in order and collects the artefacts along the way."""
 
-    def __init__(self, configuration: Configuration, container: "ServiceContainer | None" = None) -> None:
+    def __init__(
+        self,
+        configuration: Configuration,
+        container: "ServiceContainer | None" = None,
+        source: str | None = None,
+    ) -> None:
         self._configuration = configuration
         self._flags = FeatureFlags(configuration)
         self._machine = PipelineStateMachine()
         self._container = container or self._compose()
+        self._source = source
 
     def _compose(self) -> ServiceContainer:
         container = ServiceContainer()
@@ -4041,8 +4052,10 @@ class SynthesisOrchestrator:
         started = time.perf_counter()
         order = int(self._configuration["lattice.order"])
         motif_key = str(self._configuration["motif"])
-        motif = typing.cast(type, Motif.lookup(motif_key))()
-        source = motif.source(order)
+        if self._source is not None:
+            source = self._source
+        else:
+            source = typing.cast(type, Motif.lookup(motif_key))().source(order)
 
         with self._machine.transition(PipelineStage.PREPROCESSED):
             unit = Preprocessor(source).run()
@@ -4295,6 +4308,24 @@ def synthesize(
         .build()
     )
     return Result.attempt(lambda: SynthesisOrchestrator(configuration).run())
+
+
+def synthesize_source(
+    source: str, order: int = DEFAULT_LATTICE_ORDER, **overrides: Any
+) -> Result[CompilationArtifacts]:
+    """Compiles and renders arbitrary GSL source rather than a registered motif."""
+    entries = {"lattice.order": str(order), "motif": "<source>"}
+    entries.update({key: str(value) for key, value in overrides.items()})
+    configuration = (
+        ConfigurationBuilder()
+        .with_defaults()
+        .with_environment()
+        .with_mapping("api-call", entries)
+        .build()
+    )
+    return Result.attempt(
+        lambda: SynthesisOrchestrator(configuration, source=source).run()
+    )
 
 
 # ======================================================================
@@ -4692,6 +4723,38 @@ class LlvmLoweringBackend:
         )
         return address
 
+    def _floor_divide(
+        self, body: list[str], registers: _VirtualRegisterAllocator, left: str, right: str
+    ) -> str:
+        """Emits flooring division, because the machine's oracle is Python.
+
+        ``sdiv`` truncates towards zero and ``//`` floors, so they part company
+        whenever exactly one operand is negative: -1 // 4 is -1, but sdiv gives
+        0.  Decrementing the quotient when the remainder is non-zero and its
+        sign differs from the divisor's recovers the interpreter's answer.
+        """
+        quotient = registers.fresh()
+        remainder = registers.fresh()
+        inexact = registers.fresh()
+        remainder_negative = registers.fresh()
+        divisor_negative = registers.fresh()
+        signs_differ = registers.fresh()
+        correct = registers.fresh()
+        decremented = registers.fresh()
+        result = registers.fresh()
+        body.append(f"  {quotient} = sdiv i64 {left}, {right}")
+        body.append(f"  {remainder} = srem i64 {left}, {right}")
+        body.append(f"  {inexact} = icmp ne i64 {remainder}, 0")
+        body.append(f"  {remainder_negative} = icmp slt i64 {remainder}, 0")
+        body.append(f"  {divisor_negative} = icmp slt i64 {right}, 0")
+        body.append(f"  {signs_differ} = xor i1 {remainder_negative}, {divisor_negative}")
+        body.append(f"  {correct} = and i1 {inexact}, {signs_differ}")
+        body.append(f"  {decremented} = sub nsw i64 {quotient}, 1")
+        body.append(
+            f"  {result} = select i1 {correct}, i64 {decremented}, i64 {quotient}"
+        )
+        return result
+
     def _truncate(self, body: list[str], registers: _VirtualRegisterAllocator, value: str) -> str:
         narrowed = registers.fresh()
         body.append(f"  {narrowed} = trunc i64 {value} to i32")
@@ -4786,18 +4849,21 @@ class LlvmLoweringBackend:
                 value = self._pop(body, registers)
                 address_register = self._frame_slot(body, registers, slot, frame)
                 body.append(f"  store i64 {value}, ptr {address_register}, align 8")
-            case BinaryAdd() | BinarySubtract() | BinaryMultiply() | BinaryDivide():
+            case BinaryAdd() | BinarySubtract() | BinaryMultiply():
                 mnemonic = {
                     BinaryAdd: "add nsw",
                     BinarySubtract: "sub nsw",
                     BinaryMultiply: "mul nsw",
-                    BinaryDivide: "sdiv",
                 }[type(instruction)]
                 right = self._pop(body, registers)
                 left = self._pop(body, registers)
                 result = registers.fresh()
                 body.append(f"  {result} = {mnemonic} i64 {left}, {right}")
                 self._push(body, registers, result)
+            case BinaryDivide():
+                right = self._pop(body, registers)
+                left = self._pop(body, registers)
+                self._push(body, registers, self._floor_divide(body, registers, left, right))
             case Negate():
                 operand = self._pop(body, registers)
                 result = registers.fresh()
@@ -4902,6 +4968,296 @@ class LlvmToolchainService:
             if not entry:
                 raise LlvmToolchainUnavailable("the JIT could not resolve @main")
             return ctypes.CFUNCTYPE(ctypes.c_int)(entry)()
+
+
+# ======================================================================
+# Layer 17: differential fuzzing
+# ======================================================================
+#
+# Every tier in this file claims to compute the same thing.  The assurance
+# suite checks that on one hand-written motif, which is the weakest possible
+# evidence.  This layer generates random glyph programs instead and asserts
+# that the interpreter, the threaded-code tier, the optimiser, the object
+# codec, the LLVM JIT and a linked native binary all agree on every one of
+# them.  Programs are generated valid by construction: intervals cannot be
+# degenerate, divisors cannot be zero, and every value stays far inside the
+# range where Python's arbitrary-precision integers and LLVM's wrapping
+# 64-bit arithmetic are obliged to agree.
+
+
+GENERATED_ORDERS: Final[tuple[int, ...]] = (3, 5, 7, 9, 11, 15)
+MAXIMUM_EXPRESSION_DEPTH: Final[int] = 3
+MAXIMUM_NESTING_DEPTH: Final[int] = 2
+
+
+class GslProgramGenerator:
+    """Emits random but always well-formed GSL translation units."""
+
+    def __init__(self, entropy: random.Random) -> None:
+        self._entropy = entropy
+        self._counter = itertools.count()
+        self._scopes: list[list[str]] = [[]]
+        self._strokes: list[list[str]] = [[]]
+
+    # -- naming and scope ----------------------------------------------
+
+    def _name(self, stem: str) -> str:
+        return f"{stem}{next(self._counter)}"
+
+    def _visible(self) -> tuple[str, ...]:
+        return tuple(name for scope in self._scopes for name in scope)
+
+    def _visible_strokes(self) -> tuple[str, ...]:
+        return tuple(name for scope in self._strokes for name in scope)
+
+    @contextmanager
+    def _nested(self) -> Iterator[None]:
+        self._scopes.append([])
+        self._strokes.append([])
+        try:
+            yield
+        finally:
+            self._scopes.pop()
+            self._strokes.pop()
+
+    # -- expressions ----------------------------------------------------
+
+    def _atom(self) -> str:
+        choices = list(INTRINSIC_NAMES) + [*self._visible()]
+        if self._entropy.random() < 0.4 or not choices:
+            return str(self._entropy.randint(0, 9))
+        return self._entropy.choice(choices)
+
+    def _expression(self, depth: int = 0) -> str:
+        if depth >= MAXIMUM_EXPRESSION_DEPTH or self._entropy.random() < 0.45:
+            return self._atom()
+        roll = self._entropy.random()
+        if roll < 0.12:
+            return f"- {self._expression(depth + 1)}"
+        if roll < 0.22:
+            # A literal divisor keeps the quotient defined for every input.
+            return f"( {self._expression(depth + 1)} / {self._entropy.randint(1, 4)} )"
+        symbol = self._entropy.choice(("+", "-", "*"))
+        left, right = self._expression(depth + 1), self._expression(depth + 1)
+        return f"( {left} {symbol} {right} )"
+
+    def _run(self) -> str:
+        orientation = self._entropy.choice([member.value for member in Orientation])
+        index = self._expression()
+        lower = self._expression()
+        width = self._entropy.randint(0, 4)
+        upper = lower if width == 0 else f"( {lower} + {width} )"
+        return f"{orientation} at {index} span {lower} .. {upper}"
+
+    # -- statements -----------------------------------------------------
+
+    def _statements(self, depth: int, budget: int) -> list[str]:
+        emitted: list[str] = []
+        for _ in range(budget):
+            emitted.extend(self._statement(depth))
+        return emitted
+
+    def _statement(self, depth: int) -> list[str]:
+        roll = self._entropy.random()
+        if roll < 0.22:
+            name = self._name("v")
+            line = f"let {name} = {self._expression()} ;"
+            self._scopes[-1].append(name)
+            return [line]
+        if roll < 0.50:
+            name = self._name("s")
+            declaration = f"stroke {name} = {self._run()} ;"
+            self._strokes[-1].append(name)
+            return [declaration, f"emit {name} ;"]
+        if roll < 0.60 and self._visible_strokes():
+            return [f"emit {self._entropy.choice(self._visible_strokes())} ;"]
+        if roll < 0.85 or depth >= MAXIMUM_NESTING_DEPTH:
+            return [f"paint {self._run()} ;"]
+        variable = self._name("i")
+        lower = self._entropy.randint(0, 3)
+        upper = lower + self._entropy.randint(0, 3)
+        with self._nested():
+            self._scopes[-1].append(variable)
+            body = self._statements(depth + 1, self._entropy.randint(1, 2))
+        return [
+            f"for {variable} in {lower} .. {upper} {{",
+            *(f"    {line}" for line in body),
+            "}",
+        ]
+
+    # -- translation units ----------------------------------------------
+
+    def generate(self) -> tuple[str, int]:
+        self._scopes, self._strokes = [[]], [[]]
+        order = self._entropy.choice(GENERATED_ORDERS)
+        family = self._entropy.choice([member.value for member in SymmetryFamily])
+        directives = []
+        if self._entropy.random() < 0.5:
+            directives = ["#define SPAN 4", "#pragma gsl 2"]
+        body = self._statements(0, self._entropy.randint(1, 4))
+        if not any(line.startswith(("emit", "paint")) for line in body):
+            body.append(f"paint {self._run()} ;")
+        lines = [
+            *directives,
+            f"lattice order {order} ;",
+            f"symmetry {family} 4 about centroid ;",
+            *body,
+        ]
+        return "\n".join(lines) + "\n", order
+
+
+def _capture_native_stdout(action: Callable[[], Any]) -> str:
+    """Runs ``action`` with file descriptor 1 redirected into a temporary file.
+
+    The JIT writes through C stdio, which Python's ``sys.stdout`` cannot see,
+    so the descriptor itself has to be rebound for the duration of the call.
+    """
+    sys.stdout.flush()
+    saved = os.dup(1)
+    with tempfile.TemporaryFile(mode="w+b") as sink:
+        os.dup2(sink.fileno(), 1)
+        try:
+            action()
+        finally:
+            sys.stdout.flush()
+            os.dup2(saved, 1)
+            os.close(saved)
+        sink.seek(0)
+        return sink.read().decode()
+
+
+@dataclass(frozen=True, slots=True)
+class FuzzFinding:
+    """One generated program on which two tiers disagreed."""
+
+    case: int
+    tier: str
+    source: str
+    expected: str
+    produced: str
+
+    def render(self) -> str:
+        return "\n".join(
+            (
+                f"case {self.case}: tier {self.tier!r} disagreed with the interpreter",
+                "--- source ---",
+                self.source.rstrip(),
+                "--- interpreter ---",
+                self.expected,
+                f"--- {self.tier} ---",
+                self.produced,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FuzzReport:
+    executed: int
+    tiers: tuple[str, ...]
+    comparisons: int
+    findings: tuple[FuzzFinding, ...]
+    skipped: tuple[str, ...]
+
+    @property
+    def clean(self) -> bool:
+        return not self.findings
+
+    def render(self) -> str:
+        lines = [
+            f"{self.executed} program(s), {self.comparisons} cross-tier comparison(s) "
+            f"over {', '.join(self.tiers)}"
+        ]
+        for skip in self.skipped:
+            lines.append(f"  skipped: {skip}")
+        if self.clean:
+            lines.append("  [ok]   every tier agreed on every generated program")
+        else:
+            lines.append(f"  [FAIL] {len(self.findings)} disagreement(s)")
+            lines.extend(finding.render() for finding in self.findings)
+        return "\n".join(lines)
+
+
+class DifferentialFuzzer:
+    """Cross-checks every execution tier against the plain interpreter."""
+
+    def __init__(self, seed: int = 0, native: bool = False) -> None:
+        self._entropy = random.Random(seed)
+        self._generator = GslProgramGenerator(self._entropy)
+        self._native = native
+
+    def _render(self, source: str, order: int, **flags: Any) -> str:
+        return synthesize_source(source, order, **flags).unwrap_or_raise().rendering
+
+    @woven
+    def run(self, iterations: int = 100) -> FuzzReport:
+        findings: list[FuzzFinding] = []
+        skipped: list[str] = []
+        tiers = ["interpreter", "threaded", "optimised", "round-tripped"]
+        toolchain: LlvmToolchainService | None = None
+        try:
+            toolchain = LlvmToolchainService()
+            toolchain.version
+            tiers.append("jit")
+            if self._native:
+                tiers.append("native")
+        except LlvmToolchainUnavailable as exc:
+            toolchain = None
+            skipped.append(f"llvm tiers ({exc})")
+
+        comparisons = 0
+        executed = 0
+        for case in range(iterations):
+            source, order = self._generator.generate()
+            baseline = self._render(
+                source, order, optimise="false", jit="false", roundtrip="false"
+            )
+            executed += 1
+            variants: list[tuple[str, Callable[[], str]]] = [
+                ("threaded", lambda: self._render(
+                    source, order, optimise="false", jit="true", roundtrip="false")),
+                ("optimised", lambda: self._render(
+                    source, order, optimise="true", jit="false", roundtrip="false")),
+                ("round-tripped", lambda: self._render(
+                    source, order, optimise="true", jit="true", roundtrip="true")),
+            ]
+            if toolchain is not None:
+                variants.append(("jit", lambda: self._through_llvm(source, order, toolchain)))
+                if self._native:
+                    variants.append(("native", lambda: self._through_native(source, order)))
+
+            for label, produce in variants:
+                comparisons += 1
+                produced = produce()
+                if produced != baseline:
+                    findings.append(
+                        FuzzFinding(case, label, source, baseline, produced)
+                    )
+        return FuzzReport(
+            executed, tuple(tiers), comparisons, tuple(findings), tuple(skipped)
+        )
+
+    def _module_for(self, source: str, order: int) -> LlvmModule:
+        artifacts = synthesize_source(source, order).unwrap_or_raise()
+        return LlvmLoweringBackend().lower(artifacts.module)
+
+    def _through_llvm(
+        self, source: str, order: int, toolchain: LlvmToolchainService
+    ) -> str:
+        module = self._module_for(source, order)
+        return _capture_native_stdout(
+            lambda: toolchain.jit_execute(module)
+        ).removesuffix("\n")
+
+    def _through_native(self, source: str, order: int) -> str:
+        module = self._module_for(source, order)
+        with tempfile.TemporaryDirectory(prefix="ouroboros-fuzz-") as scratch:
+            binary = link_executable(module.text, Path(scratch) / "case", 2)
+            return _run(binary, "").removesuffix("\n")
+
+
+def fuzz(iterations: int = 100, seed: int = 0, native: bool = False) -> FuzzReport:
+    """Generates ``iterations`` random programs and cross-checks every tier."""
+    return DifferentialFuzzer(seed, native).run(iterations)
 
 
 # ======================================================================
@@ -7530,7 +7886,7 @@ def bootstrap(workdir: Path | None = None, opt_level: int = 2) -> BootstrapRepor
         stage1_ir=stage1_ir,
         stage2_ir=stage2_ir,
         stage3_ir=stage3_ir,
-        glyph=_run(glyph, "").rstrip("\n"),
+        glyph=_run(glyph, "").removesuffix("\n"),
     )
 
 
@@ -7562,7 +7918,7 @@ def _selftest(orders: Sequence[int]) -> int:
             toolchain.verify(module)
             with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
                 binary = link_executable(module.text, Path(scratch) / "glyph", 2)
-                tiers.append(("native", _run(binary, "").rstrip("\n")))
+                tiers.append(("native", _run(binary, "").removesuffix("\n")))
         except (LlvmToolchainUnavailable, OSError) as exc:
             print(f"  n={order:<3} llvm tiers skipped: {exc}", file=sys.stderr)
         verdict = "ok"
@@ -7642,6 +7998,11 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot.add_argument("--workdir", metavar="PATH")
     boot.add_argument("--emit-gsl2", choices=("gslc", "glyph"))
     boot.add_argument("--selftest", action="store_true")
+
+    fuzzing = parser.add_argument_group("differential fuzzing")
+    fuzzing.add_argument("--fuzz", type=int, metavar="N", help="cross-check N random programs")
+    fuzzing.add_argument("--fuzz-seed", type=int, default=0)
+    fuzzing.add_argument("--fuzz-native", action="store_true", help="also link and run each case")
     return parser.parse_args(argv)
 
 
@@ -7708,6 +8069,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))
+    if namespace.fuzz is not None:
+        report = fuzz(namespace.fuzz, namespace.fuzz_seed, namespace.fuzz_native)
+        print(report.render())
+        return 0 if report.clean else 1
     if namespace.bootstrap:
         try:
             workdir = Path(namespace.workdir) if namespace.workdir else None
