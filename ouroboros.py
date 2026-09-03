@@ -52,12 +52,20 @@
           the same compiler: for any program either accepts, both emit the
           same bytes.
 
+  tier 5  machine code          layer 18 drops the toolchain: no llvmlite, no
+          assembler, no linker, no libc.  The object module is encoded as
+          x86-64 directly - the operand stack is the hardware stack, the
+          canvas is .bss - and wrapped in a static ELF64 executable by hand.
+          A little over a kilobyte, and all it asks of the world is write(2)
+          and exit_group(2).
+
     python3 ouroboros.py                 render via the virtual machine
     python3 ouroboros.py --emit-llvm     lower the program to LLVM IR
     python3 ouroboros.py --jit           JIT-execute that IR
     python3 ouroboros.py --bootstrap     run the full self-hosting bootstrap
     python3 ouroboros.py --close-the-loop    compile the glyph with the
                                              front end written in GSL-2
+    python3 ouroboros.py --emit-elf PATH  write a static executable, no toolchain
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -5236,6 +5244,17 @@ class DifferentialFuzzer:
             toolchain = None
             skipped.append(f"llvm tiers ({exc})")
 
+        machine = False
+        if machine_code_runnable():
+            try:
+                self._through_machine(synthesize(3).unwrap_or_raise().module, scratch)
+                tiers.append("elf")
+                machine = True
+            except (GlyphPlatformError, OSError) as exc:
+                skipped.append(f"elf tier ({exc})")
+        else:
+            skipped.append("elf tier (this host cannot run x86-64 Linux binaries)")
+
         front_end: Path | None = None
         if self._front_end and toolchain is not None:
             try:
@@ -5264,6 +5283,11 @@ class DifferentialFuzzer:
                 variants.append(("jit", lambda: self._through_llvm(source, order, toolchain)))
                 if self._native:
                     variants.append(("native", lambda: self._through_native(source, order)))
+            if machine:
+                variants.append(
+                    ("elf", lambda: self._through_machine(
+                        self._object_for(source, order), scratch))
+                )
             if front_end is not None:
                 # The front end's claim is byte equality with layer 16, which is
                 # stronger than agreeing on the glyph, so both are checked.
@@ -5290,9 +5314,14 @@ class DifferentialFuzzer:
             executed, tuple(tiers), comparisons, tuple(findings), tuple(skipped)
         )
 
+    def _object_for(self, source: str, order: int) -> ObjectModule:
+        return synthesize_source(source, order).unwrap_or_raise().module
+
     def _module_for(self, source: str, order: int) -> LlvmModule:
-        artifacts = synthesize_source(source, order).unwrap_or_raise()
-        return LlvmLoweringBackend().lower(artifacts.module)
+        return LlvmLoweringBackend().lower(self._object_for(source, order))
+
+    def _through_machine(self, module: ObjectModule, scratch: Path) -> str:
+        return _run(write_executable(module, scratch / "machine"), "").removesuffix("\n")
 
     def _through_llvm(
         self, source: str, order: int, toolchain: LlvmToolchainService
@@ -10439,6 +10468,687 @@ def close_the_loop(
 
 
 # ======================================================================
+# Tier 5: straight to the machine
+# ======================================================================
+#
+# Layer 18 drops the toolchain.  No llvmlite, no assembler, no linker, no
+# libc: the object module is encoded as x86-64 machine code and wrapped in an
+# ELF64 executable here, by hand, and the only thing the result asks of the
+# world is two system calls.  A few kilobytes of the standard library stand
+# between the glyph program and a file the kernel will run.
+
+
+class MachineCodeError(GlyphPlatformError):
+    """The object module could not be encoded for this machine."""
+
+
+class Register(enum.IntEnum):
+    """The sixteen general-purpose registers, in their encoding order."""
+
+    RAX = 0
+    RCX = 1
+    RDX = 2
+    RBX = 3
+    RSP = 4
+    RBP = 5
+    RSI = 6
+    RDI = 7
+    R8 = 8
+    R9 = 9
+    R10 = 10
+    R11 = 11
+    R12 = 12
+    R13 = 13
+    R14 = 14
+    R15 = 15
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryOperand:
+    """base + index * scale + displacement, always encoded through a SIB byte."""
+
+    base: Register
+    index: Register | None = None
+    scale: int = 1
+    displacement: int = 0
+
+
+CONDITION_CODES: Final[Mapping[str, int]] = {
+    "o": 0x0, "no": 0x1, "b": 0x2, "ae": 0x3, "e": 0x4, "ne": 0x5,
+    "be": 0x6, "a": 0x7, "s": 0x8, "ns": 0x9, "p": 0xA, "np": 0xB,
+    "l": 0xC, "ge": 0xD, "le": 0xE, "g": 0xF,
+}
+
+SCALE_ENCODING: Final[Mapping[int, int]] = {1: 0, 2: 1, 4: 2, 8: 3}
+
+
+class X86Assembler:
+    """An x86-64 encoder: the instructions the machine needs, and no more.
+
+    Not to be confused with layer 9's :class:`Assembler`, which resolves the
+    virtual machine's labels.  This one resolves x86 branch displacements and
+    emits octets.  Memory operands always take the SIB form with a 32-bit
+    displacement, which costs a few bytes per instruction and removes every
+    special case from the ModRM encoding.
+    """
+
+    def __init__(self) -> None:
+        self._code = bytearray()
+        self._labels: dict[str, int] = {}
+        self._fixups: list[tuple[int, str]] = []
+
+    def __len__(self) -> int:
+        return len(self._code)
+
+    # -- labels and relocation -------------------------------------------
+
+    def label(self, name: str) -> None:
+        if name in self._labels:
+            raise MachineCodeError(f"duplicate label {name!r}")
+        self._labels[name] = len(self._code)
+
+    def link(self) -> bytes:
+        """Patches every forward and backward branch, then freezes the text."""
+        for site, name in self._fixups:
+            try:
+                target = self._labels[name]
+            except KeyError as exc:
+                raise MachineCodeError(f"unresolved branch target {name!r}") from exc
+            struct.pack_into("<i", self._code, site, target - (site + 4))
+        return bytes(self._code)
+
+    def _displacement(self, name: str) -> None:
+        self._fixups.append((len(self._code), name))
+        self._code.extend(b"\0\0\0\0")
+
+    # -- encoding ---------------------------------------------------------
+
+    def _emit(self, *octets: int) -> None:
+        self._code.extend(octets)
+
+    def _modrm(self, reg: int, rm: Register | MemoryOperand) -> tuple[int, bytes]:
+        """Returns the REX.RXB bits and the ModRM, SIB and displacement bytes."""
+        rex = 0x4 if reg >= 8 else 0
+        if isinstance(rm, Register):
+            if rm >= 8:
+                rex |= 0x1
+            return rex, bytes((0xC0 | ((reg & 7) << 3) | (rm & 7),))
+        if rm.base >= 8:
+            rex |= 0x1
+        index = 0b100
+        if rm.index is not None:
+            if rm.index is Register.RSP:
+                raise MachineCodeError("rsp cannot be an index register")
+            if rm.index >= 8:
+                rex |= 0x2
+            index = rm.index & 7
+        try:
+            displacement = struct.pack("<i", rm.displacement)
+        except struct.error as exc:
+            raise MachineCodeError(f"displacement {rm.displacement} exceeds 32 bits") from exc
+        return rex, bytes((
+            0x80 | ((reg & 7) << 3) | 0b100,
+            (SCALE_ENCODING[rm.scale] << 6) | (index << 3) | (rm.base & 7),
+        )) + displacement
+
+    def _quad(self, opcode: Sequence[int], reg: int, rm: Register | MemoryOperand) -> None:
+        """A 64-bit operation: REX.W is always present."""
+        rex, tail = self._modrm(reg, rm)
+        self._emit(0x48 | rex, *opcode)
+        self._code.extend(tail)
+
+    def _octet(self, opcode: Sequence[int], reg: int, rm: Register | MemoryOperand) -> None:
+        """An 8-bit operation: REX appears only when an operand demands it."""
+        rex, tail = self._modrm(reg, rm)
+        if rex:
+            self._emit(0x40 | rex)
+        self._emit(*opcode)
+        self._code.extend(tail)
+
+    def _signed(self, value: int, width: str) -> bytes:
+        try:
+            return struct.pack(width, value)
+        except struct.error as exc:
+            raise MachineCodeError(f"literal {value} does not fit the operand") from exc
+
+    # -- data movement ----------------------------------------------------
+
+    def load(self, destination: Register, source: Register | MemoryOperand) -> None:
+        self._quad((0x8B,), destination, source)
+
+    def store(self, destination: Register | MemoryOperand, source: Register) -> None:
+        self._quad((0x89,), source, destination)
+
+    def immediate(self, destination: Register, value: int) -> None:
+        self._emit(0x48 | (0x1 if destination >= 8 else 0), 0xB8 | (destination & 7))
+        self._code.extend(self._signed(value, "<q"))
+
+    def load_octet(self, destination: Register, source: MemoryOperand) -> None:
+        self._octet((0x8A,), destination, source)
+
+    def store_octet(self, destination: MemoryOperand, source: Register) -> None:
+        self._octet((0x88,), source, destination)
+
+    def store_octet_immediate(self, destination: MemoryOperand, value: int) -> None:
+        self._octet((0xC6,), 0, destination)
+        self._emit(value & 0xFF)
+
+    def widen_octet(self, destination: Register, source: Register | MemoryOperand) -> None:
+        self._quad((0x0F, 0xB6), destination, source)
+
+    def address_of(self, destination: Register, source: MemoryOperand) -> None:
+        self._quad((0x8D,), destination, source)
+
+    def push(self, register: Register) -> None:
+        if register >= 8:
+            self._emit(0x41)
+        self._emit(0x50 | (register & 7))
+
+    def pop(self, register: Register) -> None:
+        if register >= 8:
+            self._emit(0x41)
+        self._emit(0x58 | (register & 7))
+
+    # -- arithmetic -------------------------------------------------------
+
+    _DIRECT: Final[Mapping[str, int]] = {
+        "add": 0x03, "or": 0x0B, "and": 0x23, "sub": 0x2B, "xor": 0x33, "cmp": 0x3B,
+    }
+    _EXTENSION: Final[Mapping[str, int]] = {
+        "add": 0, "or": 1, "and": 4, "sub": 5, "xor": 6, "cmp": 7,
+    }
+
+    def arithmetic(
+        self, operation: str, destination: Register, source: Register | MemoryOperand
+    ) -> None:
+        self._quad((self._DIRECT[operation],), destination, source)
+
+    def arithmetic_immediate(
+        self, operation: str, destination: Register | MemoryOperand, value: int
+    ) -> None:
+        self._quad((0x81,), self._EXTENSION[operation], destination)
+        self._code.extend(self._signed(value, "<i"))
+
+    def compare_octet_immediate(self, destination: MemoryOperand, value: int) -> None:
+        self._octet((0x80,), 7, destination)
+        self._emit(value & 0xFF)
+
+    def multiply(self, destination: Register, source: Register | MemoryOperand) -> None:
+        self._quad((0x0F, 0xAF), destination, source)
+
+    def multiply_immediate(
+        self, destination: Register, source: Register | MemoryOperand, value: int
+    ) -> None:
+        self._quad((0x69,), destination, source)
+        self._code.extend(self._signed(value, "<i"))
+
+    def divide(self, divisor: Register | MemoryOperand) -> None:
+        self._quad((0xF7,), 7, divisor)
+
+    def sign_extend(self) -> None:
+        self._emit(0x48, 0x99)
+
+    def negate(self, destination: Register | MemoryOperand) -> None:
+        self._quad((0xF7,), 3, destination)
+
+    def increment(self, destination: Register | MemoryOperand) -> None:
+        self._quad((0xFF,), 0, destination)
+
+    def decrement(self, destination: Register | MemoryOperand) -> None:
+        self._quad((0xFF,), 1, destination)
+
+    def test(self, left: Register, right: Register | MemoryOperand) -> None:
+        self._quad((0x85,), left, right)
+
+    def set_if(self, condition: str, destination: Register | MemoryOperand) -> None:
+        self._octet((0x0F, 0x90 | CONDITION_CODES[condition]), 0, destination)
+
+    # -- control flow -----------------------------------------------------
+
+    def jump(self, name: str) -> None:
+        self._emit(0xE9)
+        self._displacement(name)
+
+    def jump_if(self, condition: str, name: str) -> None:
+        self._emit(0x0F, 0x80 | CONDITION_CODES[condition])
+        self._displacement(name)
+
+    def call(self, name: str) -> None:
+        self._emit(0xE8)
+        self._displacement(name)
+
+    def ret(self) -> None:
+        self._emit(0xC3)
+
+    def syscall(self) -> None:
+        self._emit(0x0F, 0x05)
+
+
+IMAGE_BASE: Final[int] = 0x400000
+DATA_BASE: Final[int] = 0x600000
+PAGE_SIZE: Final[int] = 0x1000
+SYS_WRITE: Final[int] = 1
+SYS_EXIT_GROUP: Final[int] = 231
+DATA_REGISTER: Final[Register] = Register.R15
+
+
+def _align_up(value: int, boundary: int) -> int:
+    return (value + boundary - 1) // boundary * boundary
+
+
+@dataclass(frozen=True, slots=True)
+class DataLayout:
+    """Where the canvas, the frame and the output buffer sit inside .bss."""
+
+    canvas: int
+    snapshot: int
+    frame: int
+    output: int
+    size: int
+
+    @classmethod
+    def of(cls, order: int, frame_size: int) -> "DataLayout":
+        cells = order * order
+        frame = _align_up(2 * cells, 8)
+        output = frame + frame_size * 8
+        return cls(0, cells, frame, output, output + 2 * cells + order + 16)
+
+
+class NativeCodeBackend:
+    """Encodes a linked object module as x86-64 machine code.
+
+    The operand stack is the hardware stack, so a push is a push and the
+    register allocation problem never arises.  The runtime routines are
+    reached by ``call``, whose return address lands on that same stack and is
+    taken off again by ``ret``, leaving it balanced across the call.  Every
+    other piece of state - canvas, snapshot, frame, output buffer - lives in
+    .bss at a fixed address the prologue puts in r15, so the text needs no
+    relocation beyond its own branches.
+    """
+
+    ORIENTATION_ENCODING: ClassVar[Mapping[Orientation, int]] = {
+        Orientation.ROW: 0,
+        Orientation.COLUMN: 1,
+        Orientation.DIAGONAL: 2,
+        Orientation.ANTIDIAGONAL: 3,
+    }
+
+    def __init__(self, module: ObjectModule) -> None:
+        self._module = module
+        self._order = module.order
+        self._cells = module.order * module.order
+        self._apothem = module.order // 2
+        self._frame = max(module.frame_size, 1)
+        self._layout = DataLayout.of(self._order, self._frame)
+        self._group = SymmetryGroup.generated_by(
+            module.family.generators,
+            Coordinate(self._apothem, self._apothem),
+            module.symmetry_order,
+            presentation=f"{module.family.value}-{module.cardinality} about centroid",
+        )
+
+    @property
+    def layout(self) -> DataLayout:
+        return self._layout
+
+    def _canvas(self, index: Register) -> MemoryOperand:
+        return MemoryOperand(DATA_REGISTER, index, 1, self._layout.canvas)
+
+    def _snapshot(self, index: Register) -> MemoryOperand:
+        return MemoryOperand(DATA_REGISTER, index, 1, self._layout.snapshot)
+
+    def _slot(self, slot: int) -> MemoryOperand:
+        return MemoryOperand(DATA_REGISTER, None, 1, self._layout.frame + slot * 8)
+
+    @woven
+    def encode(self) -> bytes:
+        """The whole text section: entry point, instruction stream, runtime."""
+        with TRACER.span("encode", order=self._order):
+            text = X86Assembler()
+            text.label("_start")
+            text.immediate(DATA_REGISTER, DATA_BASE)
+            for address, instruction in enumerate(self._module.instructions):
+                text.label(f"A{address}")
+                self._instruction(text, instruction, address)
+            text.label("exit")
+            text.call("render")
+            text.immediate(Register.RAX, SYS_EXIT_GROUP)
+            text.arithmetic("xor", Register.RDI, Register.RDI)
+            text.syscall()
+            self._paint(text)
+            self._emit_run(text)
+            self._snapshot_routine(text)
+            self._apply(text)
+            self._render(text)
+            METRICS.increment("machine.instructions", len(self._module.instructions))
+            return text.link()
+
+    # -- the instruction stream -------------------------------------------
+    #
+    # Blocks are laid out in address order, so an instruction that falls
+    # through to the next one needs no branch at all.
+
+    def _instruction(
+        self, text: X86Assembler, instruction: Instruction, address: int
+    ) -> None:
+        match instruction:
+            case Halt():
+                text.jump("exit")
+            case Jump(target=target):
+                text.jump(f"A{int(target)}")
+            case JumpIfFalse(target=target):
+                text.pop(Register.RAX)
+                text.test(Register.RAX, Register.RAX)
+                text.jump_if("e", f"A{int(target)}")
+            case PushConstant(value=value):
+                text.immediate(Register.RAX, value)
+                text.push(Register.RAX)
+            case LoadIntrinsic(name=name):
+                text.immediate(Register.RAX, self._intrinsic(name))
+                text.push(Register.RAX)
+            case LoadLocal(slot=slot):
+                text.load(Register.RAX, self._slot(slot))
+                text.push(Register.RAX)
+            case StoreLocal(slot=slot):
+                text.pop(Register.RAX)
+                text.store(self._slot(slot), Register.RAX)
+            case BinaryAdd() | BinarySubtract() | BinaryMultiply():
+                text.pop(Register.RCX)
+                text.pop(Register.RAX)
+                if isinstance(instruction, BinaryMultiply):
+                    text.multiply(Register.RAX, Register.RCX)
+                else:
+                    operation = "add" if isinstance(instruction, BinaryAdd) else "sub"
+                    text.arithmetic(operation, Register.RAX, Register.RCX)
+                text.push(Register.RAX)
+            case BinaryDivide():
+                self._floor_divide(text, address)
+            case Negate():
+                text.pop(Register.RAX)
+                text.negate(Register.RAX)
+                text.push(Register.RAX)
+            case CompareLessEqual():
+                text.pop(Register.RCX)
+                text.pop(Register.RAX)
+                text.arithmetic("cmp", Register.RAX, Register.RCX)
+                text.set_if("le", Register.RAX)
+                text.widen_octet(Register.RAX, Register.RAX)
+                text.push(Register.RAX)
+            case MakeInterval():
+                pass
+            case EmitOrientedRun(orientation=orientation):
+                text.pop(Register.RCX)
+                text.pop(Register.RDX)
+                text.pop(Register.RSI)
+                text.immediate(Register.RDI, self.ORIENTATION_ENCODING[orientation])
+                text.call("emit_run")
+            case CloseUnderGroup():
+                text.call("snapshot")
+                for element in self._group.elements:
+                    linear = element.linear
+                    text.immediate(Register.RDI, linear.a)
+                    text.immediate(Register.RSI, linear.b)
+                    text.immediate(Register.RDX, linear.c)
+                    text.immediate(Register.RCX, linear.d)
+                    text.call("apply")
+            case _:
+                raise MachineCodeError(f"unencodable instruction {instruction!r}")
+
+    def _intrinsic(self, name: str) -> int:
+        try:
+            return {
+                "zero": 0,
+                "apothem": self._apothem,
+                "extremum": self._order - 1,
+                "magnitude": self._order,
+            }[name]
+        except KeyError as exc:
+            raise MachineCodeError(f"unbound intrinsic {name!r}") from exc
+
+    def _floor_divide(self, text: X86Assembler, address: int) -> None:
+        """idiv truncates towards zero where the interpreter floors.
+
+        The quotient is decremented whenever the division was inexact and the
+        remainder and the divisor disagree about sign, which xor detects in
+        the sign bit.
+        """
+        floored = f"A{address}.floored"
+        text.pop(Register.RCX)
+        text.pop(Register.RAX)
+        text.sign_extend()
+        text.divide(Register.RCX)
+        text.test(Register.RDX, Register.RDX)
+        text.jump_if("e", floored)
+        text.arithmetic("xor", Register.RDX, Register.RCX)
+        text.jump_if("ns", floored)
+        text.decrement(Register.RAX)
+        text.label(floored)
+        text.push(Register.RAX)
+
+    # -- the runtime the instruction stream calls into ---------------------
+
+    def _paint(self, text: X86Assembler) -> None:
+        """paint(rdi = row, rsi = column), out of bounds silently ignored.
+
+        Clobbers rax and nothing else, which is what lets its callers keep
+        their loop state in registers across the call.
+        """
+        text.label("paint")
+        for register in (Register.RDI, Register.RSI):
+            text.arithmetic_immediate("cmp", register, 0)
+            text.jump_if("l", "paint.done")
+            text.arithmetic_immediate("cmp", register, self._order)
+            text.jump_if("ge", "paint.done")
+        text.multiply_immediate(Register.RAX, Register.RDI, self._order)
+        text.arithmetic("add", Register.RAX, Register.RSI)
+        text.store_octet_immediate(self._canvas(Register.RAX), 1)
+        text.label("paint.done")
+        text.ret()
+
+    def _emit_run(self, text: X86Assembler) -> None:
+        """emit_run(rdi = orientation, rsi = index, rdx = lower, rcx = upper)."""
+        text.label("emit_run")
+        text.load(Register.R8, Register.RDI)
+        text.load(Register.R9, Register.RSI)
+        text.load(Register.R10, Register.RDX)
+        text.load(Register.R11, Register.RCX)
+        text.label("emit_run.head")
+        text.arithmetic("cmp", Register.R10, Register.R11)
+        text.jump_if("g", "emit_run.done")
+        for encoding, name in ((1, "column"), (2, "diagonal"), (3, "antidiagonal")):
+            text.arithmetic_immediate("cmp", Register.R8, encoding)
+            text.jump_if("e", f"emit_run.{name}")
+        text.load(Register.RDI, Register.R9)
+        text.load(Register.RSI, Register.R10)
+        text.jump("emit_run.paint")
+        text.label("emit_run.column")
+        text.load(Register.RDI, Register.R10)
+        text.load(Register.RSI, Register.R9)
+        text.jump("emit_run.paint")
+        text.label("emit_run.diagonal")
+        text.load(Register.RDI, Register.R10)
+        text.load(Register.RSI, Register.R10)
+        text.arithmetic("add", Register.RSI, Register.R9)
+        text.jump("emit_run.paint")
+        text.label("emit_run.antidiagonal")
+        text.load(Register.RDI, Register.R10)
+        text.load(Register.RSI, Register.R9)
+        text.arithmetic("sub", Register.RSI, Register.R10)
+        text.label("emit_run.paint")
+        text.call("paint")
+        text.increment(Register.R10)
+        text.jump("emit_run.head")
+        text.label("emit_run.done")
+        text.ret()
+
+    def _snapshot_routine(self, text: X86Assembler) -> None:
+        """The canvas as it stood before the closure began."""
+        text.label("snapshot")
+        text.arithmetic("xor", Register.RAX, Register.RAX)
+        text.label("snapshot.head")
+        text.arithmetic_immediate("cmp", Register.RAX, self._cells)
+        text.jump_if("ge", "snapshot.done")
+        text.load_octet(Register.RCX, self._canvas(Register.RAX))
+        text.store_octet(self._snapshot(Register.RAX), Register.RCX)
+        text.increment(Register.RAX)
+        text.jump("snapshot.head")
+        text.label("snapshot.done")
+        text.ret()
+
+    def _apply(self, text: X86Assembler) -> None:
+        """apply(rdi = a, rsi = b, rdx = c, rcx = d): one group element."""
+        text.label("apply")
+        text.load(Register.R8, Register.RDI)
+        text.load(Register.R9, Register.RSI)
+        text.load(Register.R10, Register.RDX)
+        text.load(Register.R11, Register.RCX)
+        text.arithmetic("xor", Register.R12, Register.R12)
+        text.label("apply.row")
+        text.arithmetic_immediate("cmp", Register.R12, self._order)
+        text.jump_if("ge", "apply.done")
+        text.arithmetic("xor", Register.R13, Register.R13)
+        text.label("apply.column")
+        text.arithmetic_immediate("cmp", Register.R13, self._order)
+        text.jump_if("ge", "apply.row.step")
+        text.multiply_immediate(Register.RAX, Register.R12, self._order)
+        text.arithmetic("add", Register.RAX, Register.R13)
+        text.compare_octet_immediate(self._snapshot(Register.RAX), 0)
+        text.jump_if("e", "apply.column.step")
+        text.load(Register.RDI, Register.R12)
+        text.arithmetic_immediate("sub", Register.RDI, self._apothem)
+        text.load(Register.RSI, Register.R13)
+        text.arithmetic_immediate("sub", Register.RSI, self._apothem)
+        text.load(Register.RAX, Register.R8)
+        text.multiply(Register.RAX, Register.RDI)
+        text.load(Register.RDX, Register.R9)
+        text.multiply(Register.RDX, Register.RSI)
+        text.arithmetic("add", Register.RAX, Register.RDX)
+        text.arithmetic_immediate("add", Register.RAX, self._apothem)
+        text.load(Register.RCX, Register.R10)
+        text.multiply(Register.RCX, Register.RDI)
+        text.load(Register.RDX, Register.R11)
+        text.multiply(Register.RDX, Register.RSI)
+        text.arithmetic("add", Register.RCX, Register.RDX)
+        text.arithmetic_immediate("add", Register.RCX, self._apothem)
+        text.load(Register.RDI, Register.RAX)
+        text.load(Register.RSI, Register.RCX)
+        text.call("paint")
+        text.label("apply.column.step")
+        text.increment(Register.R13)
+        text.jump("apply.column")
+        text.label("apply.row.step")
+        text.increment(Register.R12)
+        text.jump("apply.row")
+        text.label("apply.done")
+        text.ret()
+
+    def _render(self, text: X86Assembler) -> None:
+        """The canvas as text, trailing blanks trimmed, in a single write(2)."""
+        cursor = MemoryOperand(DATA_REGISTER, Register.R14, 1, self._layout.output)
+        text.label("render")
+        text.arithmetic("xor", Register.R12, Register.R12)
+        text.arithmetic("xor", Register.R14, Register.R14)
+        text.label("render.row")
+        text.arithmetic_immediate("cmp", Register.R12, self._order)
+        text.jump_if("ge", "render.flush")
+        text.immediate(Register.R10, -1)
+        text.arithmetic("xor", Register.R13, Register.R13)
+        text.label("render.scan")
+        text.arithmetic_immediate("cmp", Register.R13, self._order)
+        text.jump_if("ge", "render.print")
+        text.multiply_immediate(Register.RAX, Register.R12, self._order)
+        text.arithmetic("add", Register.RAX, Register.R13)
+        text.compare_octet_immediate(self._canvas(Register.RAX), 0)
+        text.jump_if("e", "render.scan.step")
+        text.load(Register.R10, Register.R13)
+        text.label("render.scan.step")
+        text.increment(Register.R13)
+        text.jump("render.scan")
+        text.label("render.print")
+        text.arithmetic("xor", Register.R13, Register.R13)
+        text.label("render.cell")
+        text.arithmetic("cmp", Register.R13, Register.R10)
+        text.jump_if("g", "render.newline")
+        text.arithmetic_immediate("cmp", Register.R13, 0)
+        text.jump_if("le", "render.ink")
+        text.store_octet_immediate(cursor, ord(" "))
+        text.increment(Register.R14)
+        text.label("render.ink")
+        text.multiply_immediate(Register.RAX, Register.R12, self._order)
+        text.arithmetic("add", Register.RAX, Register.R13)
+        text.compare_octet_immediate(self._canvas(Register.RAX), 0)
+        text.jump_if("e", "render.blank")
+        text.store_octet_immediate(cursor, ord("*"))
+        text.jump("render.advance")
+        text.label("render.blank")
+        text.store_octet_immediate(cursor, ord(" "))
+        text.label("render.advance")
+        text.increment(Register.R14)
+        text.increment(Register.R13)
+        text.jump("render.cell")
+        text.label("render.newline")
+        text.store_octet_immediate(cursor, ord("\n"))
+        text.increment(Register.R14)
+        text.increment(Register.R12)
+        text.jump("render.row")
+        text.label("render.flush")
+        text.immediate(Register.RAX, SYS_WRITE)
+        text.immediate(Register.RDI, 1)
+        text.address_of(
+            Register.RSI, MemoryOperand(DATA_REGISTER, None, 1, self._layout.output)
+        )
+        text.load(Register.RDX, Register.R14)
+        text.syscall()
+        text.ret()
+
+
+ELF_HEADER_SIZE: Final[int] = 64
+PROGRAM_HEADER_SIZE: Final[int] = 56
+PROGRAM_HEADERS: Final[int] = 2
+
+
+def elf64_image(text: bytes, bss: int) -> bytes:
+    """Wraps a text section in the smallest static ELF64 executable that runs it.
+
+    Two loadable segments and nothing else: the headers and the text, mapped
+    read-execute at the image base, and an anonymous read-write span the
+    kernel zeroes for us, which is the whole of the program's data.
+    """
+    prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
+    loaded = prologue + len(text)
+    header = struct.pack(
+        "<4sBBBBB7xHHIQQQIHHHHHH",
+        b"\x7fELF", 2, 1, 1, 0, 0,
+        2, 62, 1, IMAGE_BASE + prologue, ELF_HEADER_SIZE, 0, 0,
+        ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE, PROGRAM_HEADERS, 64, 0, 0,
+    )
+    segments = struct.pack(
+        "<IIQQQQQQ", 1, 5, 0, IMAGE_BASE, IMAGE_BASE, loaded, loaded, PAGE_SIZE
+    ) + struct.pack(
+        "<IIQQQQQQ", 1, 6, 0, DATA_BASE, DATA_BASE, 0, bss, PAGE_SIZE
+    )
+    return header + segments + text
+
+
+def machine_code(module: ObjectModule) -> bytes:
+    """The object module as a static ELF64 executable for x86-64 Linux."""
+    backend = NativeCodeBackend(module)
+    return elf64_image(backend.encode(), backend.layout.size)
+
+
+def write_executable(module: ObjectModule, path: Path) -> Path:
+    """Writes that executable to ``path`` and makes it runnable."""
+    path.write_bytes(machine_code(module))
+    path.chmod(0o755)
+    return path
+
+
+def machine_code_runnable() -> bool:
+    """Whether the host can execute what layer 18 emits."""
+    return sys.platform.startswith("linux") and os.uname().machine == "x86_64"
+
+
+# ======================================================================
 # driver
 # ======================================================================
 
@@ -10469,6 +11179,14 @@ def _selftest(orders: Sequence[int]) -> int:
                 tiers.append(("native", _run(binary, "").removesuffix("\n")))
         except (LlvmToolchainUnavailable, OSError) as exc:
             print(f"  n={order:<3} llvm tiers skipped: {exc}", file=sys.stderr)
+        try:
+            if not machine_code_runnable():
+                raise OSError("this host cannot run x86-64 Linux binaries")
+            with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
+                binary = write_executable(artifacts.module, Path(scratch) / "glyph")
+                tiers.append(("elf", _run(binary, "").removesuffix("\n")))
+        except (GlyphPlatformError, OSError) as exc:
+            print(f"  n={order:<3} elf tier skipped: {exc}", file=sys.stderr)
         verdict = "ok"
         for label, produced in tiers:
             if produced != expected:
@@ -10564,6 +11282,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     backend.add_argument("--jit", action="store_true")
     backend.add_argument("-O", "--opt-level", type=int, choices=range(4), default=0)
     backend.add_argument("--triple", default=TargetProfile().triple)
+
+    machine = parser.add_argument_group("tier 5: machine code, no toolchain")
+    machine.add_argument("--emit-elf", metavar="PATH", help="write a static ELF64 executable")
+    machine.add_argument("--emit-machine-code", action="store_true")
 
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
@@ -10714,6 +11436,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         (namespace.emit_cfg, "control flow graph", artifacts.graph.render),
         (namespace.emit_passes, "optimisation report", artifacts.passes.render),
         (namespace.emit_asm, "disassembly", artifacts.module.disassembly),
+        (namespace.emit_machine_code, "machine code",
+         lambda: _hexdump(NativeCodeBackend(artifacts.module).encode())),
         (namespace.emit_container_format, "object container", lambda: _hexdump(artifacts.blob)),
         (namespace.emit_group, "symmetry group", artifacts.machine.group.render),
         (namespace.emit_events, "canvas event stream",
@@ -10744,6 +11468,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(DIAGNOSTICS.render(), file=sys.stderr)
     if namespace.verbose:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
+
+    if namespace.emit_elf:
+        written = write_executable(artifacts.module, Path(namespace.emit_elf))
+        print(f"wrote {written} ({written.stat().st_size} bytes)", file=sys.stderr)
 
     backend_requested = any(
         (
