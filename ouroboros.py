@@ -1884,6 +1884,7 @@ var LOCLEN = 900100;
 var GLBNAME = 900200;
 var GLBLEN = 900600;
 var TOKBUF = 950000;
+var ARGS = 960000;
 
 var T_EOF = 0;
 var T_NUM = 1;
@@ -1928,6 +1929,7 @@ var nglobals = 0;
 var regcnt = 0;
 var labelcnt = 0;
 var line = 1;
+var argsp = 0;
 
 fn strlen(s) {
   var i = 0;
@@ -2688,12 +2690,14 @@ fn parse_primary() {
       expect(T_RPAREN, "expected )");
       return parse_call_builtin(3, a2);
     }
+    var base = argsp;
+    argsp = argsp + 9;
     var nargs = 0;
     while (tk() != T_RPAREN) {
       if (nargs > 0) {
         expect(T_COMMA, "expected , between arguments");
       }
-      mem[TOKBUF + 100 + nargs] = parse_expr();
+      mem[ARGS + base + nargs] = parse_expr();
       nargs = nargs + 1;
       if (nargs > 8) {
         fail("too many arguments");
@@ -2712,10 +2716,11 @@ fn parse_primary() {
         es(", ");
       }
       es("i64 ");
-      er(mem[TOKBUF + 100 + i]);
+      er(mem[ARGS + base + i]);
       i = i + 1;
     }
     es(")\n");
+    argsp = base;
     return r2;
   }
   fail("expected an expression");
@@ -3260,6 +3265,7 @@ LOCLEN = 900100
 GLBNAME = 900200
 GLBLEN = 900600
 TOKBUF = 950000
+ARGS = 960000
 
 T_EOF = 0
 T_NUM = 1
@@ -3305,6 +3311,7 @@ nglobals = 0
 regcnt = 0
 labelcnt = 0
 line = 1
+argsp = 0
 
 
 def es(s):
@@ -3904,6 +3911,7 @@ def parse_call_builtin(kind, first_arg):
 
 
 def parse_primary():
+    global argsp
     if tk() == T_NUM:
         v = tnum()
         advance()
@@ -3946,11 +3954,13 @@ def parse_primary():
             a = parse_expr()
             expect(T_RPAREN, "expected )")
             return parse_call_builtin(3, a)
+        base = argsp
+        argsp = argsp + 9
         nargs = 0
         while tk() != T_RPAREN:
             if nargs > 0:
                 expect(T_COMMA, "expected , between arguments")
-            mem[TOKBUF + 100 + nargs] = parse_expr()
+            mem[ARGS + base + nargs] = parse_expr()
             nargs = nargs + 1
             if nargs > 8:
                 fail("too many arguments")
@@ -3966,9 +3976,10 @@ def parse_primary():
             if i > 0:
                 es(", ")
             es("i64 ")
-            er(mem[TOKBUF + 100 + i])
+            er(mem[ARGS + base + i])
             i = i + 1
         es(")\n")
+        argsp = base
         return r
     fail("expected an expression")
     return 0
