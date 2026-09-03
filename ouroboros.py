@@ -41,10 +41,23 @@
           build is proven correct by a three-generation fixpoint: the
           compiler's output on its own source stops changing.
 
+  tier 4  the closed loop       tier 1 and tier 2 again, written in the
+          language of tier 3 and compiled by the compiler that compiles
+          itself: the same preprocessor, transducer, parser, analyser, pass
+          manager and assembler, and the same lowering after them, in one
+          GSL-2 translation unit whose sections carry the layer numbers they
+          answer to.  The seed turns the crank once, on the GSL-2 compiler
+          alone, and after that no interpreter is left anywhere in the chain.
+          The claim is not that the two front ends agree but that they are
+          the same compiler: for any program either accepts, both emit the
+          same bytes.
+
     python3 ouroboros.py                 render via the virtual machine
     python3 ouroboros.py --emit-llvm     lower the program to LLVM IR
     python3 ouroboros.py --jit           JIT-execute that IR
     python3 ouroboros.py --bootstrap     run the full self-hosting bootstrap
+    python3 ouroboros.py --close-the-loop    compile the glyph with the
+                                             front end written in GSL-2
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -5135,19 +5148,31 @@ class FuzzFinding:
     source: str
     expected: str
     produced: str
+    baseline: str = "interpreter"
 
     def render(self) -> str:
         return "\n".join(
             (
-                f"case {self.case}: tier {self.tier!r} disagreed with the interpreter",
+                f"case {self.case}: tier {self.tier!r} disagreed with {self.baseline}",
                 "--- source ---",
                 self.source.rstrip(),
-                "--- interpreter ---",
+                f"--- {self.baseline} ---",
                 self.expected,
                 f"--- {self.tier} ---",
                 self.produced,
             )
         )
+
+
+def _first_difference(expected: str, produced: str) -> tuple[str, str]:
+    """The first line on which two listings part company, with its number."""
+    left, right = expected.splitlines(), produced.splitlines()
+    for number in range(max(len(left), len(right))):
+        one = left[number] if number < len(left) else "(end of listing)"
+        other = right[number] if number < len(right) else "(end of listing)"
+        if one != other:
+            return f"line {number + 1}: {one}", f"line {number + 1}: {other}"
+    return "(identical)", "(identical)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -5180,16 +5205,23 @@ class FuzzReport:
 class DifferentialFuzzer:
     """Cross-checks every execution tier against the plain interpreter."""
 
-    def __init__(self, seed: int = 0, native: bool = False) -> None:
+    def __init__(
+        self, seed: int = 0, native: bool = False, front_end: bool = False
+    ) -> None:
         self._entropy = random.Random(seed)
         self._generator = GslProgramGenerator(self._entropy)
         self._native = native
+        self._front_end = front_end
 
     def _render(self, source: str, order: int, **flags: Any) -> str:
         return synthesize_source(source, order, **flags).unwrap_or_raise().rendering
 
     @woven
     def run(self, iterations: int = 100) -> FuzzReport:
+        with tempfile.TemporaryDirectory(prefix="ouroboros-fuzz-") as scratch:
+            return self._sweep(iterations, Path(scratch))
+
+    def _sweep(self, iterations: int, scratch: Path) -> FuzzReport:
         findings: list[FuzzFinding] = []
         skipped: list[str] = []
         tiers = ["interpreter", "threaded", "optimised", "round-tripped"]
@@ -5203,6 +5235,14 @@ class DifferentialFuzzer:
         except LlvmToolchainUnavailable as exc:
             toolchain = None
             skipped.append(f"llvm tiers ({exc})")
+
+        front_end: Path | None = None
+        if self._front_end and toolchain is not None:
+            try:
+                front_end, _ = build_front_end(scratch / "loop")
+                tiers.extend(("front-end", "front-end-ir"))
+            except (GlyphPlatformError, subprocess.CalledProcessError, OSError) as exc:
+                skipped.append(f"front-end tiers ({exc})")
 
         comparisons = 0
         executed = 0
@@ -5224,6 +5264,20 @@ class DifferentialFuzzer:
                 variants.append(("jit", lambda: self._through_llvm(source, order, toolchain)))
                 if self._native:
                     variants.append(("native", lambda: self._through_native(source, order)))
+            if front_end is not None:
+                # The front end's claim is byte equality with layer 16, which is
+                # stronger than agreeing on the glyph, so both are checked.
+                produced_ir = _run(front_end, source)
+                reference_ir = self._module_for(source, order).text
+                comparisons += 1
+                if produced_ir != reference_ir:
+                    expected, got = _first_difference(reference_ir, produced_ir)
+                    findings.append(
+                        FuzzFinding(case, "front-end-ir", source, expected, got, "layer 16")
+                    )
+                variants.append(
+                    ("front-end", lambda: self._through_front_end(produced_ir, scratch))
+                )
 
             for label, produce in variants:
                 comparisons += 1
@@ -5254,10 +5308,18 @@ class DifferentialFuzzer:
             binary = link_executable(module.text, Path(scratch) / "case", 2)
             return _run(binary, "").removesuffix("\n")
 
+    def _through_front_end(self, ir: str, scratch: Path) -> str:
+        return _run(link_executable(ir, scratch / "case", 2), "").removesuffix("\n")
 
-def fuzz(iterations: int = 100, seed: int = 0, native: bool = False) -> FuzzReport:
+
+def fuzz(
+    iterations: int = 100,
+    seed: int = 0,
+    native: bool = False,
+    front_end: bool = False,
+) -> FuzzReport:
     """Generates ``iterations`` random programs and cross-checks every tier."""
-    return DifferentialFuzzer(seed, native).run(iterations)
+    return DifferentialFuzzer(seed, native, front_end).run(iterations)
 
 
 # ======================================================================
@@ -6653,6 +6715,2393 @@ fn main() {
 }
 '''
 
+# ----------------------------------------------------------------------
+# tier 4: the front end, written in the language tier 3 compiles
+# ----------------------------------------------------------------------
+#
+# Everything above is a circle with one end loose: tiers 1 and 2 are
+# Python, tier 3 is native but only compiles itself.  glyphc.gsl2 joins
+# the ends.  It is the whole of tier 1 - preprocessor, transducer, parser,
+# analyser, pass manager, assembler - and the tier 2 lowering after it,
+# written a second time in GSL-2 and compiled by the self-hosted compiler
+# above.  The claim it makes is not that it agrees but that it is the
+# same compiler: for any program either accepts, both emit the same bytes.
+
+
+GLYPHC_GSL2: Final[str] = r'''# glyphc.gsl2 - the GSL front end, written in GSL-2.
+#
+# Reads a GSL program on stdin, writes LLVM IR on stdout.  Byte-identical to
+# what layer 16 emits for the same program: the whole of tier 1 - preprocessor,
+# transducer, parser, analyser, emitter, pass manager, assembler - and then the
+# tier 2 lowering, all of it a second time, in a language that compiles itself.
+
+var MEM_STRINGS = 1500000;
+
+var SRC = 0;
+var PPS = 300000;
+var MACT = 600000;
+var MACNM = 660000;
+var MACNL = 660300;
+var MACVO = 660600;
+var MACVL = 660900;
+var LINEB = 670000;
+var EXPB = 680000;
+var TOKK = 700000;
+var TOKS = 730000;
+var TOKL = 760000;
+var TOKV = 790000;
+var SYMN = 820000;
+var SYML = 822000;
+var SYMK = 824000;
+var SYMSL = 826000;
+var SYMD = 828000;
+var SYMR0 = 830000;
+var SYMR1 = 832000;
+var ITK = 840000;
+var ITA = 900000;
+var OTK = 960000;
+var OTA = 1020000;
+var LBLA = 1080000;
+var GRPA = 1090000;
+var GRPB = 1090100;
+var GRPC = 1090200;
+var GRPD = 1090300;
+var STK = 1100000;
+var STA = 1150000;
+var REFL = 1200000;
+var CODEK = 1210000;
+var CODEA = 1270000;
+
+var MAXMACRO = 256;
+var MAXTOK = 30000;
+var MAXSYM = 2000;
+var MAXITEM = 60000;
+var MAXLABEL = 8192;
+
+var TK_EOI = 0;
+var TK_KW = 1;
+var TK_IDENT = 2;
+var TK_INT = 3;
+var TK_PLUS = 4;
+var TK_MINUS = 5;
+var TK_STAR = 6;
+var TK_SLASH = 7;
+var TK_EQUALS = 8;
+var TK_RANGE = 9;
+var TK_SEMI = 10;
+var TK_LPAREN = 11;
+var TK_RPAREN = 12;
+var TK_LBRACE = 13;
+var TK_RBRACE = 14;
+
+var OP_PUSH = 1;
+var OP_INTR = 2;
+var OP_LOADL = 3;
+var OP_STOREL = 4;
+var OP_ADD = 5;
+var OP_SUB = 6;
+var OP_MUL = 7;
+var OP_DIV = 8;
+var OP_NEG = 9;
+var OP_CMPLE = 10;
+var OP_MKIV = 11;
+var OP_EMIT = 12;
+var OP_JMP = 13;
+var OP_JF = 14;
+var OP_CLOSE = 15;
+var OP_HALT = 16;
+var OP_LABEL = 17;
+
+var SK_INTRINSIC = 0;
+var SK_BINDING = 1;
+var SK_STROKE = 2;
+var SK_INDUCTION = 3;
+
+var srclen = 0;
+var ppslen = 0;
+var nmacro = 0;
+var mactop = 0;
+var ntok = 0;
+var tp = 0;
+var nsym = 0;
+var nitem = 0;
+var nslot = 0;
+var nlabel = 0;
+var depth = 0;
+var ORDER = 7;
+var CELLS = 49;
+var APOTHEM = 3;
+var EXTREMUM = 6;
+var family = 0;
+var cardinality = 4;
+var ngroup = 0;
+var reg = 0;
+var frame = 1;
+var stroketop = 0;
+var ncode = 0;
+
+# ----------------------------------------------------------------------
+# output and diagnostics
+# ----------------------------------------------------------------------
+
+fn es(s) {
+  var i = 0;
+  while (mem[s + i] != 0) {
+    putchar(mem[s + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn en(n) {
+  if (n < 0) {
+    putchar('-');
+    n = 0 - n;
+  }
+  if (n >= 10) {
+    en(n / 10);
+  }
+  putchar(48 + n % 10);
+  return 0;
+}
+
+fn fail(msg) {
+  es("; error: ");
+  es(msg);
+  es("\n");
+  exit(1);
+  return 0;
+}
+
+fn strlen(s) {
+  var i = 0;
+  while (mem[s + i] != 0) {
+    i = i + 1;
+  }
+  return i;
+}
+
+# Python's // floors; GSL-2's / truncates.  The whole platform's arithmetic
+# oracle is the interpreter, so every division here has to floor.
+fn fdiv(a, b) {
+  var q = a / b;
+  var r = a % b;
+  if (r != 0) {
+    if ((r < 0) != (b < 0)) {
+      q = q - 1;
+    }
+  }
+  return q;
+}
+
+fn text_eq(a, alen, b, blen) {
+  if (alen != blen) {
+    return 0;
+  }
+  var i = 0;
+  while (i < alen) {
+    if (mem[a + i] != mem[b + i]) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn lex_is(start, length, word) {
+  return text_eq(start, length, word, strlen(word));
+}
+
+fn is_alpha(c) {
+  if (c >= 97 && c <= 122) {
+    return 1;
+  }
+  if (c >= 65 && c <= 90) {
+    return 1;
+  }
+  if (c == 95) {
+    return 1;
+  }
+  return 0;
+}
+
+fn is_digit(c) {
+  if (c >= 48 && c <= 57) {
+    return 1;
+  }
+  return 0;
+}
+
+fn is_alnum(c) {
+  if (is_alpha(c)) {
+    return 1;
+  }
+  return is_digit(c);
+}
+
+fn is_space(c) {
+  if (c == 32 || c == 9 || c == 13) {
+    return 1;
+  }
+  return 0;
+}
+
+fn read_stdin() {
+  var i = 0;
+  var c = getchar();
+  while (c >= 0) {
+    mem[SRC + i] = c;
+    i = i + 1;
+    c = getchar();
+  }
+  mem[SRC + i] = 0;
+  srclen = i;
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 3: preprocessing
+# ----------------------------------------------------------------------
+
+fn macro_find(start, length) {
+  var i = 0;
+  while (i < nmacro) {
+    if (mem[MACNL + i] == length) {
+      if (text_eq(mem[MACNM + i], length, start, length)) {
+        return i;
+      }
+    }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn mac_intern(start, length) {
+  var at = mactop;
+  var i = 0;
+  while (i < length) {
+    mem[MACT + at + i] = mem[start + i];
+    i = i + 1;
+  }
+  mactop = mactop + length;
+  return at + MACT;
+}
+
+fn macro_define(nstart, nlen, vstart, vlen) {
+  var slot = macro_find(nstart, nlen);
+  if (slot < 0) {
+    if (nmacro >= MAXMACRO) {
+      fail("too many macros");
+    }
+    slot = nmacro;
+    nmacro = nmacro + 1;
+  }
+  mem[MACNM + slot] = mac_intern(nstart, nlen);
+  mem[MACNL + slot] = nlen;
+  mem[MACVO + slot] = mac_intern(vstart, vlen);
+  mem[MACVL + slot] = vlen;
+  return 0;
+}
+
+# The span [start, start + length) with leading and trailing whitespace
+# removed; the trimmed start is returned and the length written back through
+# the one-cell cell at TRIM.
+var TRIM = 660950;
+
+fn trim(start, length) {
+  var b = start;
+  var e = start + length;
+  while (b < e && is_space(mem[b])) {
+    b = b + 1;
+  }
+  while (e > b && is_space(mem[e - 1])) {
+    e = e - 1;
+  }
+  mem[TRIM] = e - b;
+  return b;
+}
+
+fn directive_define(bstart, blen) {
+  var s = trim(bstart, blen);
+  var n = mem[TRIM];
+  if (n == 0 || is_alpha(mem[s]) == 0) {
+    fail("malformed #define");
+  }
+  var k = 0;
+  while (k < n && is_alnum(mem[s + k])) {
+    k = k + 1;
+  }
+  if (k >= n || is_space(mem[s + k]) == 0) {
+    fail("malformed #define");
+  }
+  var v = trim(s + k, n - k);
+  macro_define(s, k, v, mem[TRIM]);
+  return 0;
+}
+
+fn directive_undef(bstart, blen) {
+  var s = trim(bstart, blen);
+  var slot = macro_find(s, mem[TRIM]);
+  if (slot >= 0) {
+    mem[MACNL + slot] = 0;
+  }
+  return 0;
+}
+
+# Recognises ^\s*#\s*([a-z]+)\s*(.*)$ over the logical line held in LINEB.
+# Returns 0 when the line is not a directive, 1 when it was one and handled.
+fn directive(length) {
+  var j = 0;
+  while (j < length && is_space(mem[LINEB + j])) {
+    j = j + 1;
+  }
+  if (j >= length || mem[LINEB + j] != 35) {
+    return 0;
+  }
+  j = j + 1;
+  while (j < length && is_space(mem[LINEB + j])) {
+    j = j + 1;
+  }
+  var k = j;
+  while (k < length && mem[LINEB + k] >= 97 && mem[LINEB + k] <= 122) {
+    k = k + 1;
+  }
+  if (k == j) {
+    return 0;
+  }
+  var dstart = LINEB + j;
+  var dlen = k - j;
+  while (k < length && is_space(mem[LINEB + k])) {
+    k = k + 1;
+  }
+  if (lex_is(dstart, dlen, "define")) {
+    directive_define(LINEB + k, length - k);
+    return 1;
+  }
+  if (lex_is(dstart, dlen, "pragma")) {
+    return 1;
+  }
+  if (lex_is(dstart, dlen, "undef")) {
+    directive_undef(LINEB + k, length - k);
+    return 1;
+  }
+  fail("unknown preprocessor directive");
+  return 1;
+}
+
+# One substitution sweep of LINEB into EXPB: every maximal run of word
+# characters that begins with a letter and names a macro is replaced by that
+# macro's replacement list.  Returns the length written.
+fn expand_once(length) {
+  var i = 0;
+  var out = 0;
+  while (i < length) {
+    var c = mem[LINEB + i];
+    if (is_alnum(c)) {
+      var j = i;
+      while (j < length && is_alnum(mem[LINEB + j])) {
+        j = j + 1;
+      }
+      var slot = 0 - 1;
+      if (is_alpha(c)) {
+        slot = macro_find(LINEB + i, j - i);
+      }
+      if (slot >= 0) {
+        var k = 0;
+        while (k < mem[MACVL + slot]) {
+          mem[EXPB + out] = mem[mem[MACVO + slot] + k];
+          out = out + 1;
+          k = k + 1;
+        }
+      } else {
+        var k2 = i;
+        while (k2 < j) {
+          mem[EXPB + out] = mem[LINEB + k2];
+          out = out + 1;
+          k2 = k2 + 1;
+        }
+      }
+      i = j;
+    } else {
+      mem[EXPB + out] = c;
+      out = out + 1;
+      i = i + 1;
+    }
+  }
+  return out;
+}
+
+fn expand(length) {
+  var round = 0;
+  while (round < 32) {
+    var out = expand_once(length);
+    if (out == length && text_eq(LINEB, length, EXPB, out)) {
+      return length;
+    }
+    var i = 0;
+    while (i < out) {
+      mem[LINEB + i] = mem[EXPB + i];
+      i = i + 1;
+    }
+    length = out;
+    round = round + 1;
+  }
+  fail("macro expansion did not converge");
+  return 0;
+}
+
+fn pps_append(length) {
+  if (ppslen > 0) {
+    mem[PPS + ppslen] = 10;
+    ppslen = ppslen + 1;
+  }
+  var i = 0;
+  while (i < length) {
+    mem[PPS + ppslen] = mem[LINEB + i];
+    ppslen = ppslen + 1;
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn emit_logical(length) {
+  if (directive(length) == 1) {
+    return 0;
+  }
+  pps_append(expand(length));
+  return 0;
+}
+
+# Line splicing, then directives, then expansion.  A line whose last
+# non-blank character is a backslash is joined with the one after it, the
+# backslash and the trailing blanks going away with it.
+fn preprocess() {
+  var i = 0;
+  var held = 0;
+  while (i < srclen) {
+    var b = i;
+    while (i < srclen && mem[SRC + i] != 10) {
+      i = i + 1;
+    }
+    var e = i;
+    if (i < srclen) {
+      i = i + 1;
+    }
+    var r = e;
+    while (r > b && is_space(mem[SRC + r - 1])) {
+      r = r - 1;
+    }
+    var spliced = 0;
+    if (r > b && mem[SRC + r - 1] == 92) {
+      spliced = 1;
+      e = r - 1;
+    }
+    var k = b;
+    while (k < e) {
+      mem[LINEB + held] = mem[SRC + k];
+      held = held + 1;
+      k = k + 1;
+    }
+    if (spliced == 0) {
+      emit_logical(held);
+      held = 0;
+    }
+  }
+  if (held > 0) {
+    emit_logical(held);
+  }
+  mem[PPS + ppslen] = 0;
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 4: lexical analysis
+# ----------------------------------------------------------------------
+#
+# The same table-driven transducer, unrolled into control flow: five states,
+# maximal munch, and a rescan whenever an accepting state meets a character it
+# cannot extend with.
+
+var ST_GROUND = 0;
+var ST_IDENT = 1;
+var ST_NUM = 2;
+var ST_RANGE = 3;
+var ST_COMMENT = 4;
+
+fn is_keyword(start, length) {
+  if (lex_is(start, length, "lattice")) {
+    return 1;
+  }
+  if (lex_is(start, length, "order")) {
+    return 1;
+  }
+  if (lex_is(start, length, "symmetry")) {
+    return 1;
+  }
+  if (lex_is(start, length, "cyclic")) {
+    return 1;
+  }
+  if (lex_is(start, length, "dihedral")) {
+    return 1;
+  }
+  if (lex_is(start, length, "about")) {
+    return 1;
+  }
+  if (lex_is(start, length, "centroid")) {
+    return 1;
+  }
+  if (lex_is(start, length, "stroke")) {
+    return 1;
+  }
+  if (lex_is(start, length, "emit")) {
+    return 1;
+  }
+  if (lex_is(start, length, "paint")) {
+    return 1;
+  }
+  if (lex_is(start, length, "let")) {
+    return 1;
+  }
+  if (lex_is(start, length, "for")) {
+    return 1;
+  }
+  if (lex_is(start, length, "in")) {
+    return 1;
+  }
+  if (lex_is(start, length, "at")) {
+    return 1;
+  }
+  if (lex_is(start, length, "span")) {
+    return 1;
+  }
+  if (lex_is(start, length, "row")) {
+    return 1;
+  }
+  if (lex_is(start, length, "column")) {
+    return 1;
+  }
+  if (lex_is(start, length, "diagonal")) {
+    return 1;
+  }
+  if (lex_is(start, length, "antidiagonal")) {
+    return 1;
+  }
+  return 0;
+}
+
+fn punctuation_kind(c) {
+  if (c == 43) {
+    return TK_PLUS;
+  }
+  if (c == 45) {
+    return TK_MINUS;
+  }
+  if (c == 42) {
+    return TK_STAR;
+  }
+  if (c == 47) {
+    return TK_SLASH;
+  }
+  if (c == 61) {
+    return TK_EQUALS;
+  }
+  if (c == 59) {
+    return TK_SEMI;
+  }
+  if (c == 40) {
+    return TK_LPAREN;
+  }
+  if (c == 41) {
+    return TK_RPAREN;
+  }
+  if (c == 123) {
+    return TK_LBRACE;
+  }
+  if (c == 125) {
+    return TK_RBRACE;
+  }
+  return 0 - 1;
+}
+
+fn push_token(kind, start, length, value) {
+  if (ntok >= MAXTOK) {
+    fail("token buffer overflow");
+  }
+  mem[TOKK + ntok] = kind;
+  mem[TOKS + ntok] = start;
+  mem[TOKL + ntok] = length;
+  mem[TOKV + ntok] = value;
+  ntok = ntok + 1;
+  return 0;
+}
+
+fn digits_value(start, length) {
+  var v = 0;
+  var i = 0;
+  while (i < length) {
+    v = v * 10 + mem[start + i] - 48;
+    i = i + 1;
+  }
+  return v;
+}
+
+# The accepting states and their classifications.  A run of dots is only a
+# range operator when it is exactly two long.
+fn flush(state, start, length) {
+  if (length == 0) {
+    return 0;
+  }
+  if (state == ST_IDENT) {
+    if (is_keyword(start, length)) {
+      push_token(TK_KW, start, length, 0);
+    } else {
+      push_token(TK_IDENT, start, length, 0);
+    }
+    return 0;
+  }
+  if (state == ST_NUM) {
+    push_token(TK_INT, start, length, digits_value(start, length));
+    return 0;
+  }
+  if (state == ST_RANGE) {
+    if (length != 2) {
+      fail("malformed range operator");
+    }
+    push_token(TK_RANGE, start, length, 0);
+    return 0;
+  }
+  fail("non-accepting transducer state");
+  return 0;
+}
+
+fn tokenize() {
+  var state = ST_GROUND;
+  var start = 0;
+  var length = 0;
+  var i = 0;
+  ntok = 0;
+  while (i < ppslen) {
+    var c = mem[PPS + i];
+    if (state == ST_COMMENT) {
+      if (c == 10) {
+        state = ST_GROUND;
+      }
+      i = i + 1;
+    } else {
+      if (state == ST_IDENT && is_alnum(c)) {
+        length = length + 1;
+        i = i + 1;
+      } else {
+        if (state == ST_NUM && is_digit(c)) {
+          length = length + 1;
+          i = i + 1;
+        } else {
+          if (state == ST_RANGE && c == 46) {
+            length = length + 1;
+            i = i + 1;
+          } else {
+            if (state != ST_GROUND) {
+              flush(state, start, length);
+              length = 0;
+              state = ST_GROUND;
+            } else {
+              if (is_alpha(c)) {
+                state = ST_IDENT;
+                start = PPS + i;
+                length = 1;
+                i = i + 1;
+              } else {
+                if (is_digit(c)) {
+                  state = ST_NUM;
+                  start = PPS + i;
+                  length = 1;
+                  i = i + 1;
+                } else {
+                  if (c == 46) {
+                    state = ST_RANGE;
+                    start = PPS + i;
+                    length = 1;
+                    i = i + 1;
+                  } else {
+                    if (c == 35) {
+                      state = ST_COMMENT;
+                      i = i + 1;
+                    } else {
+                      if (c == 10 || is_space(c)) {
+                        i = i + 1;
+                      } else {
+                        var kind = punctuation_kind(c);
+                        if (kind < 0) {
+                          fail("illegal character in the source text");
+                        }
+                        push_token(kind, PPS + i, 1, 0);
+                        i = i + 1;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  flush(state, start, length);
+  push_token(TK_EOI, PPS + ppslen, 0, 0);
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 6: scopes and symbols
+# ----------------------------------------------------------------------
+
+fn sym_declare(start, length, kind, slot) {
+  var i = nsym;
+  while (i > 0 && mem[SYMD + i - 1] == depth) {
+    i = i - 1;
+    if (text_eq(mem[SYMN + i], mem[SYML + i], start, length)) {
+      fail("symbol already declared in this scope");
+    }
+  }
+  if (nsym >= MAXSYM) {
+    fail("symbol table overflow");
+  }
+  mem[SYMN + nsym] = start;
+  mem[SYML + nsym] = length;
+  mem[SYMK + nsym] = kind;
+  mem[SYMSL + nsym] = slot;
+  mem[SYMD + nsym] = depth;
+  mem[SYMR0 + nsym] = 0;
+  mem[SYMR1 + nsym] = 0;
+  nsym = nsym + 1;
+  return nsym - 1;
+}
+
+fn sym_resolve(start, length) {
+  var i = nsym;
+  while (i > 0) {
+    i = i - 1;
+    if (text_eq(mem[SYMN + i], mem[SYML + i], start, length)) {
+      return i;
+    }
+  }
+  return 0 - 1;
+}
+
+fn scope_leave(mark) {
+  nsym = mark;
+  depth = depth - 1;
+  return 0;
+}
+
+fn alloc_slot() {
+  nslot = nslot + 1;
+  return nslot - 1;
+}
+
+fn new_label() {
+  nlabel = nlabel + 1;
+  return nlabel - 1;
+}
+
+# ----------------------------------------------------------------------
+# layer 7: the symbolic listing
+# ----------------------------------------------------------------------
+
+fn emit_item(kind, arg) {
+  if (nitem >= MAXITEM) {
+    fail("listing overflow");
+  }
+  mem[ITK + nitem] = kind;
+  mem[ITA + nitem] = arg;
+  nitem = nitem + 1;
+  return 0;
+}
+
+# Strokes are lowered where they are declared, so that the names inside them
+# resolve in the scope that declared them, and the resulting run of items is
+# lifted out of the listing and replayed at every emission.  The same device
+# holds a loop's upper bound, which is parsed before the induction variable
+# exists but emitted after it.
+fn capture_take(mark) {
+  var at = stroketop;
+  var i = mark;
+  while (i < nitem) {
+    mem[STK + stroketop] = mem[ITK + i];
+    mem[STA + stroketop] = mem[ITA + i];
+    stroketop = stroketop + 1;
+    i = i + 1;
+  }
+  nitem = mark;
+  return at;
+}
+
+fn splice(from, to) {
+  var i = from;
+  while (i < to) {
+    emit_item(mem[STK + i], mem[STA + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layers 5 and 6: recursive descent, precedence climbing, and lowering
+# ----------------------------------------------------------------------
+#
+# One pass does the work of three.  The analyser and the emitter never
+# disagree about a name because they are the same traversal, and the only
+# places where the two orders differ - a stroke's run, a loop's upper bound -
+# are captured and replayed rather than revisited.
+
+fn tkind() {
+  return mem[TOKK + tp];
+}
+
+fn tstart() {
+  return mem[TOKS + tp];
+}
+
+fn tlen() {
+  return mem[TOKL + tp];
+}
+
+fn tval() {
+  return mem[TOKV + tp];
+}
+
+fn advance() {
+  if (mem[TOKK + tp] != TK_EOI) {
+    tp = tp + 1;
+  }
+  return 0;
+}
+
+fn at_kw(word) {
+  if (mem[TOKK + tp] != TK_KW) {
+    return 0;
+  }
+  return lex_is(mem[TOKS + tp], mem[TOKL + tp], word);
+}
+
+fn expect(kind, what) {
+  if (mem[TOKK + tp] != kind) {
+    fail(what);
+  }
+  advance();
+  return 0;
+}
+
+fn expect_kw(word, what) {
+  if (at_kw(word) == 0) {
+    fail(what);
+  }
+  advance();
+  return 0;
+}
+
+fn infix_precedence(kind) {
+  if (kind == TK_PLUS || kind == TK_MINUS) {
+    return 10;
+  }
+  if (kind == TK_STAR || kind == TK_SLASH) {
+    return 20;
+  }
+  return 0 - 1;
+}
+
+fn infix_opcode(kind) {
+  if (kind == TK_PLUS) {
+    return OP_ADD;
+  }
+  if (kind == TK_MINUS) {
+    return OP_SUB;
+  }
+  if (kind == TK_STAR) {
+    return OP_MUL;
+  }
+  return OP_DIV;
+}
+
+fn intrinsic_index(start, length) {
+  if (lex_is(start, length, "zero")) {
+    return 0;
+  }
+  if (lex_is(start, length, "apothem")) {
+    return 1;
+  }
+  if (lex_is(start, length, "extremum")) {
+    return 2;
+  }
+  return 3;
+}
+
+# ---- the closed expression language, evaluated rather than lowered -----
+
+fn const_prefix() {
+  if (tkind() == TK_INT) {
+    var v = tval();
+    advance();
+    return v;
+  }
+  if (tkind() == TK_MINUS) {
+    advance();
+    return 0 - const_prefix();
+  }
+  if (tkind() == TK_LPAREN) {
+    advance();
+    var inner = const_expr(0);
+    expect(TK_RPAREN, "expected )");
+    return inner;
+  }
+  fail("this is not a constant expression");
+  return 0;
+}
+
+fn const_expr(minimum) {
+  var left = const_prefix();
+  while (1) {
+    var precedence = infix_precedence(tkind());
+    if (precedence < 0 || precedence < minimum) {
+      return left;
+    }
+    var kind = tkind();
+    advance();
+    var right = const_expr(precedence + 1);
+    if (kind == TK_PLUS) {
+      left = left + right;
+    } else {
+      if (kind == TK_MINUS) {
+        left = left - right;
+      } else {
+        if (kind == TK_STAR) {
+          left = left * right;
+        } else {
+          left = fdiv(left, right);
+        }
+      }
+    }
+  }
+  return left;
+}
+
+# ---- the open expression language, lowered to the operand stack --------
+
+fn parse_prefix() {
+  if (tkind() == TK_INT) {
+    emit_item(OP_PUSH, tval());
+    advance();
+    return 0;
+  }
+  if (tkind() == TK_IDENT) {
+    var slot = sym_resolve(tstart(), tlen());
+    if (slot < 0) {
+      fail("unknown symbol");
+    }
+    if (mem[SYMK + slot] == SK_STROKE) {
+      fail("strokes are not first-class values");
+    }
+    if (mem[SYMK + slot] == SK_INTRINSIC) {
+      emit_item(OP_INTR, mem[SYMSL + slot]);
+    } else {
+      emit_item(OP_LOADL, mem[SYMSL + slot]);
+    }
+    advance();
+    return 0;
+  }
+  if (tkind() == TK_MINUS) {
+    advance();
+    parse_prefix();
+    emit_item(OP_NEG, 0);
+    return 0;
+  }
+  if (tkind() == TK_LPAREN) {
+    advance();
+    parse_expr(0);
+    expect(TK_RPAREN, "expected )");
+    return 0;
+  }
+  fail("expected an expression");
+  return 0;
+}
+
+fn parse_expr(minimum) {
+  parse_prefix();
+  while (1) {
+    var precedence = infix_precedence(tkind());
+    if (precedence < 0 || precedence < minimum) {
+      return 0;
+    }
+    var kind = tkind();
+    advance();
+    parse_expr(precedence + 1);
+    emit_item(infix_opcode(kind), 0);
+  }
+  return 0;
+}
+
+# ---- runs, statements, declarations ------------------------------------
+
+fn orientation_code() {
+  if (at_kw("row")) {
+    return 0;
+  }
+  if (at_kw("column")) {
+    return 1;
+  }
+  if (at_kw("diagonal")) {
+    return 2;
+  }
+  if (at_kw("antidiagonal")) {
+    return 3;
+  }
+  return 0 - 1;
+}
+
+fn parse_run() {
+  var orientation = orientation_code();
+  if (orientation < 0) {
+    fail("unknown orientation");
+  }
+  advance();
+  expect_kw("at", "expected at");
+  parse_expr(0);
+  expect_kw("span", "expected span");
+  parse_expr(0);
+  expect(TK_RANGE, "expected ..");
+  parse_expr(0);
+  emit_item(OP_MKIV, 0);
+  emit_item(OP_EMIT, orientation);
+  return 0;
+}
+
+fn parse_binding() {
+  advance();
+  if (tkind() != TK_IDENT) {
+    fail("expected a name after let");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  expect(TK_EQUALS, "expected =");
+  parse_expr(0);
+  expect(TK_SEMI, "expected ;");
+  var slot = alloc_slot();
+  sym_declare(start, length, SK_BINDING, slot);
+  emit_item(OP_STOREL, slot);
+  return 0;
+}
+
+fn parse_stroke() {
+  advance();
+  if (tkind() != TK_IDENT) {
+    fail("expected a name after stroke");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  expect(TK_EQUALS, "expected =");
+  var mark = nitem;
+  parse_run();
+  expect(TK_SEMI, "expected ;");
+  var at = capture_take(mark);
+  var slot = sym_declare(start, length, SK_STROKE, 0 - 1);
+  mem[SYMR0 + slot] = at;
+  mem[SYMR1 + slot] = stroketop;
+  return 0;
+}
+
+fn parse_emission() {
+  advance();
+  if (tkind() != TK_IDENT) {
+    fail("expected a stroke name after emit");
+  }
+  var slot = sym_resolve(tstart(), tlen());
+  if (slot < 0) {
+    fail("unknown symbol");
+  }
+  if (mem[SYMK + slot] != SK_STROKE) {
+    fail("that name is not a stroke");
+  }
+  advance();
+  expect(TK_SEMI, "expected ;");
+  splice(mem[SYMR0 + slot], mem[SYMR1 + slot]);
+  return 0;
+}
+
+fn parse_painting() {
+  advance();
+  parse_run();
+  expect(TK_SEMI, "expected ;");
+  return 0;
+}
+
+fn parse_iteration() {
+  advance();
+  if (tkind() != TK_IDENT) {
+    fail("expected a name after for");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  var head = new_label();
+  var done = new_label();
+  expect_kw("in", "expected in");
+  parse_expr(0);
+  expect(TK_RANGE, "expected ..");
+  var mark = nitem;
+  parse_expr(0);
+  var upper = capture_take(mark);
+  var top = stroketop;
+  expect(TK_LBRACE, "expected {");
+  var slot = alloc_slot();
+  depth = depth + 1;
+  var outer = nsym;
+  sym_declare(start, length, SK_INDUCTION, slot);
+  emit_item(OP_STOREL, slot);
+  emit_item(OP_LABEL, head);
+  emit_item(OP_LOADL, slot);
+  splice(upper, top);
+  emit_item(OP_CMPLE, 0);
+  emit_item(OP_JF, done);
+  parse_body(TK_RBRACE);
+  expect(TK_RBRACE, "expected }");
+  emit_item(OP_LOADL, slot);
+  emit_item(OP_PUSH, 1);
+  emit_item(OP_ADD, 0);
+  emit_item(OP_STOREL, slot);
+  emit_item(OP_JMP, head);
+  emit_item(OP_LABEL, done);
+  scope_leave(outer);
+  return 0;
+}
+
+fn parse_statement() {
+  if (at_kw("let")) {
+    return parse_binding();
+  }
+  if (at_kw("stroke")) {
+    return parse_stroke();
+  }
+  if (at_kw("emit")) {
+    return parse_emission();
+  }
+  if (at_kw("paint")) {
+    return parse_painting();
+  }
+  if (at_kw("for")) {
+    return parse_iteration();
+  }
+  fail("that token cannot begin a statement");
+  return 0;
+}
+
+fn parse_body(terminator) {
+  while (tkind() != terminator) {
+    parse_statement();
+  }
+  return 0;
+}
+
+fn parse_lattice() {
+  expect_kw("lattice", "expected lattice");
+  expect_kw("order", "expected order");
+  ORDER = const_expr(0);
+  expect(TK_SEMI, "expected ;");
+  if (ORDER <= 0 || ORDER % 2 == 0) {
+    fail("illegal lattice order");
+  }
+  APOTHEM = ORDER / 2;
+  EXTREMUM = ORDER - 1;
+  CELLS = ORDER * ORDER;
+  return 0;
+}
+
+fn parse_symmetry() {
+  expect_kw("symmetry", "expected symmetry");
+  if (at_kw("cyclic")) {
+    family = 0;
+  } else {
+    if (at_kw("dihedral")) {
+      family = 1;
+    } else {
+      fail("unknown symmetry family");
+    }
+  }
+  advance();
+  if (tkind() != TK_INT) {
+    fail("expected the symmetry cardinality");
+  }
+  cardinality = tval();
+  advance();
+  expect_kw("about", "expected about");
+  expect_kw("centroid", "expected centroid");
+  expect(TK_SEMI, "expected ;");
+  if (cardinality != 4) {
+    fail("this platform only implements 4-fold symmetry");
+  }
+  return 0;
+}
+
+fn declare_one_intrinsic(name, index) {
+  sym_declare(name, strlen(name), SK_INTRINSIC, index);
+  return 0;
+}
+
+fn declare_intrinsics() {
+  declare_one_intrinsic("zero", 0);
+  declare_one_intrinsic("apothem", 1);
+  declare_one_intrinsic("extremum", 2);
+  declare_one_intrinsic("magnitude", 3);
+  return 0;
+}
+
+fn parse_program() {
+  tp = 0;
+  parse_lattice();
+  parse_symmetry();
+  declare_intrinsics();
+  parse_body(TK_EOI);
+  expect(TK_EOI, "expected the end of the program");
+  emit_item(OP_CLOSE, 0);
+  emit_item(OP_HALT, 0);
+  frame = nslot;
+  if (frame < 1) {
+    frame = 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 8: the pass pipeline
+# ----------------------------------------------------------------------
+#
+# Five peephole rewrites, run round after round until a round changes
+# nothing, or until patience runs out at eight.
+
+fn is_foldable(kind) {
+  if (kind == OP_ADD || kind == OP_SUB || kind == OP_MUL || kind == OP_DIV) {
+    return 1;
+  }
+  return 0;
+}
+
+fn fold(kind, left, right) {
+  if (kind == OP_ADD) {
+    return left + right;
+  }
+  if (kind == OP_SUB) {
+    return left - right;
+  }
+  if (kind == OP_MUL) {
+    return left * right;
+  }
+  return fdiv(left, right);
+}
+
+fn keep(out, index) {
+  mem[OTK + out] = mem[ITK + index];
+  mem[OTA + out] = mem[ITA + index];
+  return out + 1;
+}
+
+fn commit(out) {
+  var i = 0;
+  while (i < out) {
+    mem[ITK + i] = mem[OTK + i];
+    mem[ITA + i] = mem[OTA + i];
+    i = i + 1;
+  }
+  nitem = out;
+  return 0;
+}
+
+fn pass_constant_folding() {
+  var i = 0;
+  var out = 0;
+  while (i < nitem) {
+    var folded = 0;
+    if (i + 2 < nitem && mem[ITK + i] == OP_PUSH && mem[ITK + i + 1] == OP_PUSH) {
+      if (is_foldable(mem[ITK + i + 2])) {
+        if (mem[ITK + i + 2] != OP_DIV || mem[ITA + i + 1] != 0) {
+          mem[OTK + out] = OP_PUSH;
+          mem[OTA + out] = fold(mem[ITK + i + 2], mem[ITA + i], mem[ITA + i + 1]);
+          out = out + 1;
+          i = i + 3;
+          folded = 1;
+        }
+      }
+    }
+    if (folded == 0) {
+      if (i + 1 < nitem && mem[ITK + i] == OP_PUSH && mem[ITK + i + 1] == OP_NEG) {
+        mem[OTK + out] = OP_PUSH;
+        mem[OTA + out] = 0 - mem[ITA + i];
+        out = out + 1;
+        i = i + 2;
+      } else {
+        out = keep(out, i);
+        i = i + 1;
+      }
+    }
+  }
+  return commit(out);
+}
+
+fn is_neutral(value, kind) {
+  if (value == 0 && (kind == OP_ADD || kind == OP_SUB)) {
+    return 1;
+  }
+  if (value == 1 && (kind == OP_MUL || kind == OP_DIV)) {
+    return 1;
+  }
+  return 0;
+}
+
+fn pass_algebraic_identities() {
+  var i = 0;
+  var out = 0;
+  while (i < nitem) {
+    if (i + 1 < nitem && mem[ITK + i] == OP_PUSH
+        && is_neutral(mem[ITA + i], mem[ITK + i + 1])) {
+      i = i + 2;
+    } else {
+      out = keep(out, i);
+      i = i + 1;
+    }
+  }
+  return commit(out);
+}
+
+fn pass_redundant_branch_elimination() {
+  var i = 0;
+  var out = 0;
+  while (i < nitem) {
+    if (mem[ITK + i] == OP_JMP && i + 1 < nitem && mem[ITK + i + 1] == OP_LABEL
+        && mem[ITA + i + 1] == mem[ITA + i]) {
+      i = i + 1;
+    } else {
+      out = keep(out, i);
+      i = i + 1;
+    }
+  }
+  return commit(out);
+}
+
+fn pass_unreachable_code_elimination() {
+  var i = 0;
+  var out = 0;
+  var live = 1;
+  while (i < nitem) {
+    if (mem[ITK + i] == OP_LABEL) {
+      live = 1;
+      out = keep(out, i);
+    } else {
+      if (live == 1) {
+        out = keep(out, i);
+        if (mem[ITK + i] == OP_JMP || mem[ITK + i] == OP_HALT) {
+          live = 0;
+        }
+      }
+    }
+    i = i + 1;
+  }
+  return commit(out);
+}
+
+fn pass_dead_label_elimination() {
+  var i = 0;
+  while (i < nlabel) {
+    mem[REFL + i] = 0;
+    i = i + 1;
+  }
+  i = 0;
+  while (i < nitem) {
+    if (mem[ITK + i] == OP_JMP || mem[ITK + i] == OP_JF) {
+      mem[REFL + mem[ITA + i]] = 1;
+    }
+    i = i + 1;
+  }
+  i = 0;
+  var out = 0;
+  while (i < nitem) {
+    if (mem[ITK + i] == OP_LABEL && mem[REFL + mem[ITA + i]] == 0) {
+      i = i + 1;
+    } else {
+      out = keep(out, i);
+      i = i + 1;
+    }
+  }
+  return commit(out);
+}
+
+fn optimise() {
+  var round = 0;
+  while (round < 8) {
+    var before = nitem;
+    pass_constant_folding();
+    pass_algebraic_identities();
+    pass_redundant_branch_elimination();
+    pass_unreachable_code_elimination();
+    pass_dead_label_elimination();
+    if (nitem == before) {
+      return 0;
+    }
+    round = round + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 9: assembly
+# ----------------------------------------------------------------------
+
+fn assemble() {
+  var address = 0;
+  var i = 0;
+  while (i < nitem) {
+    if (mem[ITK + i] == OP_LABEL) {
+      mem[LBLA + mem[ITA + i]] = address;
+    } else {
+      address = address + 1;
+    }
+    i = i + 1;
+  }
+  ncode = 0;
+  i = 0;
+  while (i < nitem) {
+    if (mem[ITK + i] != OP_LABEL) {
+      mem[CODEK + ncode] = mem[ITK + i];
+      if (mem[ITK + i] == OP_JMP || mem[ITK + i] == OP_JF) {
+        mem[CODEA + ncode] = mem[LBLA + mem[ITA + i]];
+      } else {
+        mem[CODEA + ncode] = mem[ITA + i];
+      }
+      ncode = ncode + 1;
+    }
+    i = i + 1;
+  }
+  if (ncode == 0 || mem[CODEK + ncode - 1] != OP_HALT) {
+    fail("object module does not terminate in a halt");
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 2: the symmetry group
+# ----------------------------------------------------------------------
+
+fn group_has(a, b, c, d) {
+  var i = 0;
+  while (i < ngroup) {
+    if (mem[GRPA + i] == a && mem[GRPB + i] == b) {
+      if (mem[GRPC + i] == c && mem[GRPD + i] == d) {
+        return 1;
+      }
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn group_add(a, b, c, d) {
+  if (group_has(a, b, c, d)) {
+    return 0;
+  }
+  mem[GRPA + ngroup] = a;
+  mem[GRPB + ngroup] = b;
+  mem[GRPC + ngroup] = c;
+  mem[GRPD + ngroup] = d;
+  ngroup = ngroup + 1;
+  return 1;
+}
+
+fn group_product(i, j) {
+  group_add(mem[GRPA + i] * mem[GRPA + j] + mem[GRPB + i] * mem[GRPC + j],
+            mem[GRPA + i] * mem[GRPB + j] + mem[GRPB + i] * mem[GRPD + j],
+            mem[GRPC + i] * mem[GRPA + j] + mem[GRPD + i] * mem[GRPC + j],
+            mem[GRPC + i] * mem[GRPB + j] + mem[GRPD + i] * mem[GRPD + j]);
+  return 0;
+}
+
+fn group_precedes(i, j) {
+  if (mem[GRPA + i] != mem[GRPA + j]) {
+    return mem[GRPA + i] < mem[GRPA + j];
+  }
+  if (mem[GRPB + i] != mem[GRPB + j]) {
+    return mem[GRPB + i] < mem[GRPB + j];
+  }
+  if (mem[GRPC + i] != mem[GRPC + j]) {
+    return mem[GRPC + i] < mem[GRPC + j];
+  }
+  return mem[GRPD + i] < mem[GRPD + j];
+}
+
+fn group_swap(i, j) {
+  var t = mem[GRPA + i];
+  mem[GRPA + i] = mem[GRPA + j];
+  mem[GRPA + j] = t;
+  t = mem[GRPB + i];
+  mem[GRPB + i] = mem[GRPB + j];
+  mem[GRPB + j] = t;
+  t = mem[GRPC + i];
+  mem[GRPC + i] = mem[GRPC + j];
+  mem[GRPC + j] = t;
+  t = mem[GRPD + i];
+  mem[GRPD + i] = mem[GRPD + j];
+  mem[GRPD + j] = t;
+  return 0;
+}
+
+# Closure of the generators under composition, then the total order the
+# backend iterates the elements in.  The quarter turn generates C4; adding the
+# mirror generates the dihedral group of twice the order.
+fn group_build() {
+  ngroup = 0;
+  group_add(1, 0, 0, 1);
+  group_add(0, 0 - 1, 1, 0);
+  if (family == 1) {
+    group_add(1, 0, 0, 0 - 1);
+  }
+  var changed = 1;
+  while (changed == 1) {
+    changed = 0;
+    var i = 0;
+    while (i < ngroup) {
+      var j = 0;
+      while (j < ngroup) {
+        var before = ngroup;
+        group_product(i, j);
+        if (ngroup != before) {
+          changed = 1;
+        }
+        j = j + 1;
+      }
+      i = i + 1;
+    }
+  }
+  var expected = cardinality;
+  if (family == 1) {
+    expected = 2 * cardinality;
+  }
+  if (ngroup != expected) {
+    fail("the generated group has the wrong order");
+  }
+  var p = 1;
+  while (p < ngroup) {
+    var q = p;
+    while (q > 0 && group_precedes(q, q - 1)) {
+      group_swap(q, q - 1);
+      q = q - 1;
+    }
+    p = p + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the runtime the lowered machine calls into, emitted verbatim
+# ----------------------------------------------------------------------
+
+fn emit_runtime_0() {
+  es("\n");
+  es("@canvas = internal global [");
+  en(CELLS);
+  es(" x i8] zeroinitializer\n");
+  es("@snapshot = internal global [");
+  en(CELLS);
+  es(" x i8] zeroinitializer\n");
+  es("\n");
+  es("declare i32 @putchar(i32)\n");
+  es("declare i32 @fflush(ptr)\n");
+  es("\n");
+  es("define internal void @gvm.paint(i32 %row, i32 %col) {\n");
+  es("entry:\n");
+  es("  %r0 = icmp sge i32 %row, 0\n");
+  es("  %r1 = icmp slt i32 %row, ");
+  en(ORDER);
+  es("\n");
+  es("  %rok = and i1 %r0, %r1\n");
+  es("  %c0 = icmp sge i32 %col, 0\n");
+  es("  %c1 = icmp slt i32 %col, ");
+  en(ORDER);
+  es("\n");
+  es("  %cok = and i1 %c0, %c1\n");
+  es("  %ok = and i1 %rok, %cok\n");
+  es("  br i1 %ok, label %store, label %done\n");
+  es("\n");
+  es("store:\n");
+  es("  %o0 = mul nsw i32 %row, ");
+  en(ORDER);
+  es("\n");
+  return 0;
+}
+
+fn emit_runtime_1() {
+  es("  %o1 = add nsw i32 %o0, %col\n");
+  es("  %o2 = sext i32 %o1 to i64\n");
+  es("  %slot = getelementptr inbounds [");
+  en(CELLS);
+  es(" x i8], ptr @canvas, i64 0, i64 %o2\n");
+  es("  store i8 1, ptr %slot, align 1\n");
+  es("  br label %done\n");
+  es("\n");
+  es("done:\n");
+  es("  ret void\n");
+  es("}\n");
+  es("\n");
+  es("define internal void @gvm.emit_run(i32 %orient, i32 %index, i32 %lo, i32 %hi) {\n");
+  es("entry:\n");
+  es("  %cursor = alloca i32, align 4\n");
+  es("  store i32 %lo, ptr %cursor, align 4\n");
+  es("  br label %head\n");
+  es("\n");
+  es("head:\n");
+  es("  %cur = load i32, ptr %cursor, align 4\n");
+  es("  %more = icmp sle i32 %cur, %hi\n");
+  es("  br i1 %more, label %body, label %exit\n");
+  es("\n");
+  es("body:\n");
+  es("  %scalar = load i32, ptr %cursor, align 4\n");
+  es("  switch i32 %orient, label %o.row [ i32 1, label %o.column\n");
+  es("                                     i32 2, label %o.diagonal\n");
+  es("                                     i32 3, label %o.antidiagonal ]\n");
+  es("\n");
+  es("o.row:\n");
+  return 0;
+}
+
+fn emit_runtime_2() {
+  es("  call void @gvm.paint(i32 %index, i32 %scalar)\n");
+  es("  br label %step\n");
+  es("\n");
+  es("o.column:\n");
+  es("  call void @gvm.paint(i32 %scalar, i32 %index)\n");
+  es("  br label %step\n");
+  es("\n");
+  es("o.diagonal:\n");
+  es("  %d.col = add nsw i32 %scalar, %index\n");
+  es("  call void @gvm.paint(i32 %scalar, i32 %d.col)\n");
+  es("  br label %step\n");
+  es("\n");
+  es("o.antidiagonal:\n");
+  es("  %a.col = sub nsw i32 %index, %scalar\n");
+  es("  call void @gvm.paint(i32 %scalar, i32 %a.col)\n");
+  es("  br label %step\n");
+  es("\n");
+  es("step:\n");
+  es("  %now = load i32, ptr %cursor, align 4\n");
+  es("  %next = add nsw i32 %now, 1\n");
+  es("  store i32 %next, ptr %cursor, align 4\n");
+  es("  br label %head\n");
+  es("\n");
+  es("exit:\n");
+  es("  ret void\n");
+  es("}\n");
+  es("\n");
+  es("define internal void @gvm.apply(i32 %a, i32 %b, i32 %c, i32 %d) {\n");
+  es("entry:\n");
+  es("  %row = alloca i32, align 4\n");
+  return 0;
+}
+
+fn emit_runtime_3() {
+  es("  %col = alloca i32, align 4\n");
+  es("  store i32 0, ptr %row, align 4\n");
+  es("  br label %row.head\n");
+  es("\n");
+  es("row.head:\n");
+  es("  %r = load i32, ptr %row, align 4\n");
+  es("  %rmore = icmp slt i32 %r, ");
+  en(ORDER);
+  es("\n");
+  es("  br i1 %rmore, label %row.body, label %row.done\n");
+  es("\n");
+  es("row.body:\n");
+  es("  store i32 0, ptr %col, align 4\n");
+  es("  br label %col.head\n");
+  es("\n");
+  es("col.head:\n");
+  es("  %cv = load i32, ptr %col, align 4\n");
+  es("  %cmore = icmp slt i32 %cv, ");
+  en(ORDER);
+  es("\n");
+  es("  br i1 %cmore, label %col.body, label %col.done\n");
+  es("\n");
+  es("col.body:\n");
+  es("  %br0 = load i32, ptr %row, align 4\n");
+  es("  %bc0 = load i32, ptr %col, align 4\n");
+  es("  %q0 = mul nsw i32 %br0, ");
+  en(ORDER);
+  es("\n");
+  es("  %q1 = add nsw i32 %q0, %bc0\n");
+  es("  %q2 = sext i32 %q1 to i64\n");
+  return 0;
+}
+
+fn emit_runtime_4() {
+  es("  %src = getelementptr inbounds [");
+  en(CELLS);
+  es(" x i8], ptr @snapshot, i64 0, i64 %q2\n");
+  es("  %ink = load i8, ptr %src, align 1\n");
+  es("  %lit = icmp ne i8 %ink, 0\n");
+  es("  br i1 %lit, label %col.mark, label %col.step\n");
+  es("\n");
+  es("col.mark:\n");
+  es("  %mr = load i32, ptr %row, align 4\n");
+  es("  %mc = load i32, ptr %col, align 4\n");
+  es("  %dr = sub nsw i32 %mr, ");
+  en(APOTHEM);
+  es("\n");
+  es("  %dc = sub nsw i32 %mc, ");
+  en(APOTHEM);
+  es("\n");
+  es("  %t0 = mul nsw i32 %a, %dr\n");
+  es("  %t1 = mul nsw i32 %b, %dc\n");
+  es("  %t2 = add nsw i32 %t0, %t1\n");
+  es("  %nr = add nsw i32 %t2, ");
+  en(APOTHEM);
+  es("\n");
+  es("  %t3 = mul nsw i32 %c, %dr\n");
+  es("  %t4 = mul nsw i32 %d, %dc\n");
+  es("  %t5 = add nsw i32 %t3, %t4\n");
+  es("  %nc = add nsw i32 %t5, ");
+  en(APOTHEM);
+  es("\n");
+  es("  call void @gvm.paint(i32 %nr, i32 %nc)\n");
+  es("  br label %col.step\n");
+  return 0;
+}
+
+fn emit_runtime_5() {
+  es("\n");
+  es("col.step:\n");
+  es("  %cnow = load i32, ptr %col, align 4\n");
+  es("  %cnext = add nsw i32 %cnow, 1\n");
+  es("  store i32 %cnext, ptr %col, align 4\n");
+  es("  br label %col.head\n");
+  es("\n");
+  es("col.done:\n");
+  es("  %rnow = load i32, ptr %row, align 4\n");
+  es("  %rnext = add nsw i32 %rnow, 1\n");
+  es("  store i32 %rnext, ptr %row, align 4\n");
+  es("  br label %row.head\n");
+  es("\n");
+  es("row.done:\n");
+  es("  ret void\n");
+  es("}\n");
+  es("\n");
+  es("define internal void @gvm.snapshot() {\n");
+  es("entry:\n");
+  es("  %i = alloca i32, align 4\n");
+  es("  store i32 0, ptr %i, align 4\n");
+  es("  br label %head\n");
+  es("\n");
+  es("head:\n");
+  es("  %c = load i32, ptr %i, align 4\n");
+  es("  %more = icmp slt i32 %c, ");
+  en(CELLS);
+  es("\n");
+  es("  br i1 %more, label %body, label %done\n");
+  es("\n");
+  return 0;
+}
+
+fn emit_runtime_6() {
+  es("body:\n");
+  es("  %ix = load i32, ptr %i, align 4\n");
+  es("  %ix64 = sext i32 %ix to i64\n");
+  es("  %sp = getelementptr inbounds [");
+  en(CELLS);
+  es(" x i8], ptr @canvas, i64 0, i64 %ix64\n");
+  es("  %sv = load i8, ptr %sp, align 1\n");
+  es("  %dp = getelementptr inbounds [");
+  en(CELLS);
+  es(" x i8], ptr @snapshot, i64 0, i64 %ix64\n");
+  es("  store i8 %sv, ptr %dp, align 1\n");
+  es("  %nx = add nsw i32 %ix, 1\n");
+  es("  store i32 %nx, ptr %i, align 4\n");
+  es("  br label %head\n");
+  es("\n");
+  es("done:\n");
+  es("  ret void\n");
+  es("}\n");
+  es("\n");
+  es("define internal void @gvm.render() {\n");
+  es("entry:\n");
+  es("  %row = alloca i32, align 4\n");
+  es("  %col = alloca i32, align 4\n");
+  es("  %last = alloca i32, align 4\n");
+  es("  store i32 0, ptr %row, align 4\n");
+  es("  br label %row.head\n");
+  es("\n");
+  es("row.head:\n");
+  es("  %r = load i32, ptr %row, align 4\n");
+  es("  %rmore = icmp slt i32 %r, ");
+  en(ORDER);
+  es("\n");
+  return 0;
+}
+
+fn emit_runtime_7() {
+  es("  br i1 %rmore, label %scan.init, label %row.done\n");
+  es("\n");
+  es("scan.init:\n");
+  es("  store i32 -1, ptr %last, align 4\n");
+  es("  store i32 0, ptr %col, align 4\n");
+  es("  br label %scan.head\n");
+  es("\n");
+  es("scan.head:\n");
+  es("  %sc = load i32, ptr %col, align 4\n");
+  es("  %smore = icmp slt i32 %sc, ");
+  en(ORDER);
+  es("\n");
+  es("  br i1 %smore, label %scan.body, label %scan.exit\n");
+  es("\n");
+  es("scan.body:\n");
+  es("  %sr = load i32, ptr %row, align 4\n");
+  es("  %sc2 = load i32, ptr %col, align 4\n");
+  es("  %so0 = mul nsw i32 %sr, ");
+  en(ORDER);
+  es("\n");
+  es("  %so1 = add nsw i32 %so0, %sc2\n");
+  es("  %so2 = sext i32 %so1 to i64\n");
+  es("  %sp = getelementptr inbounds [");
+  en(CELLS);
+  es(" x i8], ptr @canvas, i64 0, i64 %so2\n");
+  es("  %sink = load i8, ptr %sp, align 1\n");
+  es("  %slit = icmp ne i8 %sink, 0\n");
+  es("  br i1 %slit, label %scan.mark, label %scan.step\n");
+  es("\n");
+  es("scan.mark:\n");
+  return 0;
+}
+
+fn emit_runtime_8() {
+  es("  %sc3 = load i32, ptr %col, align 4\n");
+  es("  store i32 %sc3, ptr %last, align 4\n");
+  es("  br label %scan.step\n");
+  es("\n");
+  es("scan.step:\n");
+  es("  %sc4 = load i32, ptr %col, align 4\n");
+  es("  %sc5 = add nsw i32 %sc4, 1\n");
+  es("  store i32 %sc5, ptr %col, align 4\n");
+  es("  br label %scan.head\n");
+  es("\n");
+  es("scan.exit:\n");
+  es("  store i32 0, ptr %col, align 4\n");
+  es("  br label %print.head\n");
+  es("\n");
+  es("print.head:\n");
+  es("  %pc = load i32, ptr %col, align 4\n");
+  es("  %lastv = load i32, ptr %last, align 4\n");
+  es("  %pmore = icmp sle i32 %pc, %lastv\n");
+  es("  br i1 %pmore, label %print.body, label %print.newline\n");
+  es("\n");
+  es("print.body:\n");
+  es("  %pc2 = load i32, ptr %col, align 4\n");
+  es("  %needsep = icmp sgt i32 %pc2, 0\n");
+  es("  br i1 %needsep, label %print.separator, label %print.cell\n");
+  es("\n");
+  es("print.separator:\n");
+  es("  %sepres = call i32 @putchar(i32 32)\n");
+  es("  br label %print.cell\n");
+  es("\n");
+  es("print.cell:\n");
+  return 0;
+}
+
+fn emit_runtime_9() {
+  es("  %pr = load i32, ptr %row, align 4\n");
+  es("  %pc3 = load i32, ptr %col, align 4\n");
+  es("  %po0 = mul nsw i32 %pr, ");
+  en(ORDER);
+  es("\n");
+  es("  %po1 = add nsw i32 %po0, %pc3\n");
+  es("  %po2 = sext i32 %po1 to i64\n");
+  es("  %pp = getelementptr inbounds [");
+  en(CELLS);
+  es(" x i8], ptr @canvas, i64 0, i64 %po2\n");
+  es("  %pink = load i8, ptr %pp, align 1\n");
+  es("  %plit = icmp ne i8 %pink, 0\n");
+  es("  %glyph = select i1 %plit, i32 42, i32 32\n");
+  es("  %cellres = call i32 @putchar(i32 %glyph)\n");
+  es("  %pc4 = load i32, ptr %col, align 4\n");
+  es("  %pc5 = add nsw i32 %pc4, 1\n");
+  es("  store i32 %pc5, ptr %col, align 4\n");
+  es("  br label %print.head\n");
+  es("\n");
+  es("print.newline:\n");
+  es("  %nlres = call i32 @putchar(i32 10)\n");
+  es("  %rn = load i32, ptr %row, align 4\n");
+  es("  %rn2 = add nsw i32 %rn, 1\n");
+  es("  store i32 %rn2, ptr %row, align 4\n");
+  es("  br label %row.head\n");
+  es("\n");
+  es("row.done:\n");
+  es("  ret void\n");
+  es("}\n");
+  return 0;
+}
+
+fn emit_runtime() {
+  emit_runtime_0();
+  emit_runtime_1();
+  emit_runtime_2();
+  emit_runtime_3();
+  emit_runtime_4();
+  emit_runtime_5();
+  emit_runtime_6();
+  emit_runtime_7();
+  emit_runtime_8();
+  emit_runtime_9();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# layer 16: lowering the machine to LLVM IR
+# ----------------------------------------------------------------------
+#
+# The operand stack becomes an alloca'd array plus a stack pointer, every
+# instruction address becomes a basic block, and the machine's jumps become
+# branches between them.
+
+var STACK_DEPTH = 256;
+
+fn new_reg() {
+  reg = reg + 1;
+  return reg - 1;
+}
+
+fn er(r) {
+  putchar('%');
+  putchar('g');
+  en(r);
+  return 0;
+}
+
+# An operand is either a virtual register or a literal folded in at compile
+# time; the two are printed the same way everywhere they appear.
+fn eop(is_register, value) {
+  if (is_register == 1) {
+    er(value);
+  } else {
+    en(value);
+  }
+  return 0;
+}
+
+fn push_operand(is_register, value) {
+  var top = new_reg();
+  var slot = new_reg();
+  var bumped = new_reg();
+  es("  ");
+  er(top);
+  es(" = load i64, ptr %sp, align 8\n");
+  es("  ");
+  er(slot);
+  es(" = getelementptr inbounds [");
+  en(STACK_DEPTH);
+  es(" x i64], ptr %stack, i64 0, i64 ");
+  er(top);
+  es("\n");
+  es("  store i64 ");
+  eop(is_register, value);
+  es(", ptr ");
+  er(slot);
+  es(", align 8\n");
+  es("  ");
+  er(bumped);
+  es(" = add nsw i64 ");
+  er(top);
+  es(", 1\n");
+  es("  store i64 ");
+  er(bumped);
+  es(", ptr %sp, align 8\n");
+  return 0;
+}
+
+fn pop_operand() {
+  var top = new_reg();
+  var lowered = new_reg();
+  var slot = new_reg();
+  var value = new_reg();
+  es("  ");
+  er(top);
+  es(" = load i64, ptr %sp, align 8\n");
+  es("  ");
+  er(lowered);
+  es(" = sub nsw i64 ");
+  er(top);
+  es(", 1\n");
+  es("  store i64 ");
+  er(lowered);
+  es(", ptr %sp, align 8\n");
+  es("  ");
+  er(slot);
+  es(" = getelementptr inbounds [");
+  en(STACK_DEPTH);
+  es(" x i64], ptr %stack, i64 0, i64 ");
+  er(lowered);
+  es("\n");
+  es("  ");
+  er(value);
+  es(" = load i64, ptr ");
+  er(slot);
+  es(", align 8\n");
+  return value;
+}
+
+fn frame_slot(slot) {
+  var address = new_reg();
+  es("  ");
+  er(address);
+  es(" = getelementptr inbounds [");
+  en(frame);
+  es(" x i64], ptr %frame, i64 0, i64 ");
+  en(slot);
+  es("\n");
+  return address;
+}
+
+# sdiv truncates towards zero where the interpreter floors, so the quotient
+# is decremented whenever the division was inexact and the remainder and the
+# divisor disagree about sign.
+fn floor_divide(left, right) {
+  var quotient = new_reg();
+  var remainder = new_reg();
+  var inexact = new_reg();
+  var remainder_negative = new_reg();
+  var divisor_negative = new_reg();
+  var signs_differ = new_reg();
+  var correct = new_reg();
+  var decremented = new_reg();
+  var result = new_reg();
+  es("  ");
+  er(quotient);
+  es(" = sdiv i64 ");
+  er(left);
+  es(", ");
+  er(right);
+  es("\n");
+  es("  ");
+  er(remainder);
+  es(" = srem i64 ");
+  er(left);
+  es(", ");
+  er(right);
+  es("\n");
+  es("  ");
+  er(inexact);
+  es(" = icmp ne i64 ");
+  er(remainder);
+  es(", 0\n");
+  es("  ");
+  er(remainder_negative);
+  es(" = icmp slt i64 ");
+  er(remainder);
+  es(", 0\n");
+  es("  ");
+  er(divisor_negative);
+  es(" = icmp slt i64 ");
+  er(right);
+  es(", 0\n");
+  es("  ");
+  er(signs_differ);
+  es(" = xor i1 ");
+  er(remainder_negative);
+  es(", ");
+  er(divisor_negative);
+  es("\n");
+  es("  ");
+  er(correct);
+  es(" = and i1 ");
+  er(inexact);
+  es(", ");
+  er(signs_differ);
+  es("\n");
+  es("  ");
+  er(decremented);
+  es(" = sub nsw i64 ");
+  er(quotient);
+  es(", 1\n");
+  es("  ");
+  er(result);
+  es(" = select i1 ");
+  er(correct);
+  es(", i64 ");
+  er(decremented);
+  es(", i64 ");
+  er(quotient);
+  es("\n");
+  return result;
+}
+
+fn truncate(value) {
+  var narrowed = new_reg();
+  es("  ");
+  er(narrowed);
+  es(" = trunc i64 ");
+  er(value);
+  es(" to i32\n");
+  return narrowed;
+}
+
+fn intrinsic_value(index) {
+  if (index == 0) {
+    return 0;
+  }
+  if (index == 1) {
+    return APOTHEM;
+  }
+  if (index == 2) {
+    return EXTREMUM;
+  }
+  return ORDER;
+}
+
+fn lower_arithmetic(kind) {
+  var right = pop_operand();
+  var left = pop_operand();
+  var result = new_reg();
+  es("  ");
+  er(result);
+  if (kind == OP_ADD) {
+    es(" = add nsw i64 ");
+  }
+  if (kind == OP_SUB) {
+    es(" = sub nsw i64 ");
+  }
+  if (kind == OP_MUL) {
+    es(" = mul nsw i64 ");
+  }
+  er(left);
+  es(", ");
+  er(right);
+  es("\n");
+  push_operand(1, result);
+  return 0;
+}
+
+fn lower_emit_run(orientation) {
+  var upper = truncate(pop_operand());
+  var lower = truncate(pop_operand());
+  var index = truncate(pop_operand());
+  es("  call void @gvm.emit_run(i32 ");
+  en(orientation);
+  es(", i32 ");
+  er(index);
+  es(", i32 ");
+  er(lower);
+  es(", i32 ");
+  er(upper);
+  es(")\n");
+  return 0;
+}
+
+fn lower_close() {
+  es("  call void @gvm.snapshot()\n");
+  var i = 0;
+  while (i < ngroup) {
+    es("  call void @gvm.apply(i32 ");
+    en(mem[GRPA + i]);
+    es(", i32 ");
+    en(mem[GRPB + i]);
+    es(", i32 ");
+    en(mem[GRPC + i]);
+    es(", i32 ");
+    en(mem[GRPD + i]);
+    es(")\n");
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn lower_branch(address, target) {
+  var condition = pop_operand();
+  var test = new_reg();
+  es("  ");
+  er(test);
+  es(" = icmp ne i64 ");
+  er(condition);
+  es(", 0\n");
+  es("  br i1 ");
+  er(test);
+  es(", label %A");
+  en(address + 1);
+  es(", label %A");
+  en(target);
+  es("\n");
+  return 0;
+}
+
+fn lower_stack_op(kind) {
+  if (kind == OP_DIV) {
+    var right = pop_operand();
+    var left = pop_operand();
+    push_operand(1, floor_divide(left, right));
+    return 0;
+  }
+  if (kind == OP_NEG) {
+    var operand = pop_operand();
+    var negated = new_reg();
+    es("  ");
+    er(negated);
+    es(" = sub nsw i64 0, ");
+    er(operand);
+    es("\n");
+    push_operand(1, negated);
+    return 0;
+  }
+  if (kind == OP_CMPLE) {
+    var upper = pop_operand();
+    var lower = pop_operand();
+    var flag = new_reg();
+    var result = new_reg();
+    es("  ");
+    er(flag);
+    es(" = icmp sle i64 ");
+    er(lower);
+    es(", ");
+    er(upper);
+    es("\n");
+    es("  ");
+    er(result);
+    es(" = zext i1 ");
+    er(flag);
+    es(" to i64\n");
+    push_operand(1, result);
+    return 0;
+  }
+  return lower_arithmetic(kind);
+}
+
+fn lower_instruction(address) {
+  var kind = mem[CODEK + address];
+  var argument = mem[CODEA + address];
+  if (kind == OP_HALT) {
+    es("  br label %exit\n");
+    return 0;
+  }
+  if (kind == OP_JMP) {
+    es("  br label %A");
+    en(argument);
+    es("\n");
+    return 0;
+  }
+  if (kind == OP_JF) {
+    lower_branch(address, argument);
+    return 0;
+  }
+  if (kind == OP_PUSH) {
+    push_operand(0, argument);
+  }
+  if (kind == OP_INTR) {
+    push_operand(0, intrinsic_value(argument));
+  }
+  if (kind == OP_LOADL) {
+    var source = frame_slot(argument);
+    var value = new_reg();
+    es("  ");
+    er(value);
+    es(" = load i64, ptr ");
+    er(source);
+    es(", align 8\n");
+    push_operand(1, value);
+  }
+  if (kind == OP_STOREL) {
+    var stored = pop_operand();
+    var target = frame_slot(argument);
+    es("  store i64 ");
+    er(stored);
+    es(", ptr ");
+    er(target);
+    es(", align 8\n");
+  }
+  if (kind == OP_ADD || kind == OP_SUB || kind == OP_MUL || kind == OP_DIV
+      || kind == OP_NEG || kind == OP_CMPLE) {
+    lower_stack_op(kind);
+  }
+  if (kind == OP_MKIV) {
+    es("  ; make.interval is erased: bounds stay on the stack\n");
+  }
+  if (kind == OP_EMIT) {
+    lower_emit_run(argument);
+  }
+  if (kind == OP_CLOSE) {
+    lower_close();
+  }
+  es("  br label %A");
+  en(address + 1);
+  es("\n");
+  return 0;
+}
+
+fn emit_entry_point() {
+  es("define i32 @main() {\n");
+  es("entry:\n");
+  es("  %stack = alloca [");
+  en(STACK_DEPTH);
+  es(" x i64], align 8\n");
+  es("  %sp = alloca i64, align 8\n");
+  es("  %frame = alloca [");
+  en(frame);
+  es(" x i64], align 8\n");
+  es("  store i64 0, ptr %sp, align 8\n");
+  var slot = 0;
+  while (slot < frame) {
+    var address = frame_slot(slot);
+    es("  store i64 0, ptr ");
+    er(address);
+    es(", align 8\n");
+    slot = slot + 1;
+  }
+  es("  br label %A0\n");
+  var i = 0;
+  while (i < ncode) {
+    es("\nA");
+    en(i);
+    es(":\n");
+    lower_instruction(i);
+    i = i + 1;
+  }
+  es("\nexit:\n");
+  es("  call void @gvm.render()\n");
+  es("  ");
+  er(new_reg());
+  es(" = call i32 @fflush(ptr null)\n");
+  es("  ret i32 0\n");
+  es("}\n");
+  return 0;
+}
+
+fn emit_module() {
+  es("; ModuleID = 'glyph.canonical'\n");
+  es("source_filename = \"canonical.gsl\"\n");
+  es("target triple = \"x86_64-unknown-linux-gnu\"\n");
+  emit_runtime();
+  es("\n");
+  emit_entry_point();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the driver
+# ----------------------------------------------------------------------
+
+fn main() {
+  read_stdin();
+  preprocess();
+  tokenize();
+  parse_program();
+  optimise();
+  assemble();
+  group_build();
+  emit_module();
+  return 0;
+}
+'''
+
 _S0_OUT: list[str] = []
 _S0_SOURCE: str = ""
 
@@ -7890,6 +10339,105 @@ def bootstrap(workdir: Path | None = None, opt_level: int = 2) -> BootstrapRepor
     )
 
 
+# ----------------------------------------------------------------------
+# closing the loop
+# ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LoopCase:
+    """One motif compiled the long way round and checked against the short."""
+
+    motif: str
+    order: int
+    identical: bool
+    glyph: str
+    expected: str
+
+    @property
+    def renders(self) -> bool:
+        return self.glyph == self.expected
+
+    @property
+    def passed(self) -> bool:
+        return self.identical and self.renders
+
+
+@dataclass(frozen=True, slots=True)
+class LoopReport:
+    """The outcome of driving a motif through the native front end."""
+
+    workdir: Path
+    glyphc_ir: str
+    cases: tuple[LoopCase, ...]
+
+    @property
+    def clean(self) -> bool:
+        return all(case.passed for case in self.cases)
+
+
+def build_front_end(directory: Path, opt_level: int = 2) -> tuple[Path, str]:
+    """Builds glyphc without Python compiling anything but the seed's one turn.
+
+    The seed compiles gslc.gsl2; that binary compiles its own source, which is
+    where Python stops; and the compiler that comes out of it compiles the GSL
+    front end.  Returns the front end and the IR it was built from.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gslc.gsl2").write_text(GSLC_GSL2)
+    (directory / "glyphc.gsl2").write_text(GLYPHC_GSL2)
+
+    seeded = link_executable(gsl2_compile(GSLC_GSL2), directory / "stage1", opt_level)
+    gslc_ir = _run(seeded, GSLC_GSL2)
+    (directory / "gslc.ll").write_text(gslc_ir)
+    gslc = link_executable(gslc_ir, directory / "gslc", opt_level)
+
+    glyphc_ir = _run(gslc, GLYPHC_GSL2)
+    (directory / "glyphc.ll").write_text(glyphc_ir)
+    return link_executable(glyphc_ir, directory / "glyphc", opt_level), glyphc_ir
+
+
+def close_the_loop(
+    workdir: Path | None = None,
+    opt_level: int = 2,
+    orders: Sequence[int] = (3, 7, 11, 21),
+    motifs: Sequence[str] | None = None,
+) -> LoopReport:
+    """Compiles a motif with a front end that Python had no hand in running.
+
+    The seed turns the crank once, on gslc.gsl2 alone.  From there GSL-2
+    compiles itself, the compiler it produces compiles glyphc.gsl2, and that
+    binary compiles the motif: text in, LLVM IR out, no interpreter anywhere
+    in the chain.  The result is compared byte for byte against what layer 16
+    emits for the same source, and the linked glyph against what the virtual
+    machine renders.
+    """
+    directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-loop-"))
+    glyphc, glyphc_ir = build_front_end(directory, opt_level)
+
+    cases: list[LoopCase] = []
+    for motif in motifs if motifs is not None else Motif.catalogue():
+        for order in orders:
+            source = typing.cast(type, Motif.lookup(motif))().source(order)
+            stem = f"{motif}-{order}"
+            (directory / f"{stem}.gsl").write_text(source)
+            produced = _run(glyphc, source)
+            (directory / f"{stem}.ll").write_text(produced)
+            artifacts = synthesize_source(source, order).unwrap_or_raise()
+            reference = LlvmLoweringBackend().lower(artifacts.module).text
+            binary = link_executable(produced, directory / stem, opt_level)
+            cases.append(
+                LoopCase(
+                    motif=motif,
+                    order=order,
+                    identical=produced == reference,
+                    glyph=_run(binary, "").removesuffix("\n"),
+                    expected=artifacts.rendering,
+                )
+            )
+    return LoopReport(directory, glyphc_ir, tuple(cases))
+
+
 # ======================================================================
 # driver
 # ======================================================================
@@ -7948,6 +10496,30 @@ def _emit_bootstrap_report(report: BootstrapReport) -> int:
     return 0 if (report.seed_agrees and report.fixpoint) else 1
 
 
+def _emit_loop_report(report: LoopReport) -> int:
+    rule = "-" * 60
+    print(rule)
+    print("  python3  ->  gslc      the seed compiles the GSL-2 compiler, once")
+    print("  gslc     ->  gslc      and from here the language compiles itself")
+    print(f"  gslc     ->  glyphc    it compiles the GSL front end"
+          f"   ({len(report.glyphc_ir.splitlines())} lines of IR)")
+    print("  glyphc   ->  glyph     and that front end compiles the glyph")
+    print(rule)
+    print(f"  {'motif':<16}{'n':>4}   {'IR == layer 16':<16}glyph == tier 1")
+    for case in report.cases:
+        identical = "[ok]  " if case.identical else "[FAIL]"
+        renders = "[ok]  " if case.renders else "[FAIL]"
+        print(f"  {case.motif:<16}{case.order:>4}   {identical:<16}{renders}")
+    print(rule)
+    for case in report.cases:
+        if case.motif == "pinwheel" and case.order == 7:
+            print(case.glyph)
+            print(rule)
+            break
+    print(f"artifacts in {report.workdir}")
+    return 0 if report.clean else 1
+
+
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ouroboros",
@@ -7996,13 +10568,16 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
     boot.add_argument("--workdir", metavar="PATH")
-    boot.add_argument("--emit-gsl2", choices=("gslc", "glyph"))
+    boot.add_argument("--emit-gsl2", choices=("gslc", "glyph", "glyphc"))
+    boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
 
     fuzzing = parser.add_argument_group("differential fuzzing")
     fuzzing.add_argument("--fuzz", type=int, metavar="N", help="cross-check N random programs")
     fuzzing.add_argument("--fuzz-seed", type=int, default=0)
     fuzzing.add_argument("--fuzz-native", action="store_true", help="also link and run each case")
+    fuzzing.add_argument("--fuzz-loop", action="store_true",
+                         help="also compile each case with the GSL-2 front end")
     return parser.parse_args(argv)
 
 
@@ -8065,12 +10640,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("themes:", ", ".join(Theme.catalogue()))
         return 0
     if namespace.emit_gsl2:
-        sys.stdout.write(GSLC_GSL2 if namespace.emit_gsl2 == "gslc" else GLYPH_GSL2)
+        sys.stdout.write(
+            {"gslc": GSLC_GSL2, "glyph": GLYPH_GSL2, "glyphc": GLYPHC_GSL2}[
+                namespace.emit_gsl2
+            ]
+        )
         return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))
     if namespace.fuzz is not None:
-        report = fuzz(namespace.fuzz, namespace.fuzz_seed, namespace.fuzz_native)
+        report = fuzz(
+            namespace.fuzz, namespace.fuzz_seed, namespace.fuzz_native, namespace.fuzz_loop
+        )
         print(report.render())
         return 0 if report.clean else 1
     if namespace.bootstrap:
@@ -8079,6 +10660,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit_bootstrap_report(bootstrap(workdir, namespace.opt_level or 2))
         except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
             print(f"bootstrap unavailable: {exc}", file=sys.stderr)
+            return 3
+    if namespace.close_the_loop:
+        try:
+            workdir = Path(namespace.workdir) if namespace.workdir else None
+            return _emit_loop_report(close_the_loop(workdir, namespace.opt_level or 2))
+        except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
+            print(f"the loop cannot be closed here: {exc}", file=sys.stderr)
             return 3
 
     CATALOG = MessageCatalog(namespace.lang or "en")
