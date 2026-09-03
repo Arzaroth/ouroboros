@@ -1,0 +1,86 @@
+# Every claim the commit messages make, checked by a stranger's machine.
+#
+# The first job installs nothing at all, which is the whole point of tier 5:
+# a static executable, and four tiers cross-checked against each other, out of
+# the standard library alone.  The second installs llvmlite and runs the rest.
+#
+# The fuzz seed is the run number, so consecutive runs explore different
+# programs rather than re-checking the same ones.
+
+name: ouroboros
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  bare:
+    name: python ${{ matrix.python }}, nothing installed
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: nothing is installed
+        run: "! python -c 'import llvmlite' 2>/dev/null"
+
+      - name: render
+        run: python ouroboros.py
+
+      - name: the assurance battery
+        run: python ouroboros.py --self-test
+
+      - name: every tier that needs no toolchain
+        run: python ouroboros.py --selftest
+
+      - name: 200 random programs across those tiers
+        run: python ouroboros.py --fuzz 200 --fuzz-seed ${{ github.run_number }}
+
+      - name: a static executable, written without one
+        run: |
+          python ouroboros.py --emit-elf glyph
+          file glyph
+          diff <(./glyph) <(python ouroboros.py)
+
+  toolchain:
+    name: llvm, the bootstrap and the closed loop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install llvmlite
+
+      - name: every tier
+        run: python ouroboros.py --selftest
+
+      - name: the assurance battery
+        run: python ouroboros.py --self-test
+
+      - name: every introspection dump still renders
+        run: python ouroboros.py --emit-everything > /dev/null 2>&1
+
+      - name: lower, verify and JIT
+        run: |
+          python ouroboros.py --emit-llvm --verify-llvm > glyph.ll
+          diff <(python ouroboros.py --jit) <(python ouroboros.py)
+
+      - name: the self-hosting bootstrap reaches its fixpoint
+        run: python ouroboros.py --bootstrap
+
+      - name: the GSL-2 front end agrees with layer 16, byte for byte
+        run: python ouroboros.py --close-the-loop
+
+      - name: 120 random programs across every tier there is
+        run: |
+          python ouroboros.py --fuzz 120 --fuzz-seed ${{ github.run_number }} \
+            --fuzz-native --fuzz-loop
