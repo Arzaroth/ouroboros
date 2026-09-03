@@ -1851,6 +1851,2625 @@ def synthesize(order: int = DEFAULT_LATTICE_ORDER) -> Result[CompilationArtifact
 
 
 # ======================================================================
+# Tier 3: the GSL-2 self-hosting bootstrap
+# ======================================================================
+#
+# GSL-1 cannot express a compiler, so self-hosting needs a second, general
+# language.  GSL-2 is that language: one integer type, one flat memory, and
+# just enough control flow to write a compiler in.  The compiler for it is
+# written in itself and embedded below verbatim; the Python seed that
+# follows exists only to turn the crank the first time.
+
+
+class Gsl2Error(GlyphPlatformError):
+    """The GSL-2 seed compiler rejected a translation unit."""
+
+
+GSLC_GSL2: Final[str] = r'''# gslc.gsl2 - the GSL-2 compiler, written in GSL-2.
+#
+# Reads GSL-2 source on stdin, writes LLVM IR on stdout.  Semantically
+# identical to the stage-0 compiler gsl2c.py: for any accepted input both
+# emit the same bytes, which is what makes the bootstrap fixpoint checkable.
+
+var MEMSIZE = 2000000;
+var STRBASE = 1500000;
+var STRLIMIT = 490000;
+var FRAME = 64;
+var MAXGLOBALS = 256;
+
+var SRC = 0;
+var STRBUF = 500000;
+var LOCNAME = 900000;
+var LOCLEN = 900100;
+var GLBNAME = 900200;
+var GLBLEN = 900600;
+var TOKBUF = 950000;
+
+var T_EOF = 0;
+var T_NUM = 1;
+var T_IDENT = 2;
+var T_STR = 3;
+var T_LPAREN = 4;
+var T_RPAREN = 5;
+var T_LBRACE = 6;
+var T_RBRACE = 7;
+var T_LBRACK = 8;
+var T_RBRACK = 9;
+var T_COMMA = 10;
+var T_SEMI = 11;
+var T_ASSIGN = 12;
+var T_EQ = 13;
+var T_NE = 14;
+var T_LT = 15;
+var T_LE = 16;
+var T_GT = 17;
+var T_GE = 18;
+var T_PLUS = 19;
+var T_MINUS = 20;
+var T_STAR = 21;
+var T_SLASH = 22;
+var T_PERCENT = 23;
+var T_NOT = 24;
+var T_ANDAND = 25;
+var T_OROR = 26;
+var T_FN = 27;
+var T_VAR = 28;
+var T_IF = 29;
+var T_ELSE = 30;
+var T_WHILE = 31;
+var T_RETURN = 32;
+var T_MEM = 33;
+
+var pos = 0;
+var srclen = 0;
+var strtop = 1;
+var nlocals = 0;
+var nglobals = 0;
+var regcnt = 0;
+var labelcnt = 0;
+var line = 1;
+
+fn strlen(s) {
+  var i = 0;
+  while (mem[s + i] != 0) {
+    i = i + 1;
+  }
+  return i;
+}
+
+fn es(s) {
+  var i = 0;
+  while (mem[s + i] != 0) {
+    putchar(mem[s + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn en(n) {
+  if (n < 0) {
+    putchar('-');
+    n = 0 - n;
+  }
+  if (n >= 10) {
+    en(n / 10);
+  }
+  putchar(48 + n % 10);
+  return 0;
+}
+
+fn ec(c) {
+  putchar(c);
+  return 0;
+}
+
+fn fail(msg) {
+  es("; error: ");
+  es(msg);
+  es(" near line ");
+  en(line);
+  es("\n");
+  exit(1);
+  return 0;
+}
+
+fn kw_is(start, length, word) {
+  if (length != strlen(word)) {
+    return 0;
+  }
+  var i = 0;
+  while (i < length) {
+    if (mem[start + i] != mem[word + i]) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn name_eq(a, alen, b, blen) {
+  if (alen != blen) {
+    return 0;
+  }
+  var i = 0;
+  while (i < alen) {
+    if (mem[a + i] != mem[b + i]) {
+      return 0;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
+
+fn emit_name(start, length) {
+  var i = 0;
+  while (i < length) {
+    ec(mem[start + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# lexer
+# ----------------------------------------------------------------------
+
+fn is_digit(c) {
+  if (c >= 48 && c <= 57) {
+    return 1;
+  }
+  return 0;
+}
+
+fn is_alpha(c) {
+  if (c >= 97 && c <= 122) {
+    return 1;
+  }
+  if (c >= 65 && c <= 90) {
+    return 1;
+  }
+  if (c == 95) {
+    return 1;
+  }
+  return 0;
+}
+
+fn is_alnum(c) {
+  if (is_alpha(c)) {
+    return 1;
+  }
+  return is_digit(c);
+}
+
+fn skip_ws() {
+  while (1) {
+    var c = mem[SRC + pos];
+    if (c == 35) {
+      while (mem[SRC + pos] != 10 && mem[SRC + pos] != 0) {
+        pos = pos + 1;
+      }
+    } else {
+      if (c == 10) {
+        line = line + 1;
+        pos = pos + 1;
+      } else {
+        if (c == 32 || c == 9 || c == 13) {
+          pos = pos + 1;
+        } else {
+          return 0;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+fn escape_of(c) {
+  if (c == 110) {
+    return 10;
+  }
+  if (c == 116) {
+    return 9;
+  }
+  if (c == 48) {
+    return 0;
+  }
+  if (c == 92) {
+    return 92;
+  }
+  if (c == 34) {
+    return 34;
+  }
+  if (c == 39) {
+    return 39;
+  }
+  if (c == 114) {
+    return 13;
+  }
+  fail("bad escape");
+  return 0;
+}
+
+fn scan(slot) {
+  var base = TOKBUF + slot * 4;
+  skip_ws();
+  var c = mem[SRC + pos];
+  mem[base + 1] = 0;
+  mem[base + 2] = SRC + pos;
+  mem[base + 3] = 0;
+  if (c == 0) {
+    mem[base] = T_EOF;
+    return 0;
+  }
+  if (is_digit(c)) {
+    var v = 0;
+    while (is_digit(mem[SRC + pos])) {
+      v = v * 10 + mem[SRC + pos] - 48;
+      pos = pos + 1;
+    }
+    mem[base] = T_NUM;
+    mem[base + 1] = v;
+    return 0;
+  }
+  if (is_alpha(c)) {
+    var start = SRC + pos;
+    while (is_alnum(mem[SRC + pos])) {
+      pos = pos + 1;
+    }
+    var length = SRC + pos - start;
+    mem[base + 2] = start;
+    mem[base + 3] = length;
+    if (kw_is(start, length, "fn")) {
+      mem[base] = T_FN;
+      return 0;
+    }
+    if (kw_is(start, length, "var")) {
+      mem[base] = T_VAR;
+      return 0;
+    }
+    if (kw_is(start, length, "if")) {
+      mem[base] = T_IF;
+      return 0;
+    }
+    if (kw_is(start, length, "else")) {
+      mem[base] = T_ELSE;
+      return 0;
+    }
+    if (kw_is(start, length, "while")) {
+      mem[base] = T_WHILE;
+      return 0;
+    }
+    if (kw_is(start, length, "return")) {
+      mem[base] = T_RETURN;
+      return 0;
+    }
+    if (kw_is(start, length, "mem")) {
+      mem[base] = T_MEM;
+      return 0;
+    }
+    mem[base] = T_IDENT;
+    return 0;
+  }
+  if (c == 39) {
+    pos = pos + 1;
+    var w = mem[SRC + pos];
+    if (w == 92) {
+      pos = pos + 1;
+      w = escape_of(mem[SRC + pos]);
+    }
+    pos = pos + 1;
+    if (mem[SRC + pos] != 39) {
+      fail("unterminated char literal");
+    }
+    pos = pos + 1;
+    mem[base] = T_NUM;
+    mem[base + 1] = w;
+    return 0;
+  }
+  if (c == 34) {
+    pos = pos + 1;
+    var off = STRBASE + strtop;
+    while (mem[SRC + pos] != 34) {
+      if (mem[SRC + pos] == 0) {
+        fail("unterminated string literal");
+      }
+      var u = mem[SRC + pos];
+      if (u == 92) {
+        pos = pos + 1;
+        u = escape_of(mem[SRC + pos]);
+      }
+      mem[STRBUF + strtop] = u;
+      strtop = strtop + 1;
+      pos = pos + 1;
+    }
+    pos = pos + 1;
+    mem[STRBUF + strtop] = 0;
+    strtop = strtop + 1;
+    if (strtop > STRLIMIT) {
+      fail("string pool overflow");
+    }
+    mem[base] = T_STR;
+    mem[base + 1] = off;
+    return 0;
+  }
+  pos = pos + 1;
+  var d = mem[SRC + pos];
+  if (c == 61) {
+    if (d == 61) {
+      pos = pos + 1;
+      mem[base] = T_EQ;
+      return 0;
+    }
+    mem[base] = T_ASSIGN;
+    return 0;
+  }
+  if (c == 33) {
+    if (d == 61) {
+      pos = pos + 1;
+      mem[base] = T_NE;
+      return 0;
+    }
+    mem[base] = T_NOT;
+    return 0;
+  }
+  if (c == 60) {
+    if (d == 61) {
+      pos = pos + 1;
+      mem[base] = T_LE;
+      return 0;
+    }
+    mem[base] = T_LT;
+    return 0;
+  }
+  if (c == 62) {
+    if (d == 61) {
+      pos = pos + 1;
+      mem[base] = T_GE;
+      return 0;
+    }
+    mem[base] = T_GT;
+    return 0;
+  }
+  if (c == 38) {
+    if (d == 38) {
+      pos = pos + 1;
+      mem[base] = T_ANDAND;
+      return 0;
+    }
+    fail("single & is not an operator");
+  }
+  if (c == 124) {
+    if (d == 124) {
+      pos = pos + 1;
+      mem[base] = T_OROR;
+      return 0;
+    }
+    fail("single | is not an operator");
+  }
+  if (c == 40) {
+    mem[base] = T_LPAREN;
+    return 0;
+  }
+  if (c == 41) {
+    mem[base] = T_RPAREN;
+    return 0;
+  }
+  if (c == 123) {
+    mem[base] = T_LBRACE;
+    return 0;
+  }
+  if (c == 125) {
+    mem[base] = T_RBRACE;
+    return 0;
+  }
+  if (c == 91) {
+    mem[base] = T_LBRACK;
+    return 0;
+  }
+  if (c == 93) {
+    mem[base] = T_RBRACK;
+    return 0;
+  }
+  if (c == 44) {
+    mem[base] = T_COMMA;
+    return 0;
+  }
+  if (c == 59) {
+    mem[base] = T_SEMI;
+    return 0;
+  }
+  if (c == 43) {
+    mem[base] = T_PLUS;
+    return 0;
+  }
+  if (c == 45) {
+    mem[base] = T_MINUS;
+    return 0;
+  }
+  if (c == 42) {
+    mem[base] = T_STAR;
+    return 0;
+  }
+  if (c == 47) {
+    mem[base] = T_SLASH;
+    return 0;
+  }
+  if (c == 37) {
+    mem[base] = T_PERCENT;
+    return 0;
+  }
+  fail("unexpected character");
+  return 0;
+}
+
+fn tk() {
+  return mem[TOKBUF];
+}
+
+fn tnum() {
+  return mem[TOKBUF + 1];
+}
+
+fn tstart() {
+  return mem[TOKBUF + 2];
+}
+
+fn tlen() {
+  return mem[TOKBUF + 3];
+}
+
+fn tk2() {
+  return mem[TOKBUF + 4];
+}
+
+fn advance() {
+  mem[TOKBUF] = mem[TOKBUF + 4];
+  mem[TOKBUF + 1] = mem[TOKBUF + 5];
+  mem[TOKBUF + 2] = mem[TOKBUF + 6];
+  mem[TOKBUF + 3] = mem[TOKBUF + 7];
+  scan(1);
+  return 0;
+}
+
+fn expect(kind, what) {
+  if (tk() != kind) {
+    fail(what);
+  }
+  advance();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# symbol tables
+# ----------------------------------------------------------------------
+
+fn declare_local(start, length) {
+  if (nlocals >= FRAME) {
+    fail("too many locals in one function");
+  }
+  mem[LOCNAME + nlocals] = start;
+  mem[LOCLEN + nlocals] = length;
+  nlocals = nlocals + 1;
+  return nlocals - 1;
+}
+
+fn find_local(start, length) {
+  var i = nlocals - 1;
+  while (i >= 0) {
+    if (name_eq(mem[LOCNAME + i], mem[LOCLEN + i], start, length)) {
+      return i;
+    }
+    i = i - 1;
+  }
+  return 0 - 1;
+}
+
+fn declare_global(start, length) {
+  if (nglobals >= MAXGLOBALS) {
+    fail("too many globals");
+  }
+  mem[GLBNAME + nglobals] = start;
+  mem[GLBLEN + nglobals] = length;
+  nglobals = nglobals + 1;
+  return nglobals - 1;
+}
+
+fn find_global(start, length) {
+  var i = nglobals - 1;
+  while (i >= 0) {
+    if (name_eq(mem[GLBNAME + i], mem[GLBLEN + i], start, length)) {
+      return i;
+    }
+    i = i - 1;
+  }
+  return 0 - 1;
+}
+
+fn alloc_temp_slot() {
+  if (nlocals >= FRAME) {
+    fail("frame overflow");
+  }
+  mem[LOCNAME + nlocals] = 0;
+  mem[LOCLEN + nlocals] = 0;
+  nlocals = nlocals + 1;
+  return nlocals - 1;
+}
+
+# ----------------------------------------------------------------------
+# emission primitives
+# ----------------------------------------------------------------------
+
+fn new_reg() {
+  regcnt = regcnt + 1;
+  return regcnt;
+}
+
+fn new_label() {
+  labelcnt = labelcnt + 1;
+  return labelcnt;
+}
+
+fn er(r) {
+  es("%t");
+  en(r);
+  return 0;
+}
+
+fn elabel(l) {
+  es("L");
+  en(l);
+  return 0;
+}
+
+fn emit_label(l) {
+  elabel(l);
+  es(":\n");
+  return 0;
+}
+
+fn emit_br(l) {
+  es("  br label %");
+  elabel(l);
+  es("\n");
+  return 0;
+}
+
+fn emit_cond_br(r, a, b) {
+  var t = new_reg();
+  es("  ");
+  er(t);
+  es(" = icmp ne i64 ");
+  er(r);
+  es(", 0\n");
+  es("  br i1 ");
+  er(t);
+  es(", label %");
+  elabel(a);
+  es(", label %");
+  elabel(b);
+  es("\n");
+  return 0;
+}
+
+fn gen_const(v) {
+  var r = new_reg();
+  es("  ");
+  er(r);
+  es(" = add i64 0, ");
+  en(v);
+  es("\n");
+  return r;
+}
+
+fn gen_slot_addr(slot) {
+  var r = new_reg();
+  es("  ");
+  er(r);
+  es(" = getelementptr inbounds [");
+  en(FRAME);
+  es(" x i64], ptr %frame, i64 0, i64 ");
+  en(slot);
+  es("\n");
+  return r;
+}
+
+fn gen_mem_addr(index_reg) {
+  var r = new_reg();
+  es("  ");
+  er(r);
+  es(" = getelementptr inbounds [");
+  en(MEMSIZE);
+  es(" x i64], ptr @memory, i64 0, i64 ");
+  er(index_reg);
+  es("\n");
+  return r;
+}
+
+fn gen_load(addr_reg) {
+  var r = new_reg();
+  es("  ");
+  er(r);
+  es(" = load i64, ptr ");
+  er(addr_reg);
+  es(", align 8\n");
+  return r;
+}
+
+fn gen_store(value_reg, addr_reg) {
+  es("  store i64 ");
+  er(value_reg);
+  es(", ptr ");
+  er(addr_reg);
+  es(", align 8\n");
+  return 0;
+}
+
+fn gen_global_load(start, length) {
+  var r = new_reg();
+  es("  ");
+  er(r);
+  es(" = load i64, ptr @g_");
+  emit_name(start, length);
+  es(", align 8\n");
+  return r;
+}
+
+fn gen_global_store(value_reg, start, length) {
+  es("  store i64 ");
+  er(value_reg);
+  es(", ptr @g_");
+  emit_name(start, length);
+  es(", align 8\n");
+  return 0;
+}
+
+fn gen_binary(op, a, b) {
+  var r = new_reg();
+  es("  ");
+  er(r);
+  if (op == T_PLUS) {
+    es(" = add nsw i64 ");
+  }
+  if (op == T_MINUS) {
+    es(" = sub nsw i64 ");
+  }
+  if (op == T_STAR) {
+    es(" = mul nsw i64 ");
+  }
+  if (op == T_SLASH) {
+    es(" = sdiv i64 ");
+  }
+  if (op == T_PERCENT) {
+    es(" = srem i64 ");
+  }
+  er(a);
+  es(", ");
+  er(b);
+  es("\n");
+  return r;
+}
+
+fn gen_compare(op, a, b) {
+  var c = new_reg();
+  es("  ");
+  er(c);
+  if (op == T_EQ) {
+    es(" = icmp eq i64 ");
+  }
+  if (op == T_NE) {
+    es(" = icmp ne i64 ");
+  }
+  if (op == T_LT) {
+    es(" = icmp slt i64 ");
+  }
+  if (op == T_LE) {
+    es(" = icmp sle i64 ");
+  }
+  if (op == T_GT) {
+    es(" = icmp sgt i64 ");
+  }
+  if (op == T_GE) {
+    es(" = icmp sge i64 ");
+  }
+  er(a);
+  es(", ");
+  er(b);
+  es("\n");
+  var r = new_reg();
+  es("  ");
+  er(r);
+  es(" = zext i1 ");
+  er(c);
+  es(" to i64\n");
+  return r;
+}
+
+# ----------------------------------------------------------------------
+# expressions
+# ----------------------------------------------------------------------
+
+fn parse_call_builtin(kind, first_arg) {
+  if (kind == 1) {
+    var t = new_reg();
+    es("  ");
+    er(t);
+    es(" = trunc i64 ");
+    er(first_arg);
+    es(" to i32\n");
+    var u = new_reg();
+    es("  ");
+    er(u);
+    es(" = call i32 @putchar(i32 ");
+    er(t);
+    es(")\n");
+    var r = new_reg();
+    es("  ");
+    er(r);
+    es(" = sext i32 ");
+    er(u);
+    es(" to i64\n");
+    return r;
+  }
+  if (kind == 2) {
+    var u2 = new_reg();
+    es("  ");
+    er(u2);
+    es(" = call i32 @getchar()\n");
+    var r2 = new_reg();
+    es("  ");
+    er(r2);
+    es(" = sext i32 ");
+    er(u2);
+    es(" to i64\n");
+    return r2;
+  }
+  var t3 = new_reg();
+  es("  ");
+  er(t3);
+  es(" = trunc i64 ");
+  er(first_arg);
+  es(" to i32\n");
+  es("  call void @exit(i32 ");
+  er(t3);
+  es(")\n");
+  return gen_const(0);
+}
+
+fn parse_primary() {
+  if (tk() == T_NUM) {
+    var v = tnum();
+    advance();
+    return gen_const(v);
+  }
+  if (tk() == T_STR) {
+    var v2 = tnum();
+    advance();
+    return gen_const(v2);
+  }
+  if (tk() == T_LPAREN) {
+    advance();
+    var r = parse_expr();
+    expect(T_RPAREN, "expected )");
+    return r;
+  }
+  if (tk() == T_MEM) {
+    advance();
+    expect(T_LBRACK, "expected [ after mem");
+    var i0 = parse_expr();
+    expect(T_RBRACK, "expected ]");
+    return gen_load(gen_mem_addr(i0));
+  }
+  if (tk() == T_IDENT) {
+    var start = tstart();
+    var length = tlen();
+    advance();
+    if (tk() != T_LPAREN) {
+      var slot = find_local(start, length);
+      if (slot >= 0) {
+        return gen_load(gen_slot_addr(slot));
+      }
+      if (find_global(start, length) >= 0) {
+        return gen_global_load(start, length);
+      }
+      fail("unknown identifier");
+    }
+    advance();
+    if (kw_is(start, length, "putchar")) {
+      var a1 = parse_expr();
+      expect(T_RPAREN, "expected )");
+      return parse_call_builtin(1, a1);
+    }
+    if (kw_is(start, length, "getchar")) {
+      expect(T_RPAREN, "expected )");
+      return parse_call_builtin(2, 0);
+    }
+    if (kw_is(start, length, "exit")) {
+      var a2 = parse_expr();
+      expect(T_RPAREN, "expected )");
+      return parse_call_builtin(3, a2);
+    }
+    var nargs = 0;
+    while (tk() != T_RPAREN) {
+      if (nargs > 0) {
+        expect(T_COMMA, "expected , between arguments");
+      }
+      mem[TOKBUF + 100 + nargs] = parse_expr();
+      nargs = nargs + 1;
+      if (nargs > 8) {
+        fail("too many arguments");
+      }
+    }
+    advance();
+    var r2 = new_reg();
+    es("  ");
+    er(r2);
+    es(" = call i64 @f_");
+    emit_name(start, length);
+    es("(");
+    var i = 0;
+    while (i < nargs) {
+      if (i > 0) {
+        es(", ");
+      }
+      es("i64 ");
+      er(mem[TOKBUF + 100 + i]);
+      i = i + 1;
+    }
+    es(")\n");
+    return r2;
+  }
+  fail("expected an expression");
+  return 0;
+}
+
+fn parse_unary() {
+  if (tk() == T_MINUS) {
+    advance();
+    var a = parse_unary();
+    return gen_binary(T_MINUS, gen_const(0), a);
+  }
+  if (tk() == T_NOT) {
+    advance();
+    var b = parse_unary();
+    return gen_compare(T_EQ, b, gen_const(0));
+  }
+  return parse_primary();
+}
+
+fn parse_mul() {
+  var a = parse_unary();
+  while (tk() == T_STAR || tk() == T_SLASH || tk() == T_PERCENT) {
+    var op = tk();
+    advance();
+    var b = parse_unary();
+    a = gen_binary(op, a, b);
+  }
+  return a;
+}
+
+fn parse_add() {
+  var a = parse_mul();
+  while (tk() == T_PLUS || tk() == T_MINUS) {
+    var op = tk();
+    advance();
+    var b = parse_mul();
+    a = gen_binary(op, a, b);
+  }
+  return a;
+}
+
+fn parse_rel() {
+  var a = parse_add();
+  while (tk() == T_LT || tk() == T_LE || tk() == T_GT || tk() == T_GE) {
+    var op = tk();
+    advance();
+    var b = parse_add();
+    a = gen_compare(op, a, b);
+  }
+  return a;
+}
+
+fn parse_eq() {
+  var a = parse_rel();
+  while (tk() == T_EQ || tk() == T_NE) {
+    var op = tk();
+    advance();
+    var b = parse_rel();
+    a = gen_compare(op, a, b);
+  }
+  return a;
+}
+
+fn parse_and() {
+  var a = parse_eq();
+  while (tk() == T_ANDAND) {
+    advance();
+    var slot = alloc_temp_slot();
+    var s1 = gen_slot_addr(slot);
+    es("  store i64 0, ptr ");
+    er(s1);
+    es(", align 8\n");
+    var lrhs = new_label();
+    var lend = new_label();
+    emit_cond_br(a, lrhs, lend);
+    emit_label(lrhs);
+    var b = parse_eq();
+    var v = gen_compare(T_NE, b, gen_const(0));
+    gen_store(v, gen_slot_addr(slot));
+    emit_br(lend);
+    emit_label(lend);
+    a = gen_load(gen_slot_addr(slot));
+  }
+  return a;
+}
+
+fn parse_or() {
+  var a = parse_and();
+  while (tk() == T_OROR) {
+    advance();
+    var slot = alloc_temp_slot();
+    var s1 = gen_slot_addr(slot);
+    es("  store i64 1, ptr ");
+    er(s1);
+    es(", align 8\n");
+    var lrhs = new_label();
+    var lend = new_label();
+    emit_cond_br(a, lend, lrhs);
+    emit_label(lrhs);
+    var b = parse_and();
+    var v = gen_compare(T_NE, b, gen_const(0));
+    gen_store(v, gen_slot_addr(slot));
+    emit_br(lend);
+    emit_label(lend);
+    a = gen_load(gen_slot_addr(slot));
+  }
+  return a;
+}
+
+fn parse_expr() {
+  return parse_or();
+}
+
+# ----------------------------------------------------------------------
+# statements
+# ----------------------------------------------------------------------
+
+fn parse_block() {
+  expect(T_LBRACE, "expected {");
+  while (tk() != T_RBRACE) {
+    if (tk() == T_EOF) {
+      fail("unterminated block");
+    }
+    parse_stmt();
+  }
+  advance();
+  return 0;
+}
+
+fn parse_stmt() {
+  if (tk() == T_VAR) {
+    advance();
+    if (tk() != T_IDENT) {
+      fail("expected a name after var");
+    }
+    var start = tstart();
+    var length = tlen();
+    advance();
+    expect(T_ASSIGN, "expected = in var declaration");
+    var r = parse_expr();
+    expect(T_SEMI, "expected ;");
+    var slot = declare_local(start, length);
+    gen_store(r, gen_slot_addr(slot));
+    return 0;
+  }
+  if (tk() == T_IF) {
+    advance();
+    expect(T_LPAREN, "expected ( after if");
+    var c = parse_expr();
+    expect(T_RPAREN, "expected )");
+    var lthen = new_label();
+    var lelse = new_label();
+    var lend = new_label();
+    emit_cond_br(c, lthen, lelse);
+    emit_label(lthen);
+    parse_block();
+    emit_br(lend);
+    emit_label(lelse);
+    if (tk() == T_ELSE) {
+      advance();
+      parse_block();
+    }
+    emit_br(lend);
+    emit_label(lend);
+    return 0;
+  }
+  if (tk() == T_WHILE) {
+    advance();
+    var lhead = new_label();
+    var lbody = new_label();
+    var lend2 = new_label();
+    emit_br(lhead);
+    emit_label(lhead);
+    expect(T_LPAREN, "expected ( after while");
+    var c2 = parse_expr();
+    expect(T_RPAREN, "expected )");
+    emit_cond_br(c2, lbody, lend2);
+    emit_label(lbody);
+    parse_block();
+    emit_br(lhead);
+    emit_label(lend2);
+    return 0;
+  }
+  if (tk() == T_RETURN) {
+    advance();
+    var r2 = parse_expr();
+    expect(T_SEMI, "expected ;");
+    es("  ret i64 ");
+    er(r2);
+    es("\n");
+    emit_label(new_label());
+    return 0;
+  }
+  if (tk() == T_MEM) {
+    advance();
+    expect(T_LBRACK, "expected [ after mem");
+    var i0 = parse_expr();
+    expect(T_RBRACK, "expected ]");
+    expect(T_ASSIGN, "expected = in mem assignment");
+    var v0 = parse_expr();
+    expect(T_SEMI, "expected ;");
+    gen_store(v0, gen_mem_addr(i0));
+    return 0;
+  }
+  if (tk() == T_IDENT && tk2() == T_ASSIGN) {
+    var start2 = tstart();
+    var length2 = tlen();
+    advance();
+    advance();
+    var r3 = parse_expr();
+    expect(T_SEMI, "expected ;");
+    var slot2 = find_local(start2, length2);
+    if (slot2 >= 0) {
+      gen_store(r3, gen_slot_addr(slot2));
+      return 0;
+    }
+    if (find_global(start2, length2) >= 0) {
+      gen_global_store(r3, start2, length2);
+      return 0;
+    }
+    fail("assignment to unknown identifier");
+  }
+  parse_expr();
+  expect(T_SEMI, "expected ;");
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# declarations
+# ----------------------------------------------------------------------
+
+fn parse_global_decl() {
+  advance();
+  if (tk() != T_IDENT) {
+    fail("expected a name after var");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  expect(T_ASSIGN, "expected = in global declaration");
+  var neg = 0;
+  if (tk() == T_MINUS) {
+    neg = 1;
+    advance();
+  }
+  if (tk() != T_NUM) {
+    fail("global initializers must be integer literals");
+  }
+  var v = tnum();
+  advance();
+  expect(T_SEMI, "expected ;");
+  declare_global(start, length);
+  es("@g_");
+  emit_name(start, length);
+  es(" = internal global i64 ");
+  if (neg == 1) {
+    es("-");
+  }
+  en(v);
+  es("\n");
+  return 0;
+}
+
+fn parse_function() {
+  advance();
+  if (tk() != T_IDENT) {
+    fail("expected a function name");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  expect(T_LPAREN, "expected ( after function name");
+  nlocals = 0;
+  regcnt = 0;
+  labelcnt = 0;
+  var nparams = 0;
+  while (tk() != T_RPAREN) {
+    if (nparams > 0) {
+      expect(T_COMMA, "expected , between parameters");
+    }
+    if (tk() != T_IDENT) {
+      fail("expected a parameter name");
+    }
+    declare_local(tstart(), tlen());
+    nparams = nparams + 1;
+    advance();
+  }
+  advance();
+  es("\ndefine i64 @f_");
+  emit_name(start, length);
+  es("(");
+  var i = 0;
+  while (i < nparams) {
+    if (i > 0) {
+      es(", ");
+    }
+    es("i64 %p");
+    en(i);
+    i = i + 1;
+  }
+  es(") {\nentry:\n");
+  es("  %frame = alloca [");
+  en(FRAME);
+  es(" x i64], align 8\n");
+  i = 0;
+  while (i < nparams) {
+    es("  %a");
+    en(i);
+    es(" = getelementptr inbounds [");
+    en(FRAME);
+    es(" x i64], ptr %frame, i64 0, i64 ");
+    en(i);
+    es("\n");
+    es("  store i64 %p");
+    en(i);
+    es(", ptr %a");
+    en(i);
+    es(", align 8\n");
+    i = i + 1;
+  }
+  parse_block();
+  es("  ret i64 0\n}\n");
+  return 0;
+}
+
+fn emit_header() {
+  es("target triple = \"x86_64-unknown-linux-gnu\"\n\n");
+  es("@memory = internal global [");
+  en(MEMSIZE);
+  es(" x i64] zeroinitializer\n\n");
+  es("declare i32 @putchar(i32)\n");
+  es("declare i32 @getchar()\n");
+  es("declare void @exit(i32)\n\n");
+  return 0;
+}
+
+fn emit_trailer() {
+  es("\n@strdata = internal constant [");
+  en(strtop);
+  es(" x i64] [");
+  var i = 0;
+  while (i < strtop) {
+    if (i > 0) {
+      es(", ");
+    }
+    es("i64 ");
+    en(mem[STRBUF + i]);
+    i = i + 1;
+  }
+  es("]\n\n");
+  es("define internal void @__init_strings() {\nentry:\n");
+  es("  %i = alloca i64, align 8\n");
+  es("  store i64 0, ptr %i, align 8\n");
+  es("  br label %head\n\nhead:\n");
+  es("  %c = load i64, ptr %i, align 8\n");
+  es("  %m = icmp slt i64 %c, ");
+  en(strtop);
+  es("\n  br i1 %m, label %body, label %done\n\nbody:\n");
+  es("  %si = load i64, ptr %i, align 8\n");
+  es("  %sp = getelementptr inbounds [");
+  en(strtop);
+  es(" x i64], ptr @strdata, i64 0, i64 %si\n");
+  es("  %sv = load i64, ptr %sp, align 8\n");
+  es("  %dj = add nsw i64 %si, ");
+  en(STRBASE);
+  es("\n");
+  es("  %dp = getelementptr inbounds [");
+  en(MEMSIZE);
+  es(" x i64], ptr @memory, i64 0, i64 %dj\n");
+  es("  store i64 %sv, ptr %dp, align 8\n");
+  es("  %ni = add nsw i64 %si, 1\n");
+  es("  store i64 %ni, ptr %i, align 8\n");
+  es("  br label %head\n\ndone:\n  ret void\n}\n\n");
+  es("define i32 @main() {\nentry:\n");
+  es("  call void @__init_strings()\n");
+  es("  %r = call i64 @f_main()\n");
+  es("  %t = trunc i64 %r to i32\n");
+  es("  ret i32 %t\n}\n");
+  return 0;
+}
+
+fn read_source() {
+  var i = 0;
+  var c = getchar();
+  while (c != 0 - 1) {
+    mem[SRC + i] = c;
+    i = i + 1;
+    c = getchar();
+  }
+  mem[SRC + i] = 0;
+  srclen = i;
+  return 0;
+}
+
+fn compile_unit() {
+  emit_header();
+  scan(0);
+  scan(1);
+  while (tk() != T_EOF) {
+    if (tk() == T_VAR) {
+      parse_global_decl();
+    } else {
+      if (tk() == T_FN) {
+        parse_function();
+      } else {
+        fail("expected fn or var at top level");
+      }
+    }
+  }
+  emit_trailer();
+  return 0;
+}
+
+fn main() {
+  read_source();
+  compile_unit();
+  return 0;
+}
+'''
+
+GLYPH_GSL2: Final[str] = r'''# The canonical glyph, expressed in GSL-2.
+# Reads an optional odd lattice order from stdin; defaults to 7.
+# Two canonical strokes are emitted, then closed under the cyclic group C4.
+
+var order = 7;
+var apothem = 3;
+
+fn cell(row, col) {
+  return row * order + col;
+}
+
+fn emit_run(index, lo, hi, orient) {
+  var cursor = lo;
+  while (cursor <= hi) {
+    if (orient == 0) {
+      mem[cell(index, cursor)] = 1;
+    } else {
+      mem[cell(cursor, index)] = 1;
+    }
+    cursor = cursor + 1;
+  }
+  return 0;
+}
+
+fn close_group(passes) {
+  var pass = 0;
+  while (pass < passes) {
+    var row = 0;
+    while (row < order) {
+      var col = 0;
+      while (col < order) {
+        if (mem[cell(row, col)] != 0) {
+          mem[cell(col, 2 * apothem - row)] = 1;
+        }
+        col = col + 1;
+      }
+      row = row + 1;
+    }
+    pass = pass + 1;
+  }
+  return 0;
+}
+
+fn render() {
+  var row = 0;
+  while (row < order) {
+    var last = 0 - 1;
+    var col = 0;
+    while (col < order) {
+      if (mem[cell(row, col)] != 0) {
+        last = col;
+      }
+      col = col + 1;
+    }
+    col = 0;
+    while (col <= last) {
+      if (col > 0) {
+        putchar(' ');
+      }
+      if (mem[cell(row, col)] != 0) {
+        putchar('*');
+      } else {
+        putchar(' ');
+      }
+      col = col + 1;
+    }
+    putchar('\n');
+    row = row + 1;
+  }
+  return 0;
+}
+
+fn read_order() {
+  var value = 0;
+  var seen = 0;
+  var c = getchar();
+  while (c >= '0' && c <= '9') {
+    value = value * 10 + c - '0';
+    seen = 1;
+    c = getchar();
+  }
+  if (seen == 0) {
+    return 7;
+  }
+  return value;
+}
+
+fn main() {
+  order = read_order();
+  if (order < 3 || order % 2 == 0) {
+    return 2;
+  }
+  apothem = order / 2;
+  emit_run(apothem, 0, order - 1, 1);
+  emit_run(0, apothem + 1, order - 1, 0);
+  close_group(3);
+  render();
+  return 0;
+}
+'''
+
+_S0_OUT: list[str] = []
+_S0_SOURCE: str = ""
+
+
+# ----------------------------------------------------------------------
+# stage 0: the seed compiler
+# ----------------------------------------------------------------------
+
+
+MEMSIZE = 2000000
+STRBASE = 1500000
+STRLIMIT = 490000
+FRAME = 64
+MAXGLOBALS = 256
+
+SRC = 0
+STRBUF = 500000
+LOCNAME = 900000
+LOCLEN = 900100
+GLBNAME = 900200
+GLBLEN = 900600
+TOKBUF = 950000
+
+T_EOF = 0
+T_NUM = 1
+T_IDENT = 2
+T_STR = 3
+T_LPAREN = 4
+T_RPAREN = 5
+T_LBRACE = 6
+T_RBRACE = 7
+T_LBRACK = 8
+T_RBRACK = 9
+T_COMMA = 10
+T_SEMI = 11
+T_ASSIGN = 12
+T_EQ = 13
+T_NE = 14
+T_LT = 15
+T_LE = 16
+T_GT = 17
+T_GE = 18
+T_PLUS = 19
+T_MINUS = 20
+T_STAR = 21
+T_SLASH = 22
+T_PERCENT = 23
+T_NOT = 24
+T_ANDAND = 25
+T_OROR = 26
+T_FN = 27
+T_VAR = 28
+T_IF = 29
+T_ELSE = 30
+T_WHILE = 31
+T_RETURN = 32
+T_MEM = 33
+
+mem = [0] * 1200000
+pos = 0
+srclen = 0
+strtop = 1
+nlocals = 0
+nglobals = 0
+regcnt = 0
+labelcnt = 0
+line = 1
+
+
+def es(s):
+    _S0_OUT.append(s)
+
+
+def en(n):
+    _S0_OUT.append(str(n))
+
+
+def ec(c):
+    _S0_OUT.append(chr(c))
+
+
+def fail(msg):
+    raise Gsl2Error(f"{msg} near line {line}")
+
+
+def kw_is(start, length, word):
+    if length != len(word):
+        return 0
+    i = 0
+    while i < length:
+        if mem[start + i] != ord(word[i]):
+            return 0
+        i = i + 1
+    return 1
+
+
+def name_eq(a, alen, b, blen):
+    if alen != blen:
+        return 0
+    i = 0
+    while i < alen:
+        if mem[a + i] != mem[b + i]:
+            return 0
+        i = i + 1
+    return 1
+
+
+def emit_name(start, length):
+    i = 0
+    while i < length:
+        ec(mem[start + i])
+        i = i + 1
+
+
+# ----------------------------------------------------------------------
+# lexer
+# ----------------------------------------------------------------------
+
+
+def is_digit(c):
+    return 1 if 48 <= c <= 57 else 0
+
+
+def is_alpha(c):
+    if 97 <= c <= 122:
+        return 1
+    if 65 <= c <= 90:
+        return 1
+    if c == 95:
+        return 1
+    return 0
+
+
+def is_alnum(c):
+    if is_alpha(c):
+        return 1
+    return is_digit(c)
+
+
+def skip_ws():
+    global pos, line
+    while 1:
+        c = mem[SRC + pos]
+        if c == 35:
+            while mem[SRC + pos] != 10 and mem[SRC + pos] != 0:
+                pos = pos + 1
+        else:
+            if c == 10:
+                line = line + 1
+                pos = pos + 1
+            else:
+                if c == 32 or c == 9 or c == 13:
+                    pos = pos + 1
+                else:
+                    return 0
+    return 0
+
+
+def escape_of(c):
+    if c == 110:
+        return 10
+    if c == 116:
+        return 9
+    if c == 48:
+        return 0
+    if c == 92:
+        return 92
+    if c == 34:
+        return 34
+    if c == 39:
+        return 39
+    if c == 114:
+        return 13
+    fail("bad escape")
+    return 0
+
+
+def scan(slot):
+    global pos, strtop
+    base = TOKBUF + slot * 4
+    skip_ws()
+    c = mem[SRC + pos]
+    mem[base + 1] = 0
+    mem[base + 2] = SRC + pos
+    mem[base + 3] = 0
+    if c == 0:
+        mem[base] = T_EOF
+        return 0
+    if is_digit(c):
+        v = 0
+        while is_digit(mem[SRC + pos]):
+            v = v * 10 + mem[SRC + pos] - 48
+            pos = pos + 1
+        mem[base] = T_NUM
+        mem[base + 1] = v
+        return 0
+    if is_alpha(c):
+        start = SRC + pos
+        while is_alnum(mem[SRC + pos]):
+            pos = pos + 1
+        length = SRC + pos - start
+        mem[base + 2] = start
+        mem[base + 3] = length
+        if kw_is(start, length, "fn"):
+            mem[base] = T_FN
+            return 0
+        if kw_is(start, length, "var"):
+            mem[base] = T_VAR
+            return 0
+        if kw_is(start, length, "if"):
+            mem[base] = T_IF
+            return 0
+        if kw_is(start, length, "else"):
+            mem[base] = T_ELSE
+            return 0
+        if kw_is(start, length, "while"):
+            mem[base] = T_WHILE
+            return 0
+        if kw_is(start, length, "return"):
+            mem[base] = T_RETURN
+            return 0
+        if kw_is(start, length, "mem"):
+            mem[base] = T_MEM
+            return 0
+        mem[base] = T_IDENT
+        return 0
+    if c == 39:
+        pos = pos + 1
+        v = mem[SRC + pos]
+        if v == 92:
+            pos = pos + 1
+            v = escape_of(mem[SRC + pos])
+        pos = pos + 1
+        if mem[SRC + pos] != 39:
+            fail("unterminated char literal")
+        pos = pos + 1
+        mem[base] = T_NUM
+        mem[base + 1] = v
+        return 0
+    if c == 34:
+        pos = pos + 1
+        off = STRBASE + strtop
+        while mem[SRC + pos] != 34:
+            if mem[SRC + pos] == 0:
+                fail("unterminated string literal")
+            v = mem[SRC + pos]
+            if v == 92:
+                pos = pos + 1
+                v = escape_of(mem[SRC + pos])
+            mem[STRBUF + strtop] = v
+            strtop = strtop + 1
+            pos = pos + 1
+        pos = pos + 1
+        mem[STRBUF + strtop] = 0
+        strtop = strtop + 1
+        if strtop > STRLIMIT:
+            fail("string pool overflow")
+        mem[base] = T_STR
+        mem[base + 1] = off
+        return 0
+    pos = pos + 1
+    d = mem[SRC + pos]
+    if c == 61:
+        if d == 61:
+            pos = pos + 1
+            mem[base] = T_EQ
+            return 0
+        mem[base] = T_ASSIGN
+        return 0
+    if c == 33:
+        if d == 61:
+            pos = pos + 1
+            mem[base] = T_NE
+            return 0
+        mem[base] = T_NOT
+        return 0
+    if c == 60:
+        if d == 61:
+            pos = pos + 1
+            mem[base] = T_LE
+            return 0
+        mem[base] = T_LT
+        return 0
+    if c == 62:
+        if d == 61:
+            pos = pos + 1
+            mem[base] = T_GE
+            return 0
+        mem[base] = T_GT
+        return 0
+    if c == 38:
+        if d == 38:
+            pos = pos + 1
+            mem[base] = T_ANDAND
+            return 0
+        fail("single & is not an operator")
+    if c == 124:
+        if d == 124:
+            pos = pos + 1
+            mem[base] = T_OROR
+            return 0
+        fail("single | is not an operator")
+    if c == 40:
+        mem[base] = T_LPAREN
+        return 0
+    if c == 41:
+        mem[base] = T_RPAREN
+        return 0
+    if c == 123:
+        mem[base] = T_LBRACE
+        return 0
+    if c == 125:
+        mem[base] = T_RBRACE
+        return 0
+    if c == 91:
+        mem[base] = T_LBRACK
+        return 0
+    if c == 93:
+        mem[base] = T_RBRACK
+        return 0
+    if c == 44:
+        mem[base] = T_COMMA
+        return 0
+    if c == 59:
+        mem[base] = T_SEMI
+        return 0
+    if c == 43:
+        mem[base] = T_PLUS
+        return 0
+    if c == 45:
+        mem[base] = T_MINUS
+        return 0
+    if c == 42:
+        mem[base] = T_STAR
+        return 0
+    if c == 47:
+        mem[base] = T_SLASH
+        return 0
+    if c == 37:
+        mem[base] = T_PERCENT
+        return 0
+    fail("unexpected character")
+    return 0
+
+
+def tk():
+    return mem[TOKBUF]
+
+
+def tnum():
+    return mem[TOKBUF + 1]
+
+
+def tstart():
+    return mem[TOKBUF + 2]
+
+
+def tlen():
+    return mem[TOKBUF + 3]
+
+
+def tk2():
+    return mem[TOKBUF + 4]
+
+
+def advance():
+    mem[TOKBUF] = mem[TOKBUF + 4]
+    mem[TOKBUF + 1] = mem[TOKBUF + 5]
+    mem[TOKBUF + 2] = mem[TOKBUF + 6]
+    mem[TOKBUF + 3] = mem[TOKBUF + 7]
+    scan(1)
+    return 0
+
+
+def expect(kind, what):
+    if tk() != kind:
+        fail(what)
+    advance()
+    return 0
+
+
+# ----------------------------------------------------------------------
+# symbol tables
+# ----------------------------------------------------------------------
+
+
+def declare_local(start, length):
+    global nlocals
+    if nlocals >= FRAME:
+        fail("too many locals in one function")
+    mem[LOCNAME + nlocals] = start
+    mem[LOCLEN + nlocals] = length
+    nlocals = nlocals + 1
+    return nlocals - 1
+
+
+def find_local(start, length):
+    i = nlocals - 1
+    while i >= 0:
+        if name_eq(mem[LOCNAME + i], mem[LOCLEN + i], start, length):
+            return i
+        i = i - 1
+    return 0 - 1
+
+
+def declare_global(start, length):
+    global nglobals
+    if nglobals >= MAXGLOBALS:
+        fail("too many globals")
+    mem[GLBNAME + nglobals] = start
+    mem[GLBLEN + nglobals] = length
+    nglobals = nglobals + 1
+    return nglobals - 1
+
+
+def find_global(start, length):
+    i = nglobals - 1
+    while i >= 0:
+        if name_eq(mem[GLBNAME + i], mem[GLBLEN + i], start, length):
+            return i
+        i = i - 1
+    return 0 - 1
+
+
+def alloc_temp_slot():
+    global nlocals
+    if nlocals >= FRAME:
+        fail("frame overflow")
+    mem[LOCNAME + nlocals] = 0
+    mem[LOCLEN + nlocals] = 0
+    nlocals = nlocals + 1
+    return nlocals - 1
+
+
+# ----------------------------------------------------------------------
+# emission primitives
+# ----------------------------------------------------------------------
+
+
+def new_reg():
+    global regcnt
+    regcnt = regcnt + 1
+    return regcnt
+
+
+def new_label():
+    global labelcnt
+    labelcnt = labelcnt + 1
+    return labelcnt
+
+
+def er(r):
+    es("%t")
+    en(r)
+    return 0
+
+
+def elabel(l):
+    es("L")
+    en(l)
+    return 0
+
+
+def emit_label(l):
+    elabel(l)
+    es(":\n")
+    return 0
+
+
+def emit_br(l):
+    es("  br label %")
+    elabel(l)
+    es("\n")
+    return 0
+
+
+def emit_cond_br(r, a, b):
+    t = new_reg()
+    es("  ")
+    er(t)
+    es(" = icmp ne i64 ")
+    er(r)
+    es(", 0\n")
+    es("  br i1 ")
+    er(t)
+    es(", label %")
+    elabel(a)
+    es(", label %")
+    elabel(b)
+    es("\n")
+    return 0
+
+
+def gen_const(v):
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = add i64 0, ")
+    en(v)
+    es("\n")
+    return r
+
+
+def gen_slot_addr(slot):
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = getelementptr inbounds [")
+    en(FRAME)
+    es(" x i64], ptr %frame, i64 0, i64 ")
+    en(slot)
+    es("\n")
+    return r
+
+
+def gen_mem_addr(index_reg):
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = getelementptr inbounds [")
+    en(MEMSIZE)
+    es(" x i64], ptr @memory, i64 0, i64 ")
+    er(index_reg)
+    es("\n")
+    return r
+
+
+def gen_load(addr_reg):
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = load i64, ptr ")
+    er(addr_reg)
+    es(", align 8\n")
+    return r
+
+
+def gen_store(value_reg, addr_reg):
+    es("  store i64 ")
+    er(value_reg)
+    es(", ptr ")
+    er(addr_reg)
+    es(", align 8\n")
+    return 0
+
+
+def gen_global_load(start, length):
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = load i64, ptr @g_")
+    emit_name(start, length)
+    es(", align 8\n")
+    return r
+
+
+def gen_global_store(value_reg, start, length):
+    es("  store i64 ")
+    er(value_reg)
+    es(", ptr @g_")
+    emit_name(start, length)
+    es(", align 8\n")
+    return 0
+
+
+def gen_binary(op, a, b):
+    r = new_reg()
+    es("  ")
+    er(r)
+    if op == T_PLUS:
+        es(" = add nsw i64 ")
+    if op == T_MINUS:
+        es(" = sub nsw i64 ")
+    if op == T_STAR:
+        es(" = mul nsw i64 ")
+    if op == T_SLASH:
+        es(" = sdiv i64 ")
+    if op == T_PERCENT:
+        es(" = srem i64 ")
+    er(a)
+    es(", ")
+    er(b)
+    es("\n")
+    return r
+
+
+def gen_compare(op, a, b):
+    c = new_reg()
+    es("  ")
+    er(c)
+    if op == T_EQ:
+        es(" = icmp eq i64 ")
+    if op == T_NE:
+        es(" = icmp ne i64 ")
+    if op == T_LT:
+        es(" = icmp slt i64 ")
+    if op == T_LE:
+        es(" = icmp sle i64 ")
+    if op == T_GT:
+        es(" = icmp sgt i64 ")
+    if op == T_GE:
+        es(" = icmp sge i64 ")
+    er(a)
+    es(", ")
+    er(b)
+    es("\n")
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = zext i1 ")
+    er(c)
+    es(" to i64\n")
+    return r
+
+
+# ----------------------------------------------------------------------
+# expressions
+# ----------------------------------------------------------------------
+
+
+def parse_call_builtin(kind, first_arg):
+    if kind == 1:
+        t = new_reg()
+        es("  ")
+        er(t)
+        es(" = trunc i64 ")
+        er(first_arg)
+        es(" to i32\n")
+        u = new_reg()
+        es("  ")
+        er(u)
+        es(" = call i32 @putchar(i32 ")
+        er(t)
+        es(")\n")
+        r = new_reg()
+        es("  ")
+        er(r)
+        es(" = sext i32 ")
+        er(u)
+        es(" to i64\n")
+        return r
+    if kind == 2:
+        u = new_reg()
+        es("  ")
+        er(u)
+        es(" = call i32 @getchar()\n")
+        r = new_reg()
+        es("  ")
+        er(r)
+        es(" = sext i32 ")
+        er(u)
+        es(" to i64\n")
+        return r
+    t = new_reg()
+    es("  ")
+    er(t)
+    es(" = trunc i64 ")
+    er(first_arg)
+    es(" to i32\n")
+    es("  call void @exit(i32 ")
+    er(t)
+    es(")\n")
+    return gen_const(0)
+
+
+def parse_primary():
+    if tk() == T_NUM:
+        v = tnum()
+        advance()
+        return gen_const(v)
+    if tk() == T_STR:
+        v = tnum()
+        advance()
+        return gen_const(v)
+    if tk() == T_LPAREN:
+        advance()
+        r = parse_expr()
+        expect(T_RPAREN, "expected )")
+        return r
+    if tk() == T_MEM:
+        advance()
+        expect(T_LBRACK, "expected [ after mem")
+        i = parse_expr()
+        expect(T_RBRACK, "expected ]")
+        return gen_load(gen_mem_addr(i))
+    if tk() == T_IDENT:
+        start = tstart()
+        length = tlen()
+        advance()
+        if tk() != T_LPAREN:
+            slot = find_local(start, length)
+            if slot >= 0:
+                return gen_load(gen_slot_addr(slot))
+            if find_global(start, length) >= 0:
+                return gen_global_load(start, length)
+            fail("unknown identifier")
+        advance()
+        if kw_is(start, length, "putchar"):
+            a = parse_expr()
+            expect(T_RPAREN, "expected )")
+            return parse_call_builtin(1, a)
+        if kw_is(start, length, "getchar"):
+            expect(T_RPAREN, "expected )")
+            return parse_call_builtin(2, 0)
+        if kw_is(start, length, "exit"):
+            a = parse_expr()
+            expect(T_RPAREN, "expected )")
+            return parse_call_builtin(3, a)
+        nargs = 0
+        while tk() != T_RPAREN:
+            if nargs > 0:
+                expect(T_COMMA, "expected , between arguments")
+            mem[TOKBUF + 100 + nargs] = parse_expr()
+            nargs = nargs + 1
+            if nargs > 8:
+                fail("too many arguments")
+        advance()
+        r = new_reg()
+        es("  ")
+        er(r)
+        es(" = call i64 @f_")
+        emit_name(start, length)
+        es("(")
+        i = 0
+        while i < nargs:
+            if i > 0:
+                es(", ")
+            es("i64 ")
+            er(mem[TOKBUF + 100 + i])
+            i = i + 1
+        es(")\n")
+        return r
+    fail("expected an expression")
+    return 0
+
+
+def parse_unary():
+    if tk() == T_MINUS:
+        advance()
+        a = parse_unary()
+        return gen_binary(T_MINUS, gen_const(0), a)
+    if tk() == T_NOT:
+        advance()
+        a = parse_unary()
+        return gen_compare(T_EQ, a, gen_const(0))
+    return parse_primary()
+
+
+def parse_mul():
+    a = parse_unary()
+    while tk() == T_STAR or tk() == T_SLASH or tk() == T_PERCENT:
+        op = tk()
+        advance()
+        b = parse_unary()
+        a = gen_binary(op, a, b)
+    return a
+
+
+def parse_add():
+    a = parse_mul()
+    while tk() == T_PLUS or tk() == T_MINUS:
+        op = tk()
+        advance()
+        b = parse_mul()
+        a = gen_binary(op, a, b)
+    return a
+
+
+def parse_rel():
+    a = parse_add()
+    while tk() == T_LT or tk() == T_LE or tk() == T_GT or tk() == T_GE:
+        op = tk()
+        advance()
+        b = parse_add()
+        a = gen_compare(op, a, b)
+    return a
+
+
+def parse_eq():
+    a = parse_rel()
+    while tk() == T_EQ or tk() == T_NE:
+        op = tk()
+        advance()
+        b = parse_rel()
+        a = gen_compare(op, a, b)
+    return a
+
+
+def parse_and():
+    a = parse_eq()
+    while tk() == T_ANDAND:
+        advance()
+        slot = alloc_temp_slot()
+        s1 = gen_slot_addr(slot)
+        es("  store i64 0, ptr ")
+        er(s1)
+        es(", align 8\n")
+        lrhs = new_label()
+        lend = new_label()
+        emit_cond_br(a, lrhs, lend)
+        emit_label(lrhs)
+        b = parse_eq()
+        v = gen_compare(T_NE, b, gen_const(0))
+        gen_store(v, gen_slot_addr(slot))
+        emit_br(lend)
+        emit_label(lend)
+        a = gen_load(gen_slot_addr(slot))
+    return a
+
+
+def parse_or():
+    a = parse_and()
+    while tk() == T_OROR:
+        advance()
+        slot = alloc_temp_slot()
+        s1 = gen_slot_addr(slot)
+        es("  store i64 1, ptr ")
+        er(s1)
+        es(", align 8\n")
+        lrhs = new_label()
+        lend = new_label()
+        emit_cond_br(a, lend, lrhs)
+        emit_label(lrhs)
+        b = parse_and()
+        v = gen_compare(T_NE, b, gen_const(0))
+        gen_store(v, gen_slot_addr(slot))
+        emit_br(lend)
+        emit_label(lend)
+        a = gen_load(gen_slot_addr(slot))
+    return a
+
+
+def parse_expr():
+    return parse_or()
+
+
+# ----------------------------------------------------------------------
+# statements
+# ----------------------------------------------------------------------
+
+
+def parse_block():
+    expect(T_LBRACE, "expected {")
+    while tk() != T_RBRACE:
+        if tk() == T_EOF:
+            fail("unterminated block")
+        parse_stmt()
+    advance()
+    return 0
+
+
+def parse_stmt():
+    if tk() == T_VAR:
+        advance()
+        if tk() != T_IDENT:
+            fail("expected a name after var")
+        start = tstart()
+        length = tlen()
+        advance()
+        expect(T_ASSIGN, "expected = in var declaration")
+        r = parse_expr()
+        expect(T_SEMI, "expected ;")
+        slot = declare_local(start, length)
+        gen_store(r, gen_slot_addr(slot))
+        return 0
+    if tk() == T_IF:
+        advance()
+        expect(T_LPAREN, "expected ( after if")
+        c = parse_expr()
+        expect(T_RPAREN, "expected )")
+        lthen = new_label()
+        lelse = new_label()
+        lend = new_label()
+        emit_cond_br(c, lthen, lelse)
+        emit_label(lthen)
+        parse_block()
+        emit_br(lend)
+        emit_label(lelse)
+        if tk() == T_ELSE:
+            advance()
+            parse_block()
+        emit_br(lend)
+        emit_label(lend)
+        return 0
+    if tk() == T_WHILE:
+        advance()
+        lhead = new_label()
+        lbody = new_label()
+        lend = new_label()
+        emit_br(lhead)
+        emit_label(lhead)
+        expect(T_LPAREN, "expected ( after while")
+        c = parse_expr()
+        expect(T_RPAREN, "expected )")
+        emit_cond_br(c, lbody, lend)
+        emit_label(lbody)
+        parse_block()
+        emit_br(lhead)
+        emit_label(lend)
+        return 0
+    if tk() == T_RETURN:
+        advance()
+        r = parse_expr()
+        expect(T_SEMI, "expected ;")
+        es("  ret i64 ")
+        er(r)
+        es("\n")
+        emit_label(new_label())
+        return 0
+    if tk() == T_MEM:
+        advance()
+        expect(T_LBRACK, "expected [ after mem")
+        i = parse_expr()
+        expect(T_RBRACK, "expected ]")
+        expect(T_ASSIGN, "expected = in mem assignment")
+        v = parse_expr()
+        expect(T_SEMI, "expected ;")
+        gen_store(v, gen_mem_addr(i))
+        return 0
+    if tk() == T_IDENT and tk2() == T_ASSIGN:
+        start = tstart()
+        length = tlen()
+        advance()
+        advance()
+        r = parse_expr()
+        expect(T_SEMI, "expected ;")
+        slot = find_local(start, length)
+        if slot >= 0:
+            gen_store(r, gen_slot_addr(slot))
+            return 0
+        if find_global(start, length) >= 0:
+            gen_global_store(r, start, length)
+            return 0
+        fail("assignment to unknown identifier")
+    parse_expr()
+    expect(T_SEMI, "expected ;")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# declarations
+# ----------------------------------------------------------------------
+
+
+def parse_global_decl():
+    advance()
+    if tk() != T_IDENT:
+        fail("expected a name after var")
+    start = tstart()
+    length = tlen()
+    advance()
+    expect(T_ASSIGN, "expected = in global declaration")
+    neg = 0
+    if tk() == T_MINUS:
+        neg = 1
+        advance()
+    if tk() != T_NUM:
+        fail("global initializers must be integer literals")
+    v = tnum()
+    advance()
+    expect(T_SEMI, "expected ;")
+    declare_global(start, length)
+    es("@g_")
+    emit_name(start, length)
+    es(" = internal global i64 ")
+    if neg == 1:
+        es("-")
+    en(v)
+    es("\n")
+    return 0
+
+
+def parse_function():
+    global nlocals, regcnt, labelcnt
+    advance()
+    if tk() != T_IDENT:
+        fail("expected a function name")
+    start = tstart()
+    length = tlen()
+    advance()
+    expect(T_LPAREN, "expected ( after function name")
+    nlocals = 0
+    regcnt = 0
+    labelcnt = 0
+    nparams = 0
+    while tk() != T_RPAREN:
+        if nparams > 0:
+            expect(T_COMMA, "expected , between parameters")
+        if tk() != T_IDENT:
+            fail("expected a parameter name")
+        declare_local(tstart(), tlen())
+        nparams = nparams + 1
+        advance()
+    advance()
+    es("\ndefine i64 @f_")
+    emit_name(start, length)
+    es("(")
+    i = 0
+    while i < nparams:
+        if i > 0:
+            es(", ")
+        es("i64 %p")
+        en(i)
+        i = i + 1
+    es(") {\nentry:\n")
+    es("  %frame = alloca [")
+    en(FRAME)
+    es(" x i64], align 8\n")
+    i = 0
+    while i < nparams:
+        es("  %a")
+        en(i)
+        es(" = getelementptr inbounds [")
+        en(FRAME)
+        es(" x i64], ptr %frame, i64 0, i64 ")
+        en(i)
+        es("\n")
+        es("  store i64 %p")
+        en(i)
+        es(", ptr %a")
+        en(i)
+        es(", align 8\n")
+        i = i + 1
+    parse_block()
+    es("  ret i64 0\n}\n")
+    return 0
+
+
+def emit_header():
+    es("target triple = \"x86_64-unknown-linux-gnu\"\n\n")
+    es("@memory = internal global [")
+    en(MEMSIZE)
+    es(" x i64] zeroinitializer\n\n")
+    es("declare i32 @putchar(i32)\n")
+    es("declare i32 @getchar()\n")
+    es("declare void @exit(i32)\n\n")
+    return 0
+
+
+def emit_trailer():
+    es("\n@strdata = internal constant [")
+    en(strtop)
+    es(" x i64] [")
+    i = 0
+    while i < strtop:
+        if i > 0:
+            es(", ")
+        es("i64 ")
+        en(mem[STRBUF + i])
+        i = i + 1
+    es("]\n\n")
+    es("define internal void @__init_strings() {\nentry:\n")
+    es("  %i = alloca i64, align 8\n")
+    es("  store i64 0, ptr %i, align 8\n")
+    es("  br label %head\n\nhead:\n")
+    es("  %c = load i64, ptr %i, align 8\n")
+    es("  %m = icmp slt i64 %c, ")
+    en(strtop)
+    es("\n  br i1 %m, label %body, label %done\n\nbody:\n")
+    es("  %si = load i64, ptr %i, align 8\n")
+    es("  %sp = getelementptr inbounds [")
+    en(strtop)
+    es(" x i64], ptr @strdata, i64 0, i64 %si\n")
+    es("  %sv = load i64, ptr %sp, align 8\n")
+    es("  %dj = add nsw i64 %si, ")
+    en(STRBASE)
+    es("\n")
+    es("  %dp = getelementptr inbounds [")
+    en(MEMSIZE)
+    es(" x i64], ptr @memory, i64 0, i64 %dj\n")
+    es("  store i64 %sv, ptr %dp, align 8\n")
+    es("  %ni = add nsw i64 %si, 1\n")
+    es("  store i64 %ni, ptr %i, align 8\n")
+    es("  br label %head\n\ndone:\n  ret void\n}\n\n")
+    es("define i32 @main() {\nentry:\n")
+    es("  call void @__init_strings()\n")
+    es("  %r = call i64 @f_main()\n")
+    es("  %t = trunc i64 %r to i32\n")
+    es("  ret i32 %t\n}\n")
+    return 0
+
+
+def read_source():
+    global srclen
+    data = _S0_SOURCE.encode()
+    i = 0
+    while i < len(data):
+        mem[SRC + i] = data[i]
+        i = i + 1
+    mem[SRC + i] = 0
+    srclen = i
+    return 0
+
+
+def compile_unit():
+    emit_header()
+    scan(0)
+    scan(1)
+    while tk() != T_EOF:
+        if tk() == T_VAR:
+            parse_global_decl()
+        else:
+            if tk() == T_FN:
+                parse_function()
+            else:
+                fail("expected fn or var at top level")
+    emit_trailer()
+    return 0
+
+
+def _stage0_run():
+    read_source()
+    compile_unit()
+    return 0
+
+
+def _stage0_reset() -> None:
+    """Return the seed compiler to a pristine state between translation units."""
+    global mem, pos, srclen, strtop, nlocals, nglobals, regcnt, labelcnt
+    global line, argsp, _S0_OUT
+    mem = [0] * 1200000
+    pos = 0
+    srclen = 0
+    strtop = 1
+    nlocals = 0
+    nglobals = 0
+    regcnt = 0
+    labelcnt = 0
+    line = 1
+    argsp = 0
+    _S0_OUT = []
+
+
+def gsl2_compile(source: str) -> str:
+    """Compile GSL-2 source to LLVM IR using the Python seed compiler."""
+    global _S0_SOURCE
+    _stage0_reset()
+    _S0_SOURCE = source
+    _stage0_run()
+    return "".join(_S0_OUT)
+
+
+# ----------------------------------------------------------------------
+# native toolchain
+# ----------------------------------------------------------------------
+
+
+def link_executable(ir_text: str, exe_path: Path, opt_level: int = 2) -> Path:
+    """Assemble LLVM IR to an object file and link it into a native binary."""
+    if shutil.which("gcc") is None and shutil.which("cc") is None:
+        raise LlvmToolchainUnavailable("no system C linker (gcc/cc) on PATH")
+    toolchain = LlvmToolchainService()
+    module = LlvmModule(text=ir_text, profile=TargetProfile(), order=0)
+    if opt_level:
+        module = toolchain.optimize(module, opt_level)
+    object_path = exe_path.with_suffix(".o")
+    toolchain.emit_object(module, str(object_path))
+    linker = shutil.which("gcc") or shutil.which("cc")
+    subprocess.run([linker, str(object_path), "-o", str(exe_path)], check=True)
+    return exe_path
+
+
+def _run(executable: Path, stdin_text: str) -> str:
+    completed = subprocess.run(
+        [str(executable)],
+        input=stdin_text.encode(),
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return completed.stdout.decode()
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapReport:
+    """The outcome of a full three-generation self-hosting bootstrap."""
+
+    workdir: Path
+    stage1_ir: str
+    stage2_ir: str
+    stage3_ir: str
+    glyph: str
+
+    @property
+    def seed_agrees(self) -> bool:
+        return self.stage1_ir == self.stage2_ir
+
+    @property
+    def fixpoint(self) -> bool:
+        return self.stage2_ir == self.stage3_ir
+
+
+def bootstrap(workdir: Path | None = None, opt_level: int = 2) -> BootstrapReport:
+    """Compile the GSL-2 compiler with itself until its output stops changing.
+
+    stage0 is the Python seed above.  stage1 is what the seed makes of
+    gslc.gsl2.  stage2 is what stage1 makes of the very same source, and
+    stage3 what stage2 makes of it.  stage2 == stage3 is the fixpoint that
+    proves the compiler reproduces itself; stage1 == stage2 additionally
+    proves the seed was never needed for anything but the first turn of the
+    crank.
+    """
+    directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-"))
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gslc.gsl2").write_text(GSLC_GSL2)
+    (directory / "glyph.gsl2").write_text(GLYPH_GSL2)
+
+    stage1_ir = gsl2_compile(GSLC_GSL2)
+    (directory / "stage1.ll").write_text(stage1_ir)
+    stage1 = link_executable(stage1_ir, directory / "stage1", opt_level)
+
+    stage2_ir = _run(stage1, GSLC_GSL2)
+    (directory / "stage2.ll").write_text(stage2_ir)
+    stage2 = link_executable(stage2_ir, directory / "stage2", opt_level)
+
+    stage3_ir = _run(stage2, GSLC_GSL2)
+    (directory / "stage3.ll").write_text(stage3_ir)
+    link_executable(stage3_ir, directory / "stage3", opt_level)
+
+    glyph_ir = _run(stage2, GLYPH_GSL2)
+    (directory / "glyph.ll").write_text(glyph_ir)
+    glyph = link_executable(glyph_ir, directory / "glyph", opt_level)
+
+    return BootstrapReport(
+        workdir=directory,
+        stage1_ir=stage1_ir,
+        stage2_ir=stage2_ir,
+        stage3_ir=stage3_ir,
+        glyph=_run(glyph, "").rstrip("\n"),
+    )
+
+
+# ======================================================================
 # driver
 # ======================================================================
 
@@ -1881,6 +4500,24 @@ def _selftest(orders: Sequence[int]) -> int:
     return 1 if failures else 0
 
 
+def _emit_bootstrap_report(report: BootstrapReport) -> int:
+    rule = "-" * 60
+    print(rule)
+    print(f"stage1.ll  {len(report.stage1_ir.splitlines()):>6} lines   (seed compiled gslc.gsl2)")
+    print(f"stage2.ll  {len(report.stage2_ir.splitlines()):>6} lines   (stage1 compiled its own source)")
+    print(f"stage3.ll  {len(report.stage3_ir.splitlines()):>6} lines   (stage2 compiled it again)")
+    print(rule)
+    seed = "[ok]  " if report.seed_agrees else "[FAIL]"
+    fixed = "[ok]  " if report.fixpoint else "[FAIL]"
+    print(f"  {seed} stage1.ll == stage2.ll   seed and self-hosted compiler agree")
+    print(f"  {fixed} stage2.ll == stage3.ll   compiler reproduces itself: FIXPOINT")
+    print(rule)
+    print(report.glyph)
+    print(rule)
+    print(f"artifacts in {report.workdir}")
+    return 0 if (report.seed_agrees and report.fixpoint) else 1
+
+
 def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ouroboros - the pattern, and everything it grew into",
@@ -1900,7 +4537,11 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     backend.add_argument("-O", "--opt-level", type=int, choices=range(4), default=0)
     backend.add_argument("--triple", default=TargetProfile().triple)
 
-    parser.add_argument("--selftest", action="store_true")
+    boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
+    boot.add_argument("--bootstrap", action="store_true")
+    boot.add_argument("--workdir", metavar="PATH")
+    boot.add_argument("--emit-gsl2", choices=("gslc", "glyph"))
+    boot.add_argument("--selftest", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1912,8 +4553,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(levelname)s %(name)s %(message)s",
     )
 
+    if namespace.emit_gsl2:
+        sys.stdout.write(GSLC_GSL2 if namespace.emit_gsl2 == "gslc" else GLYPH_GSL2)
+        return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))
+    if namespace.bootstrap:
+        try:
+            workdir = Path(namespace.workdir) if namespace.workdir else None
+            return _emit_bootstrap_report(bootstrap(workdir, namespace.opt_level or 2))
+        except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
+            print(f"bootstrap unavailable: {exc}", file=sys.stderr)
+            return 3
 
     outcome = synthesize(namespace.order)
     if not outcome.is_ok:
