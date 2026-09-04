@@ -49,10 +49,12 @@ jobs:
           file glyph
           diff <(./glyph) <(python ouroboros.py)
 
-      - name: and the machine this is not, which the arm job runs for real
+      - name: and the machines this is not, one of which the arm job runs
         run: |
           python ouroboros.py --machine aarch64 --emit-elf glyph-aarch64
           file glyph-aarch64 | grep -q aarch64
+          python ouroboros.py --machine riscv64 --emit-elf glyph-riscv64
+          file glyph-riscv64 | grep -q RISC-V
 
       - name: a wasm module, and the five lines of host it asks for
         run: |
@@ -93,10 +95,12 @@ jobs:
           file glyph
           diff <(./glyph) <(python ouroboros.py)
 
-      - name: and the one it is not, which only has to be the right shape here
+      - name: and the ones it is not, which only have to be the right shape here
         run: |
-          python ouroboros.py --machine x86-64 --emit-elf other
-          file other | grep -q x86-64
+          python ouroboros.py --machine x86-64 --emit-elf other-x86-64
+          file other-x86-64 | grep -q x86-64
+          python ouroboros.py --machine riscv64 --emit-elf other-riscv64
+          file other-riscv64 | grep -q RISC-V
 
   toolchain:
     name: llvm, the bootstrap and the closed loop

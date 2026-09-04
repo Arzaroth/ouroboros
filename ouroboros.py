@@ -54,11 +54,11 @@
 
   tier 5  machine code          layer 18 drops the toolchain: no llvmlite, no
           assembler, no linker, no libc.  The object module is encoded as
-          x86-64 or as aarch64 directly - the operand stack is the hardware
-          stack, the canvas is .bss - and wrapped in a static ELF64 executable
-          by hand.  A little over a kilobyte, and all it asks of the world is
-          write and exit_group.  Two machines behind one ELF writer, which is
-          what obliges the writer to say which of them it means.
+          x86-64, aarch64 or riscv64 directly - the operand stack is the
+          hardware stack, the canvas is .bss - and wrapped in a static ELF64
+          executable by hand.  A little over a kilobyte, and all it asks of
+          the world is write and exit_group.  Three machines behind one ELF
+          writer, which is what obliges the writer to say which it means.
 
   tier 6  WebAssembly           layer 19 encodes the same object module as a
           wasm reactor, by hand and with nothing installed.  It imports
@@ -11727,6 +11727,559 @@ class Aarch64CodeBackend:
         text.ret()
 
 
+EM_RISCV: Final[int] = 243
+RISCV_SYS_WRITE: Final[int] = 64
+RISCV_SYS_EXIT_GROUP: Final[int] = 93
+
+RISCV_ZERO: Final[int] = 0
+RISCV_RETURN: Final[int] = 1          # ra, where a call leaves its return address
+RISCV_STACK: Final[int] = 2           # sp
+RISCV_DATA: Final[int] = 18           # the .bss base, put there by the prologue
+RISCV_LINK_SAVE: Final[int] = 19      # ra parked across the one level of nesting
+RISCV_SCRATCH: Final[int] = 31        # t6, borrowed by the wide-immediate forms
+RISCV_SYSCALL: Final[int] = 17        # a7
+
+# The branch this machine has is the opposite of the one wanted, jumped over.
+# Each entry is the funct3 of that opposite and whether it reads its operands
+# the other way round.
+RISCV_INVERTED: Final[Mapping[str, tuple[int, bool]]] = {
+    "eq": (0b001, False), "ne": (0b000, False),
+    "lt": (0b101, False), "ge": (0b100, False),
+    "gt": (0b101, True), "le": (0b100, True),
+}
+
+
+class Riscv64Assembler:
+    """A riscv64 encoder: the instructions the machine needs, and no more.
+
+    Fixed width like the aarch64 one, so a fixup is still a bitfield, but the
+    bits of a branch offset are scattered through the word rather than lying
+    in one field.  Conditional branches reach four kilooctets and the
+    instruction stream can be longer than that, so every one of them is
+    written as its own opposite jumped over an unconditional jump, which
+    reaches a megaoctet and costs a word.
+    """
+
+    def __init__(self) -> None:
+        self._code = bytearray()
+        self._labels: dict[str, int] = {}
+        self._fixups: list[tuple[int, str]] = []
+
+    def __len__(self) -> int:
+        return len(self._code)
+
+    # -- labels and relocation --------------------------------------------
+
+    def label(self, name: str) -> None:
+        if name in self._labels:
+            raise MachineCodeError(f"duplicate label {name!r}")
+        self._labels[name] = len(self._code)
+
+    def link(self) -> bytes:
+        """Patches every jump, then freezes the text."""
+        for site, name in self._fixups:
+            try:
+                target = self._labels[name]
+            except KeyError as exc:
+                raise MachineCodeError(f"unresolved branch target {name!r}") from exc
+            offset = target - site
+            if not -(1 << 20) <= offset < (1 << 20):
+                raise MachineCodeError(f"jump to {name!r} is out of range")
+            word = struct.unpack_from("<I", self._code, site)[0]
+            struct.pack_into("<I", self._code, site, word | self._jtype(offset))
+        return bytes(self._code)
+
+    @staticmethod
+    def _jtype(offset: int) -> int:
+        return (
+            ((offset >> 20 & 1) << 31)
+            | ((offset >> 1 & 0x3FF) << 21)
+            | ((offset >> 11 & 1) << 20)
+            | ((offset >> 12 & 0xFF) << 12)
+        )
+
+    def _word(self, value: int) -> None:
+        self._code.extend(struct.pack("<I", value & 0xFFFFFFFF))
+
+    # -- the five formats --------------------------------------------------
+
+    def _r(self, funct7: int, rs2: int, rs1: int, funct3: int, rd: int, opcode: int) -> None:
+        self._word((funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode)
+
+    def _i(self, value: int, rs1: int, funct3: int, rd: int, opcode: int) -> None:
+        if not -2048 <= value < 2048:
+            raise MachineCodeError(f"{value} does not fit a twelve-bit immediate")
+        self._word(((value & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode)
+
+    def _s(self, value: int, rs2: int, rs1: int, funct3: int, opcode: int) -> None:
+        if not -2048 <= value < 2048:
+            raise MachineCodeError(f"{value} does not fit a twelve-bit immediate")
+        self._word(
+            ((value >> 5 & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15)
+            | (funct3 << 12) | ((value & 0x1F) << 7) | opcode
+        )
+
+    def _b(self, offset: int, rs2: int, rs1: int, funct3: int) -> None:
+        self._word(
+            ((offset >> 12 & 1) << 31) | ((offset >> 5 & 0x3F) << 25) | (rs2 << 20)
+            | (rs1 << 15) | (funct3 << 12) | ((offset >> 1 & 0xF) << 8)
+            | ((offset >> 11 & 1) << 7) | 0b1100011
+        )
+
+    # -- moving values -----------------------------------------------------
+
+    def move(self, destination: int, source: int) -> None:
+        self._i(0, source, 0b000, destination, 0b0010011)
+
+    def immediate(self, destination: int, value: int) -> None:
+        """addi alone, or lui and addi.
+
+        Layer 9 packs a constant as an i32, so nothing wider than this can
+        reach the backend; anything that did would be a container that had
+        already accepted what it could not hold.
+        """
+        if -2048 <= value < 2048:
+            self._i(value, RISCV_ZERO, 0b000, destination, 0b0010011)
+            return
+        if not -(1 << 31) <= value < (1 << 31):
+            raise MachineCodeError(f"{value} is wider than the container can carry")
+        low = ((value & 0xFFF) ^ 0x800) - 0x800
+        self._word((((value - low) >> 12 & 0xFFFFF) << 12) | (destination << 7) | 0b0110111)
+        if low:
+            self._i(low, destination, 0b000, destination, 0b0010011)
+
+    # -- arithmetic --------------------------------------------------------
+
+    OPERATIONS: ClassVar[Mapping[str, tuple[int, int]]] = {
+        "add": (0b0000000, 0b000), "sub": (0b0100000, 0b000),
+        "xor": (0b0000000, 0b100), "slt": (0b0000000, 0b010),
+        "mul": (0b0000001, 0b000), "div": (0b0000001, 0b100),
+        "rem": (0b0000001, 0b110),
+    }
+
+    def arithmetic(self, operation: str, destination: int, left: int, right: int) -> None:
+        funct7, funct3 = self.OPERATIONS[operation]
+        self._r(funct7, right, left, funct3, destination, 0b0110011)
+
+    def arithmetic_immediate(
+        self, destination: int, left: int, value: int, scratch: int = RISCV_SCRATCH
+    ) -> None:
+        """addi, or the value in a register and an add."""
+        if -2048 <= value < 2048:
+            self._i(value, left, 0b000, destination, 0b0010011)
+            return
+        self.immediate(scratch, value)
+        self.arithmetic("add", destination, left, scratch)
+
+    def exclusive_or_immediate(self, destination: int, source: int, value: int) -> None:
+        self._i(value, source, 0b100, destination, 0b0010011)
+
+    def negate(self, destination: int, source: int) -> None:
+        self.arithmetic("sub", destination, RISCV_ZERO, source)
+
+    # -- memory ------------------------------------------------------------
+
+    def load(self, destination: int, base: int, offset: int = 0) -> None:
+        self._i(offset, base, 0b011, destination, 0b0000011)
+
+    def store(self, source: int, base: int, offset: int = 0) -> None:
+        self._s(offset, source, base, 0b011, 0b0100011)
+
+    def load_octet(self, destination: int, base: int, offset: int = 0) -> None:
+        self._i(offset, base, 0b100, destination, 0b0000011)
+
+    def store_octet(self, source: int, base: int, offset: int = 0) -> None:
+        self._s(offset, source, base, 0b000, 0b0100011)
+
+    def push(self, register: int) -> None:
+        """Sixteen, not eight, because sp is aligned to sixteen here too."""
+        self._i(-16, RISCV_STACK, 0b000, RISCV_STACK, 0b0010011)
+        self.store(register, RISCV_STACK, 0)
+
+    def pop(self, register: int) -> None:
+        self.load(register, RISCV_STACK, 0)
+        self._i(16, RISCV_STACK, 0b000, RISCV_STACK, 0b0010011)
+
+    # -- control -----------------------------------------------------------
+
+    def jump(self, name: str) -> None:
+        self._fixups.append((len(self._code), name))
+        self._word(0b1101111)
+
+    def call(self, name: str) -> None:
+        self._fixups.append((len(self._code), name))
+        self._word((RISCV_RETURN << 7) | 0b1101111)
+
+    def branch(self, condition: str, left: int, right: int, name: str) -> None:
+        funct3, swapped = RISCV_INVERTED[condition]
+        first, second = (right, left) if swapped else (left, right)
+        self._b(8, second, first, funct3)
+        self.jump(name)
+
+    def branch_immediate(
+        self, condition: str, left: int, value: int, name: str, scratch: int = RISCV_SCRATCH
+    ) -> None:
+        if value == 0:
+            self.branch(condition, left, RISCV_ZERO, name)
+            return
+        self.immediate(scratch, value)
+        self.branch(condition, left, scratch, name)
+
+    def ret(self) -> None:
+        self._i(0, RISCV_RETURN, 0b000, RISCV_ZERO, 0b1100111)
+
+    def trap(self) -> None:
+        self._word(0x00100073)
+
+    def syscall(self) -> None:
+        self._word(0x00000073)
+
+
+A0, A1, A2, A3 = 10, 11, 12, 13
+T0, T1, T2, T3 = 5, 6, 7, 28
+S4, S5, S6, S7, S8, S9, S10, S11 = 20, 21, 22, 23, 24, 25, 26, 27
+
+
+class Riscv64CodeBackend:
+    """Encodes a linked object module as riscv64 machine code.
+
+    The same shape as the other two: the operand stack is the hardware stack,
+    the runtime is reached by call, and .bss sits at a fixed address the
+    prologue puts in a register.  A call leaves its return address in a
+    register as on aarch64, so the two routines that call another one park it.
+
+    What is its own is the addressing.  There is no register-plus-register
+    form to load or store through, so an index is added into a pointer first
+    and every access reads at zero from that.  And div answers minus one where
+    the divisor is zero rather than faulting, so the divisor is tested and the
+    trap is written out.
+    """
+
+    ORIENTATION_ENCODING: ClassVar[Mapping[Orientation, int]] = {
+        Orientation.ROW: 0,
+        Orientation.COLUMN: 1,
+        Orientation.DIAGONAL: 2,
+        Orientation.ANTIDIAGONAL: 3,
+    }
+
+    def __init__(self, module: ObjectModule) -> None:
+        self._module = module
+        self._order = module.order
+        self._cells = module.order * module.order
+        self._apothem = module.order // 2
+        self._frame = max(module.frame_size, 1)
+        self._layout = DataLayout.of(self._order, self._frame)
+        self._group = SymmetryGroup.generated_by(
+            module.family.generators,
+            Coordinate(self._apothem, self._apothem),
+            module.symmetry_order,
+            presentation=f"{module.family.value}-{module.cardinality} about centroid",
+        )
+
+    @property
+    def layout(self) -> DataLayout:
+        return self._layout
+
+    @woven
+    def encode(self) -> bytes:
+        """The whole text section: entry point, instruction stream, runtime."""
+        text = Riscv64Assembler()
+        text.label("_start")
+        text.immediate(RISCV_DATA, DATA_BASE)
+        for address, instruction in enumerate(self._module.instructions):
+            text.label(f"A{address}")
+            self._instruction(text, instruction, address)
+        text.label("exit")
+        text.call("render")
+        text.immediate(RISCV_SYSCALL, RISCV_SYS_EXIT_GROUP)
+        text.immediate(A0, 0)
+        text.syscall()
+        text.label("divide.by.zero")
+        text.trap()
+        self._paint(text)
+        self._emit_run(text)
+        self._snapshot(text)
+        self._apply(text)
+        self._render(text)
+        return text.link()
+
+    @staticmethod
+    def _address(text: Riscv64Assembler, destination: int, index: int, offset: int) -> None:
+        """destination = the .bss base, plus a region's offset, plus an index."""
+        text.arithmetic("add", destination, RISCV_DATA, index)
+        if offset:
+            text.arithmetic_immediate(destination, destination, offset)
+
+    def _intrinsic(self, name: str) -> int:
+        try:
+            return {
+                "zero": 0,
+                "apothem": self._apothem,
+                "extremum": self._order - 1,
+                "magnitude": self._order,
+            }[name]
+        except KeyError as exc:
+            raise MachineCodeError(f"unbound intrinsic {name!r}") from exc
+
+    def _instruction(
+        self, text: Riscv64Assembler, instruction: Instruction, address: int
+    ) -> None:
+        match instruction:
+            case Halt():
+                text.jump("exit")
+            case Jump(target=target):
+                text.jump(f"A{int(target)}")
+            case JumpIfFalse(target=target):
+                text.pop(A0)
+                text.branch("eq", A0, RISCV_ZERO, f"A{int(target)}")
+            case PushConstant(value=value):
+                text.immediate(A0, value)
+                text.push(A0)
+            case LoadIntrinsic(name=name):
+                text.immediate(A0, self._intrinsic(name))
+                text.push(A0)
+            case LoadLocal(slot=slot):
+                self._address(text, T0, RISCV_ZERO, self._layout.frame + slot * 8)
+                text.load(A0, T0)
+                text.push(A0)
+            case StoreLocal(slot=slot):
+                text.pop(A0)
+                self._address(text, T0, RISCV_ZERO, self._layout.frame + slot * 8)
+                text.store(A0, T0)
+            case BinaryAdd() | BinarySubtract() | BinaryMultiply():
+                text.pop(A1)
+                text.pop(A0)
+                text.arithmetic(
+                    {BinaryAdd: "add", BinarySubtract: "sub", BinaryMultiply: "mul"}[
+                        type(instruction)
+                    ],
+                    A0, A0, A1,
+                )
+                text.push(A0)
+            case BinaryDivide():
+                self._floor_divide(text, address)
+            case Negate():
+                text.pop(A0)
+                text.negate(A0, A0)
+                text.push(A0)
+            case CompareLessEqual():
+                # There is a set-if-less-than and no set-if-not-greater, so
+                # the operands go the other way round and the answer flips.
+                text.pop(A1)
+                text.pop(A0)
+                text.arithmetic("slt", A0, A1, A0)
+                text.exclusive_or_immediate(A0, A0, 1)
+                text.push(A0)
+            case MakeInterval():
+                pass
+            case EmitOrientedRun(orientation=orientation):
+                text.pop(A3)
+                text.pop(A2)
+                text.pop(A1)
+                text.immediate(A0, self.ORIENTATION_ENCODING[orientation])
+                text.call("emit_run")
+            case CloseUnderGroup():
+                text.call("snapshot")
+                for element in self._group.elements:
+                    linear = element.linear
+                    text.immediate(A0, linear.a)
+                    text.immediate(A1, linear.b)
+                    text.immediate(A2, linear.c)
+                    text.immediate(A3, linear.d)
+                    text.call("apply")
+            case _:
+                raise MachineCodeError(f"unencodable instruction {instruction!r}")
+
+    def _floor_divide(self, text: Riscv64Assembler, address: int) -> None:
+        """div truncates towards zero where the interpreter floors."""
+        floored = f"A{address}.floored"
+        text.pop(A1)
+        text.pop(A0)
+        text.branch("eq", A1, RISCV_ZERO, "divide.by.zero")
+        text.arithmetic("div", A2, A0, A1)
+        text.arithmetic("rem", A3, A0, A1)
+        text.branch("eq", A3, RISCV_ZERO, floored)
+        text.arithmetic("xor", A3, A3, A1)
+        text.branch("ge", A3, RISCV_ZERO, floored)
+        text.arithmetic_immediate(A2, A2, -1)
+        text.label(floored)
+        text.push(A2)
+
+    # -- the runtime the instruction stream calls into ---------------------
+
+    def _paint(self, text: Riscv64Assembler) -> None:
+        """paint(a0 = row, a1 = column), out of bounds silently ignored."""
+        text.label("paint")
+        for register in (A0, A1):
+            text.branch("lt", register, RISCV_ZERO, "paint.done")
+            text.branch_immediate("ge", register, self._order, "paint.done")
+        text.immediate(T0, self._order)
+        text.arithmetic("mul", T0, A0, T0)
+        text.arithmetic("add", T0, T0, A1)
+        self._address(text, T0, T0, self._layout.canvas)
+        text.immediate(T1, 1)
+        text.store_octet(T1, T0)
+        text.label("paint.done")
+        text.ret()
+
+    def _emit_run(self, text: Riscv64Assembler) -> None:
+        """emit_run(a0 = orientation, a1 = index, a2 = lower, a3 = upper)."""
+        text.label("emit_run")
+        text.move(RISCV_LINK_SAVE, RISCV_RETURN)
+        text.move(S4, A0)
+        text.move(S5, A1)
+        text.move(S6, A2)
+        text.move(S7, A3)
+        text.label("emit_run.head")
+        text.branch("gt", S6, S7, "emit_run.done")
+        for encoding, name in ((1, "column"), (2, "diagonal"), (3, "antidiagonal")):
+            text.branch_immediate("eq", S4, encoding, f"emit_run.{name}")
+        text.move(A0, S5)
+        text.move(A1, S6)
+        text.jump("emit_run.paint")
+        text.label("emit_run.column")
+        text.move(A0, S6)
+        text.move(A1, S5)
+        text.jump("emit_run.paint")
+        text.label("emit_run.diagonal")
+        text.move(A0, S6)
+        text.arithmetic("add", A1, S6, S5)
+        text.jump("emit_run.paint")
+        text.label("emit_run.antidiagonal")
+        text.move(A0, S6)
+        text.arithmetic("sub", A1, S5, S6)
+        text.label("emit_run.paint")
+        text.call("paint")
+        text.arithmetic_immediate(S6, S6, 1)
+        text.jump("emit_run.head")
+        text.label("emit_run.done")
+        text.move(RISCV_RETURN, RISCV_LINK_SAVE)
+        text.ret()
+
+    def _snapshot(self, text: Riscv64Assembler) -> None:
+        """The canvas as it stood before the closure began."""
+        text.label("snapshot")
+        self._address(text, S4, RISCV_ZERO, self._layout.canvas)
+        self._address(text, S5, RISCV_ZERO, self._layout.snapshot)
+        text.immediate(T0, 0)
+        text.label("snapshot.head")
+        text.branch_immediate("ge", T0, self._cells, "snapshot.done")
+        text.arithmetic("add", T1, S4, T0)
+        text.load_octet(T2, T1)
+        text.arithmetic("add", T1, S5, T0)
+        text.store_octet(T2, T1)
+        text.arithmetic_immediate(T0, T0, 1)
+        text.jump("snapshot.head")
+        text.label("snapshot.done")
+        text.ret()
+
+    def _apply(self, text: Riscv64Assembler) -> None:
+        """apply(a0 = a, a1 = b, a2 = c, a3 = d): one group element."""
+        text.label("apply")
+        text.move(RISCV_LINK_SAVE, RISCV_RETURN)
+        text.move(S4, A0)
+        text.move(S5, A1)
+        text.move(S6, A2)
+        text.move(S7, A3)
+        self._address(text, S8, RISCV_ZERO, self._layout.snapshot)
+        text.immediate(S9, 0)
+        text.label("apply.row")
+        text.branch_immediate("ge", S9, self._order, "apply.done")
+        text.immediate(S10, 0)
+        text.label("apply.column")
+        text.branch_immediate("ge", S10, self._order, "apply.row.step")
+        text.immediate(T0, self._order)
+        text.arithmetic("mul", T0, S9, T0)
+        text.arithmetic("add", T0, T0, S10)
+        text.arithmetic("add", T0, S8, T0)
+        text.load_octet(T1, T0)
+        text.branch("eq", T1, RISCV_ZERO, "apply.column.step")
+        text.arithmetic_immediate(S11, S9, -self._apothem)
+        text.arithmetic_immediate(T3, S10, -self._apothem)
+        text.arithmetic("mul", T0, S4, S11)
+        text.arithmetic("mul", T1, S5, T3)
+        text.arithmetic("add", T0, T0, T1)
+        text.arithmetic_immediate(A0, T0, self._apothem)
+        text.arithmetic("mul", T0, S6, S11)
+        text.arithmetic("mul", T1, S7, T3)
+        text.arithmetic("add", T0, T0, T1)
+        text.arithmetic_immediate(A1, T0, self._apothem)
+        text.call("paint")
+        text.label("apply.column.step")
+        text.arithmetic_immediate(S10, S10, 1)
+        text.jump("apply.column")
+        text.label("apply.row.step")
+        text.arithmetic_immediate(S9, S9, 1)
+        text.jump("apply.row")
+        text.label("apply.done")
+        text.move(RISCV_RETURN, RISCV_LINK_SAVE)
+        text.ret()
+
+    def _render(self, text: Riscv64Assembler) -> None:
+        """The canvas as text, trailing blanks trimmed, in a single write."""
+        text.label("render")
+        self._address(text, S4, RISCV_ZERO, self._layout.canvas)
+        self._address(text, S5, RISCV_ZERO, self._layout.output)
+        text.immediate(S6, 0)
+        text.immediate(S7, 0)
+        text.label("render.row")
+        text.branch_immediate("ge", S6, self._order, "render.flush")
+        text.immediate(S9, -1)
+        text.immediate(S8, 0)
+        text.label("render.scan")
+        text.branch_immediate("ge", S8, self._order, "render.print")
+        text.immediate(T0, self._order)
+        text.arithmetic("mul", T0, S6, T0)
+        text.arithmetic("add", T0, T0, S8)
+        text.arithmetic("add", T0, S4, T0)
+        text.load_octet(T1, T0)
+        text.branch("eq", T1, RISCV_ZERO, "render.scan.step")
+        text.move(S9, S8)
+        text.label("render.scan.step")
+        text.arithmetic_immediate(S8, S8, 1)
+        text.jump("render.scan")
+        text.label("render.print")
+        text.immediate(S8, 0)
+        text.label("render.cell")
+        text.branch("gt", S8, S9, "render.newline")
+        text.branch("le", S8, RISCV_ZERO, "render.ink")
+        text.immediate(T2, ord(" "))
+        text.arithmetic("add", T1, S5, S7)
+        text.store_octet(T2, T1)
+        text.arithmetic_immediate(S7, S7, 1)
+        text.label("render.ink")
+        text.immediate(T0, self._order)
+        text.arithmetic("mul", T0, S6, T0)
+        text.arithmetic("add", T0, T0, S8)
+        text.arithmetic("add", T0, S4, T0)
+        text.load_octet(T1, T0)
+        text.branch("eq", T1, RISCV_ZERO, "render.blank")
+        text.immediate(T2, ord("*"))
+        text.jump("render.advance")
+        text.label("render.blank")
+        text.immediate(T2, ord(" "))
+        text.label("render.advance")
+        text.arithmetic("add", T1, S5, S7)
+        text.store_octet(T2, T1)
+        text.arithmetic_immediate(S7, S7, 1)
+        text.arithmetic_immediate(S8, S8, 1)
+        text.jump("render.cell")
+        text.label("render.newline")
+        text.immediate(T2, ord("\n"))
+        text.arithmetic("add", T1, S5, S7)
+        text.store_octet(T2, T1)
+        text.arithmetic_immediate(S7, S7, 1)
+        text.arithmetic_immediate(S6, S6, 1)
+        text.jump("render.row")
+        text.label("render.flush")
+        text.immediate(RISCV_SYSCALL, RISCV_SYS_WRITE)
+        text.immediate(A0, 1)
+        self._address(text, A1, RISCV_ZERO, self._layout.output)
+        text.move(A2, S7)
+        text.syscall()
+        text.ret()
+
+
 ELF_HEADER_SIZE: Final[int] = 64
 PROGRAM_HEADER_SIZE: Final[int] = 56
 PROGRAM_HEADERS: Final[int] = 2
@@ -11762,6 +12315,7 @@ def elf64_image(text: bytes, bss: int, machine: int, align: int) -> bytes:
 MACHINES: Final[Mapping[str, tuple[type, int, int, str]]] = {
     "x86-64": (NativeCodeBackend, EM_X86_64, PAGE_SIZE, "x86_64"),
     "aarch64": (Aarch64CodeBackend, EM_AARCH64, ARM_PAGE, "aarch64"),
+    "riscv64": (Riscv64CodeBackend, EM_RISCV, PAGE_SIZE, "riscv64"),
 }
 
 

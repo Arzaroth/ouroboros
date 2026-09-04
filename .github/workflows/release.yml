@@ -70,6 +70,7 @@ jobs:
           cp ouroboros.py dist/
           python ouroboros.py --machine x86-64 --emit-elf "dist/glyph-$safe-linux-x86_64" > /dev/null
           python ouroboros.py --machine aarch64 --emit-elf "dist/glyph-$safe-linux-aarch64" > /dev/null
+          python ouroboros.py --machine riscv64 --emit-elf "dist/glyph-$safe-linux-riscv64" > /dev/null
           python ouroboros.py --emit-wasm "dist/glyph-$safe.wasm" > /dev/null
           python ouroboros.py --emit-llvm > "dist/glyph-$safe.ll"
           python ouroboros.py --emit-gsl2 glyphc > "dist/glyphc-$safe.gsl2"
@@ -78,9 +79,11 @@ jobs:
           diff <("./dist/glyph-$safe-linux-x86_64") <(python ouroboros.py)
           file "dist/glyph-$safe-linux-x86_64"
 
-          # This runner is not that machine, so the arm job is what runs the
-          # aarch64 one; here it only has to be the right shape.
+          # This runner is neither of those machines, so the arm job is what
+          # runs the aarch64 one and qemu is all the riscv64 one has ever had;
+          # here they only have to be the right shape.
           file "dist/glyph-$safe-linux-aarch64" | grep -q aarch64
+          file "dist/glyph-$safe-linux-riscv64" | grep -q RISC-V
 
           # The same again for the one that asks for no Linux, through the
           # five lines of host the file carries.
