@@ -2815,8 +2815,80 @@ class Label:
 IrItem = typing.Union[Instruction, Label]
 
 
+# ----------------------------------------------------------------------
+# Lowering, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# A program per kind of node, in the same vocabulary-and-offsets form the
+# surface of the language is written in.  An opcode either walks into the
+# tree, emits an instruction, or binds and places a label; what each kind of
+# node lowers to is the run of opcodes listed against it and nothing else.
+
+LOWERING_IMAGE: Final[str] = (
+    "+ BinaryAdd - BinarySubtract * BinaryMultiply / BinaryDivide Program "
+    "each body emit CloseUnderGroup Halt LatticeDeclaration "
+    "SymmetryDeclaration Binding visit value sym StoreLocal slot "
+    "StrokeDeclaration Emission lowered Painting run Run index lower upper "
+    "MakeInterval node EmitOrientedRun orientation Iteration mark head "
+    "loop.head. exit loop.exit. place LoadLocal CompareLessEqual goto "
+    "JumpIfFalse lit PushConstant 1 Jump IntegerLiteral SymbolReference "
+    "bykind LoadIntrinsic name UnaryOperation operand Negate BinaryOperation "
+    "left right pick operator_symbol~0.1,2.3,4.5,6.7~8:9.a|b.c|b.d,e:,f:,g:h."
+    "i|j.k.l,m:,n:o,p:h.q,r:h.s|h.t|h.u|b.v|w.x.y,z:10.11.12|10.13.14|h.t|j.k"
+    ".l|15.11|j.16.l|h.u|b.17|18.19.13|9.a|j.16.l|1a.1b.1c|b.1|j.k.l|18.1d.11"
+    "|15.13,1e:w.1b.i,1f:1g.1h.1i.16.l,1j:h.1k|b.1l,1m:h.1n|h.1o|1p.1q"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LoweringImage:
+    """What the image stands for: an operator table and a program per node."""
+
+    operators: Mapping[str, str]
+    programs: Mapping[str, tuple[tuple[str, ...], ...]]
+
+
+def compile_lowering(image: str) -> LoweringImage:
+    """Reads an image back into the programs layer 7 runs."""
+    try:
+        vocabulary, operators, programs = image.split("~")
+    except ValueError as exc:
+        raise CodeGenerationError("the image does not have three sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise CodeGenerationError(f"{code!r} addresses no word") from exc
+
+    return LoweringImage(
+        {at(a): at(b) for a, b in (r.split(".") for r in operators.split(","))},
+        {
+            at(head): (
+                tuple(tuple(at(t) for t in op.split(".")) for op in body.split("|"))
+                if body
+                else ()
+            )
+            for head, _, body in (r.partition(":") for r in programs.split(","))
+        },
+    )
+
+
+LOWERING: Final[LoweringImage] = compile_lowering(LOWERING_IMAGE)
+
+INSTRUCTION_BY_NAME: Final[Mapping[str, type[Instruction]]] = {
+    instruction.__name__: instruction for instruction in _OPCODES.values()
+}
+
+
 class BytecodeEmitter(AstVisitor[None]):
-    """Lowers the typed tree into a symbolic instruction listing."""
+    """Lowers the typed tree by running the program the image holds for a node.
+
+    Every one of the visitor's thirteen methods is the same method.  Which
+    program runs is settled by the node the double dispatch arrives at, and
+    that program is read out of the image rather than written here.
+    """
 
     def __init__(self, model: SemanticModel) -> None:
         self._model = model
@@ -2835,88 +2907,78 @@ class BytecodeEmitter(AstVisitor[None]):
     def _label(self, stem: str) -> Label:
         return Label(f".{stem}{next(self._labels)}")
 
-    def visit_program(self, node: Program) -> None:
-        for statement in node.body:
-            self.visit(statement)
-        self._emit(CloseUnderGroup())
-        self._emit(Halt())
+    @staticmethod
+    def _instruction(name: str) -> type[Instruction]:
+        try:
+            return INSTRUCTION_BY_NAME[name]
+        except KeyError as exc:
+            raise CodeGenerationError(f"{name!r} names no instruction") from exc
 
-    def visit_lattice_declaration(self, node: LatticeDeclaration) -> None:
-        return None
-
-    def visit_symmetry_declaration(self, node: SymmetryDeclaration) -> None:
-        return None
-
-    def visit_binding(self, node: Binding) -> None:
-        symbol = self._model.resolutions.get(node_id := id(node))
-        if symbol is None:  # pragma: no cover - defensive
-            raise CodeGenerationError(f"binding {node.name!r} was never resolved")
-        del node_id
-        self.visit(node.value)
-        self._emit(StoreLocal(symbol.slot))
-
-    def visit_stroke_declaration(self, node: StrokeDeclaration) -> None:
-        return None
-
-    def visit_emission(self, node: Emission) -> None:
+    def _resolve(self, node: AstNode) -> Symbol:
         symbol = self._model.resolutions.get(id(node))
-        run = symbol.run if symbol is not None else self._model.strokes.get(node.name)
-        if run is None:  # pragma: no cover - defensive
-            raise CodeGenerationError(f"stroke {node.name!r} has no lowered definition")
-        self.visit(run)
+        if symbol is None:  # pragma: no cover - defensive
+            raise CodeGenerationError(f"{type(node).__name__} was never resolved")
+        return symbol
 
-    def visit_painting(self, node: Painting) -> None:
-        self.visit(node.run)
+    def _dispatch(self, node: AstNode) -> None:
+        marks: dict[str, Label] = {}
+        for code, *arguments in LOWERING.programs.get(type(node).__name__, ()):
+            if code == "visit":
+                self.visit(getattr(node, arguments[0]))
+            elif code == "each":
+                for item in getattr(node, arguments[0]):
+                    self.visit(item)
+            elif code == "emit":
+                self._emit(self._instruction(arguments[0])())
+            elif code == "node":
+                self._emit(self._instruction(arguments[0])(getattr(node, arguments[1])))
+            elif code == "sym":
+                symbol = self._resolve(node)
+                self._emit(self._instruction(arguments[0])(getattr(symbol, arguments[1])))
+            elif code == "lit":
+                self._emit(self._instruction(arguments[0])(int(arguments[1])))
+            elif code == "mark":
+                marks[arguments[0]] = self._label(arguments[1])
+            elif code == "place":
+                self._emit(marks[arguments[0]])
+            elif code == "goto":
+                self._emit(self._instruction(arguments[0])(marks[arguments[1]].name))
+            elif code == "pick":
+                chosen = LOWERING.operators[getattr(node, arguments[0])]
+                self._emit(self._instruction(chosen)())
+            elif code == "bykind":
+                symbol = self._resolve(node)
+                head, attribute = (
+                    arguments[:2] if symbol.kind is SymbolKind.INTRINSIC else arguments[2:]
+                )
+                self._emit(self._instruction(head)(getattr(symbol, attribute)))
+            elif code == "lowered":
+                resolved = self._model.resolutions.get(id(node))
+                run = (
+                    resolved.run if resolved is not None
+                    else self._model.strokes.get(node.name)
+                )
+                if run is None:  # pragma: no cover - defensive
+                    raise CodeGenerationError(
+                        f"stroke {node.name!r} has no lowered definition"
+                    )
+                self.visit(run)
+            else:  # pragma: no cover - defensive
+                raise CodeGenerationError(f"{code!r} is not an opcode this runs")
 
-    def visit_run(self, node: Run) -> None:
-        self.visit(node.index)
-        self.visit(node.lower)
-        self.visit(node.upper)
-        self._emit(MakeInterval())
-        self._emit(EmitOrientedRun(node.orientation))
-
-    def visit_iteration(self, node: Iteration) -> None:
-        symbol = self._model.resolutions[id(node)]
-        head, exit_ = self._label("loop.head."), self._label("loop.exit.")
-        self.visit(node.lower)
-        self._emit(StoreLocal(symbol.slot))
-        self._emit(head)
-        self._emit(LoadLocal(symbol.slot))
-        self.visit(node.upper)
-        self._emit(CompareLessEqual())
-        self._emit(JumpIfFalse(exit_.name))
-        for statement in node.body:
-            self.visit(statement)
-        self._emit(LoadLocal(symbol.slot))
-        self._emit(PushConstant(1))
-        self._emit(BinaryAdd())
-        self._emit(StoreLocal(symbol.slot))
-        self._emit(Jump(head.name))
-        self._emit(exit_)
-
-    def visit_integer_literal(self, node: IntegerLiteral) -> None:
-        self._emit(PushConstant(node.value))
-
-    def visit_symbol_reference(self, node: SymbolReference) -> None:
-        symbol = self._model.resolutions[id(node)]
-        if symbol.kind is SymbolKind.INTRINSIC:
-            self._emit(LoadIntrinsic(symbol.name))
-        else:
-            self._emit(LoadLocal(symbol.slot))
-
-    def visit_unary_operation(self, node: UnaryOperation) -> None:
-        self.visit(node.operand)
-        self._emit(Negate())
-
-    def visit_binary_operation(self, node: BinaryOperation) -> None:
-        self.visit(node.left)
-        self.visit(node.right)
-        self._emit(
-            {
-                "+": BinaryAdd, "-": BinarySubtract,
-                "*": BinaryMultiply, "/": BinaryDivide,
-            }[node.operator_symbol]()
-        )
+    visit_program = _dispatch
+    visit_lattice_declaration = _dispatch
+    visit_symmetry_declaration = _dispatch
+    visit_binding = _dispatch
+    visit_stroke_declaration = _dispatch
+    visit_emission = _dispatch
+    visit_painting = _dispatch
+    visit_run = _dispatch
+    visit_iteration = _dispatch
+    visit_integer_literal = _dispatch
+    visit_symbol_reference = _dispatch
+    visit_unary_operation = _dispatch
+    visit_binary_operation = _dispatch
 
 
 # ======================================================================
