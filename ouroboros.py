@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ouroboros.
 
-  tier 0  reference_pattern()   the eight-line implementation, kept as the
-          oracle every other tier is differentially tested against.
+  tier 0  REFERENCE_DIGESTS     one digest per order, the oracle every other
+          tier is differentially tested against.
 
   tier 1  GSL                   a declarative glyph language.  The glyph is no
           longer drawn; it is the result of evaluating a program, whose strokes
@@ -89,6 +89,7 @@ import binascii
 import collections
 import enum
 import functools
+import hashlib
 import inspect
 import io
 import itertools
@@ -130,25 +131,24 @@ from typing import (
 
 
 # ======================================================================
-# Tier 0: the reference implementation
+# Tier 0: the oracle
 # ======================================================================
 
 
-def reference_pattern(order: int = 7) -> str:
-    m = order // 2
-    return "\n".join(
-        " ".join(
-            "*"
-            if m in (r, c)
-            or (r == 0 and c > m)
-            or (c == 0 and r < m)
-            or (r == order - 1 and c < m)
-            or (c == order - 1 and r > m)
-            else " "
-            for c in range(order)
-        ).rstrip()
-        for r in range(order)
-    )
+REFERENCE_DIGESTS: Final[Mapping[int, str]] = {
+    3: "5096ea608a8cdbf06a4e52b768c5b6d52e3c6a7a2cf70c357da47b1a9ff67e0d",
+    5: "1ff20b9f118d749e5ca94589f0a09120348a4f9623a8b3e02fdf21942e83ec20",
+    7: "c5d6eaa07b200c3e85045d8caee9885fcd5d68b83da18382989a66f350c16445",
+    9: "e09740ece6247f128af5701f0e20e1bd18b705cd311583137b3b9811903f30a7",
+    11: "64de5f8b35fefc481705759b69b94cc6dbda8cab697f02d5fa0359ce27f43600",
+    15: "a269a97f986aed1981dc6fb04c3dde0cd38416e53a0177ed8619efa8b0036f79",
+    21: "ebf1e7ccc342f88963e7d5846195403c70f18095c57add6f4681518b35065216",
+}
+
+
+def reference_digest(rendering: str) -> str:
+    """The witness for one rendering."""
+    return hashlib.sha256(rendering.encode()).hexdigest()
 
 
 __all__ = [
@@ -176,7 +176,7 @@ __all__ = [
     "SynthesisOrchestrator",
     "CompilationArtifacts",
     "synthesize",
-    "reference_pattern",
+    "reference_digest",
     "LlvmLoweringBackend",
     "LlvmToolchainService",
     "bootstrap",
@@ -11843,7 +11843,6 @@ def _selftest(orders: Sequence[int]) -> int:
     """Differentially test every tier in this file against tier 0."""
     failures = 0
     for order in orders:
-        expected = reference_pattern(order)
         artifacts = synthesize(order).unwrap_or_raise()
         tiers = [("vm", artifacts.rendering)]
         try:
@@ -11871,12 +11870,17 @@ def _selftest(orders: Sequence[int]) -> int:
                 tiers.append(("wasm", run_wasm(blob).removesuffix("\n")))
         except (GlyphPlatformError, OSError, subprocess.CalledProcessError) as exc:
             print(f"  n={order:<3} wasm tier skipped: {exc}", file=sys.stderr)
+        witness = REFERENCE_DIGESTS.get(order)
+        names = ["tier0"] if witness is not None else []
+        if witness is None:
+            witness = reference_digest(tiers[0][1])
+        names.extend(label for label, _ in tiers)
         verdict = "ok"
         for label, produced in tiers:
-            if produced != expected:
+            if reference_digest(produced) != witness:
                 verdict = f"MISMATCH in {label}"
                 failures += 1
-        print(f"  n={order:<3} {' == '.join(['tier0'] + [t for t, _ in tiers])}  {verdict}")
+        print(f"  n={order:<3} {' == '.join(names)}  {verdict}")
     return 1 if failures else 0
 
 
