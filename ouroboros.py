@@ -1477,6 +1477,85 @@ class Preprocessor:
 # ======================================================================
 
 
+# ----------------------------------------------------------------------
+# The surface of the language, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# Every word the tables stand on is interned once and addressed by an offset
+# in base thirty-six thereafter, so what is written down is a vocabulary and
+# runs of offsets into it rather than the tables themselves.  The five
+# sections are the vocabulary, the reserved words, the punctuation, the
+# productions, and the infix operators with their binding powers.
+
+FRONT_END_IMAGE: Final[str] = (
+    "about antidiagonal at centroid column cyclic diagonal dihedral emit for "
+    "in lattice let order paint row span stroke symmetry ( LEFT_PAREN ) "
+    "RIGHT_PAREN * STAR + PLUS - MINUS / SLASH ; SEMICOLON = EQUALS { "
+    "LEFT_BRACE } RIGHT_BRACE program body 'lattice' 'order' expression ';' "
+    "'symmetry' family INTEGER 'about' 'centroid' 'cyclic' 'dihedral' "
+    "statement ε binding emission painting iteration 'let' IDENTIFIER '=' "
+    "'stroke' run 'emit' 'paint' 'for' 'in' '..' '{' '}' orientation 'at' "
+    "'span' 'row' 'column' 'diagonal' 'antidiagonal' term expression_tail '+'"
+    " '-' factor term_tail '*' '/' '(' ')'~0.1.2.3.4.5.6.7.8.9.a.b.c.d.e.f.g."
+    "h.i~j.k,l.m,n.o,p.q,r.s,t.u,v.w,x.y,z.10,11.12~13:b.i.14,b:15.16.17.18,i"
+    ":19.1a.1b.1c.1d.18,1a:1e|1f,14:1g.14|1h,1g:1i|h|1j|1k|1l,1i:1m.1n.1o.17."
+    "18,h:1p.1n.1o.1q.18,1j:1r.1n.18,1k:1s.1q.18,1l:1t.1n.1u.17.1v.17.1w.14.1"
+    "x,1q:1y.1z.17.20.17.1v.17,1y:21|22|23|24,17:25.26,26:27.25.26|28.25.26|1"
+    "h,25:29.2a,2a:2b.29.2a|2c.29.2a|1h,29:1b|1n|28.29|2d.17.2e~q.p.a,s.r.a,o"
+    ".n.k,u.t.k"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FrontEndImage:
+    """What the image stands for: the tables layers 4 and 5 are driven by."""
+
+    keywords: FrozenSet[str]
+    punctuation: Mapping[str, str]
+    grammar: Mapping[str, tuple[tuple[str, ...], ...]]
+    infix: tuple[tuple[str, str, int], ...]
+
+
+def compile_front_end(image: str) -> FrontEndImage:
+    """Reads an image back into the tables it stands for."""
+    try:
+        vocabulary, reserved, marks, rules, operators = image.split("~")
+    except ValueError as exc:
+        raise LexicalError("the image does not have five sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise LexicalError(f"{code!r} addresses no word") from exc
+
+    def fields(record: str, count: int) -> list[str]:
+        parts = record.split(".")
+        if len(parts) != count:
+            raise LexicalError(f"{record!r} is not {count} fields")
+        return parts
+
+    return FrontEndImage(
+        frozenset(at(code) for code in reserved.split(".")),
+        {at(a): at(b) for a, b in (fields(r, 2) for r in marks.split(","))},
+        {
+            at(head): tuple(
+                tuple(at(symbol) for symbol in alternative.split("."))
+                for alternative in body.split("|")
+            )
+            for head, _, body in (r.partition(":") for r in rules.split(","))
+        },
+        tuple(
+            (at(a), at(b), int(c, 36))
+            for a, b, c in (fields(r, 3) for r in operators.split(","))
+        ),
+    )
+
+
+FRONT_END: Final[FrontEndImage] = compile_front_end(FRONT_END_IMAGE)
+
+
 class TokenKind(enum.Enum):
     KEYWORD = enum.auto()
     IDENTIFIER = enum.auto()
@@ -1495,25 +1574,10 @@ class TokenKind(enum.Enum):
     END_OF_INPUT = enum.auto()
 
 
-KEYWORDS: Final[FrozenSet[str]] = frozenset(
-    {
-        "lattice", "order", "symmetry", "cyclic", "dihedral", "about", "centroid",
-        "stroke", "emit", "paint", "let", "for", "in", "at", "span",
-        "row", "column", "diagonal", "antidiagonal",
-    }
-)
+KEYWORDS: Final[FrozenSet[str]] = FRONT_END.keywords
 
 PUNCTUATION: Final[Mapping[str, TokenKind]] = {
-    "+": TokenKind.PLUS,
-    "-": TokenKind.MINUS,
-    "*": TokenKind.STAR,
-    "/": TokenKind.SLASH,
-    "=": TokenKind.EQUALS,
-    ";": TokenKind.SEMICOLON,
-    "(": TokenKind.LEFT_PAREN,
-    ")": TokenKind.RIGHT_PAREN,
-    "{": TokenKind.LEFT_BRACE,
-    "}": TokenKind.RIGHT_BRACE,
+    mark: TokenKind[name] for mark, name in FRONT_END.punctuation.items()
 }
 
 
@@ -1743,33 +1807,7 @@ class TokenStream:
 
 EPSILON: Final[str] = "ε"
 
-GSL_GRAMMAR: Final[Mapping[str, tuple[tuple[str, ...], ...]]] = {
-    "program": (("lattice", "symmetry", "body"),),
-    "lattice": (("'lattice'", "'order'", "expression", "';'"),),
-    "symmetry": (("'symmetry'", "family", "INTEGER", "'about'", "'centroid'", "';'"),),
-    "family": (("'cyclic'",), ("'dihedral'",)),
-    "body": (("statement", "body"), (EPSILON,)),
-    "statement": (
-        ("binding",),
-        ("stroke",),
-        ("emission",),
-        ("painting",),
-        ("iteration",),
-    ),
-    "binding": (("'let'", "IDENTIFIER", "'='", "expression", "';'"),),
-    "stroke": (("'stroke'", "IDENTIFIER", "'='", "run", "';'"),),
-    "emission": (("'emit'", "IDENTIFIER", "';'"),),
-    "painting": (("'paint'", "run", "';'"),),
-    "iteration": (("'for'", "IDENTIFIER", "'in'", "expression", "'..'", "expression",
-                   "'{'", "body", "'}'"),),
-    "run": (("orientation", "'at'", "expression", "'span'", "expression", "'..'", "expression"),),
-    "orientation": (("'row'",), ("'column'",), ("'diagonal'",), ("'antidiagonal'",)),
-    "expression": (("term", "expression_tail"),),
-    "expression_tail": (("'+'", "term", "expression_tail"), ("'-'", "term", "expression_tail"), (EPSILON,)),
-    "term": (("factor", "term_tail"),),
-    "term_tail": (("'*'", "factor", "term_tail"), ("'/'", "factor", "term_tail"), (EPSILON,)),
-    "factor": (("INTEGER",), ("IDENTIFIER",), ("'-'", "factor"), ("'('", "expression", "')'")),
-}
+GSL_GRAMMAR: Final[Mapping[str, tuple[tuple[str, ...], ...]]] = FRONT_END.grammar
 
 
 class GrammarAnalyzer:
@@ -2110,10 +2148,8 @@ class InfixOperatorSpec:
 
 
 INFIX_TABLE: Final[Mapping[TokenKind, InfixOperatorSpec]] = {
-    TokenKind.PLUS: InfixOperatorSpec("+", 10),
-    TokenKind.MINUS: InfixOperatorSpec("-", 10),
-    TokenKind.STAR: InfixOperatorSpec("*", 20),
-    TokenKind.SLASH: InfixOperatorSpec("/", 20),
+    TokenKind[kind]: InfixOperatorSpec(symbol, precedence)
+    for kind, symbol, precedence in FRONT_END.infix
 }
 
 
