@@ -2283,6 +2283,67 @@ ENUM_BY_NAME: Final[Mapping[str, type[enum.Enum]]] = {
 }
 
 
+GRAMMAR_TERMINALS: Final[Mapping[str, str]] = {
+    **{kind.name: f"'{mark}'" for mark, kind in PUNCTUATION.items()},
+    "RANGE": "'..'",
+}
+
+STEP_SYMBOLS: Final[Mapping[str, str]] = {
+    "id": "IDENTIFIER",
+    "int": "INTEGER",
+    "expr": "expression",
+    "run": "run",
+    "body": "body",
+}
+
+ENUM_NONTERMINALS: Final[Mapping[str, str]] = {
+    "SymmetryFamily": "family",
+    "Orientation": "orientation",
+}
+
+
+def form_sentence(steps: Sequence[Sequence[str]]) -> tuple[str, ...]:
+    """The grammar symbols a form consumes, in the order it consumes them."""
+    sentence: list[str] = []
+    for code, *arguments in steps:
+        if code == "kw":
+            sentence.append(f"'{arguments[0]}'")
+        elif code == "tok":
+            sentence.append(GRAMMAR_TERMINALS[arguments[0]])
+        elif code == "enum":
+            sentence.append(ENUM_NONTERMINALS[arguments[0]])
+        elif code != "make":
+            sentence.append(STEP_SYMBOLS[code])
+    return tuple(sentence)
+
+
+def grammar_disagreements() -> tuple[str, ...]:
+    """Where the forms and the productions describe different languages.
+
+    Two descriptions of one syntax sit in the images and only one of them
+    parses: the forms are walked, and the productions are what FIRST and
+    FOLLOW - and so what a recovering parser reports against - are computed
+    from.  Nothing but this obliges them to agree, so nothing but this would
+    notice them drifting apart.
+
+    It settles which is authoritative not at all.  It only says they still
+    say the same thing.
+    """
+    found: list[str] = []
+    for name, steps in PARSER.forms.items():
+        if form_sentence(steps) not in GSL_GRAMMAR.get(name, ()):
+            found.append(f"no production admits the form {name!r}")
+    reachable = set(PARSER.statements.values())
+    alternatives = {alternative[0] for alternative in GSL_GRAMMAR["statement"]}
+    if reachable != alternatives:
+        found.append(
+            f"statements reach {sorted(reachable)} where the productions "
+            f"list {sorted(alternatives)}"
+        )
+    return tuple(found)
+
+
+
 class RecursiveDescentParser:
     """Recursive descent for statements, precedence climbing for expressions."""
 
@@ -4865,6 +4926,7 @@ class AssuranceSuite:
                 self._rasterisers_agree,
                 self._event_replay,
                 self._lexer_covers_source,
+                self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
                 self._coordinate_immutable,
             )
@@ -4949,6 +5011,17 @@ class AssuranceSuite:
         reconstructed = "".join(token.trivia + token.lexeme for token in artifacts.tokens)
         return CheckResult(
             "lexer partitions the whole unit", reconstructed == artifacts.unit.text
+        )
+
+    @staticmethod
+    def _forms_answer_to_grammar(artifacts: CompilationArtifacts) -> CheckResult:
+        disagreements = grammar_disagreements()
+        return CheckResult(
+            "forms answer to the grammar",
+            not disagreements,
+            f"{len(PARSER.forms)} form(s), and the statements they reach"
+            if not disagreements
+            else "; ".join(disagreements),
         )
 
     @staticmethod
