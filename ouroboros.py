@@ -1115,14 +1115,44 @@ class LinearOperator:
     def apply(self, row: int, column: int) -> tuple[int, int]:
         return (self.a * row + self.b * column, self.c * row + self.d * column)
 
+    @property
+    def transpose(self) -> "LinearOperator":
+        return LinearOperator(self.a, self.c, self.b, self.d)
+
     def __str__(self) -> str:
         return f"[[{self.a} {self.b}] [{self.c} {self.d}]]"
 
 
 LinearOperator.IDENTITY = LinearOperator(1, 0, 0, 1)
-INVOLUTION: Final[LinearOperator] = LinearOperator(1, 0, 0, -1)
-EXCHANGE: Final[LinearOperator] = LinearOperator(0, 1, 1, 0)
-PRINCIPAL_GENERATOR: Final[LinearOperator] = INVOLUTION @ EXCHANGE
+
+OPERATOR_BOUND: Final[int] = 1
+
+
+@functools.lru_cache(maxsize=None)
+def solve_operators(determinants: FrozenSet[int]) -> tuple[LinearOperator, ...]:
+    """Every integer operator satisfying the relations, over a bounded box.
+
+    Four unknowns and two relations: the operator composed with its own
+    transpose is the identity, and its determinant is one of ``determinants``.
+    Nothing is tabulated - the entries are searched for at the moment they are
+    wanted, and what is written down is only what they have to satisfy.
+
+    The first relation is what confines the search to a box at all: it forces
+    every row to have unit norm, so no entry can exceed one however wide the
+    span is opened.
+    """
+    span = range(-OPERATOR_BOUND, OPERATOR_BOUND + 1)
+    solutions = tuple(
+        candidate
+        for a, b, c, d in itertools.product(span, repeat=4)
+        if (candidate := LinearOperator(a, b, c, d)).determinant in determinants
+        and candidate.transpose @ candidate == LinearOperator.IDENTITY
+    )
+    if not solutions:
+        raise GroupAxiomViolation(
+            f"the relations admit no operator of determinant {sorted(determinants)}"
+        )
+    return solutions
 
 
 @dataclass(frozen=True, slots=True)
@@ -1806,9 +1836,8 @@ class SymmetryFamily(enum.Enum):
 
     @property
     def generators(self) -> tuple[LinearOperator, ...]:
-        if self is SymmetryFamily.CYCLIC:
-            return (PRINCIPAL_GENERATOR,)
-        return (PRINCIPAL_GENERATOR, INVOLUTION)
+        admitted = frozenset({1}) if self is SymmetryFamily.CYCLIC else frozenset({1, -1})
+        return solve_operators(admitted)
 
     def expected_order(self, cardinality: int) -> int:
         return cardinality if self is SymmetryFamily.CYCLIC else 2 * cardinality
@@ -3900,6 +3929,158 @@ class ServiceContainer:
 # ======================================================================
 
 
+class RewriteError(GlyphPlatformError):
+    """A term did not reach a normal form."""
+
+
+REWRITE_LIMIT: Final[int] = 512
+
+ORIENTATION_ATOMS: Final[Mapping[str, Orientation]] = {
+    "r": Orientation.ROW,
+    "c": Orientation.COLUMN,
+    "d": Orientation.DIAGONAL,
+    "a": Orientation.ANTIDIAGONAL,
+}
+
+DUAL_ATOMS: Final[Mapping[str, str]] = {"c": "r", "r": "c", "d": "a", "a": "d"}
+
+
+def applied(*symbols: Any) -> Any:
+    """Left-associated application, which is the only way a term is built."""
+    head, *rest = symbols
+    for symbol in rest:
+        head = (head, symbol)
+    return head
+
+
+def _spine(term: Any) -> tuple[Any, list[Any]]:
+    """Unwinds an application into what is being applied and to what."""
+    arguments: list[Any] = []
+    while isinstance(term, tuple):
+        term, argument = term
+        arguments.append(argument)
+    arguments.reverse()
+    return term, arguments
+
+
+def _pair(term: Any) -> tuple[int, int]:
+    head, arguments = _spine(term)
+    if head != "P" or len(arguments) != 2:
+        raise RewriteError(f"expected a pair, found {term!r}")
+    return typing.cast(tuple[int, int], tuple(arguments))
+
+
+def _entry(term: Any) -> list[Any]:
+    head, arguments = _spine(term)
+    if head != "R" or len(arguments) != 4:
+        raise RewriteError(f"expected an entry, found {term!r}")
+    return arguments
+
+
+def _dual(atom: Any) -> str:
+    try:
+        return DUAL_ATOMS[atom]
+    except (KeyError, TypeError) as exc:
+        raise RewriteError(f"{atom!r} has no dual") from exc
+
+
+def _successor(term: Any) -> Any:
+    scale, offset = _pair(term)
+    return applied("P", scale + 1, offset)
+
+
+def _increment(term: Any) -> Any:
+    scale, offset = _pair(term)
+    return applied("P", scale, offset + 1)
+
+
+def _advance(term: Any) -> Any:
+    orientation, index, lower, upper = _entry(term)
+    return applied("R", _dual(orientation), lower, _increment(index), upper)
+
+
+def _widen(term: Any) -> Any:
+    orientation, index, lower, upper = _entry(term)
+    return applied("R", orientation, _increment(index), lower, upper)
+
+
+REWRITE_RULES: Final[Mapping[str, tuple[int, Callable[..., Any]]]] = {
+    "I": (1, lambda x: x),
+    "K": (2, lambda x, y: x),
+    "S": (3, lambda x, y, z: applied(x, z, (y, z))),
+    "B": (3, lambda x, y, z: applied(x, (y, z))),
+    "C": (3, lambda x, y, z: applied(x, z, y)),
+    "W": (2, lambda x, y: applied(x, y, y)),
+    "O": (0, lambda: applied("P", 0, 0)),
+    "N": (1, _successor),
+    "U": (1, _increment),
+    "A": (1, _advance),
+    "H": (1, _widen),
+}
+
+# The rules that read their argument rather than merely moving it, and so
+# cannot fire until it has stopped changing.
+STRICT_RULES: Final[FrozenSet[str]] = frozenset({"N", "U", "A", "H"})
+
+
+def _rebuild(head: Any, arguments: Sequence[Any]) -> Any:
+    for argument in arguments:
+        head = (head, argument)
+    return head
+
+
+def _rewrite_once(term: Any) -> Any | None:
+    """One step, leftmost and outermost, or ``None`` at a normal form."""
+    head, arguments = _spine(term)
+    rule = REWRITE_RULES.get(head) if isinstance(head, str) else None
+    if rule is not None:
+        arity, contract = rule
+        if len(arguments) >= arity:
+            if head in STRICT_RULES:
+                for position in range(arity):
+                    reduced = _rewrite_once(arguments[position])
+                    if reduced is not None:
+                        arguments[position] = reduced
+                        return _rebuild(head, arguments)
+            return _rebuild(contract(*arguments[:arity]), arguments[arity:])
+    for position, argument in enumerate(arguments):
+        reduced = _rewrite_once(argument)
+        if reduced is not None:
+            arguments[position] = reduced
+            return _rebuild(head, arguments)
+    return None
+
+
+def normal_form(term: Any, limit: int = REWRITE_LIMIT) -> Any:
+    """Rewrites until the term stops changing, and answers what it settled on."""
+    for _ in range(limit):
+        reduced = _rewrite_once(term)
+        if reduced is None:
+            return term
+        term = reduced
+    raise RewriteError(f"no normal form within {limit} rewrites")
+
+
+@functools.lru_cache(maxsize=None)
+def seed_of(term: Any) -> tuple["SeedRun", ...]:
+    """The entries a term settles on, read off its normal form."""
+    entries: list[SeedRun] = []
+    cursor = normal_form(term)
+    while True:
+        head, arguments = _spine(cursor)
+        if head == "E":
+            return tuple(entries)
+        if head != "L" or len(arguments) != 2:
+            raise RewriteError(f"expected a list, found {cursor!r}")
+        orientation, index, lower, upper = _entry(arguments[0])
+        try:
+            oriented = ORIENTATION_ATOMS[orientation]
+        except (KeyError, TypeError) as exc:
+            raise RewriteError(f"{orientation!r} names no orientation") from exc
+        entries.append(SeedRun(oriented, _pair(index), _pair(lower), _pair(upper)))
+        cursor = arguments[1]
+
+
 @dataclass(frozen=True, slots=True)
 class SeedRun:
     """One entry of a seed: an oriented run, sited relative to the centre.
@@ -3942,8 +4123,12 @@ class Motif(abc.ABC, metaclass=PluginRegistryMeta):
     description: ClassVar[str] = ""
     family: ClassVar[SymmetryFamily] = SymmetryFamily.CYCLIC
     cardinality: ClassVar[int] = 4
-    seed: ClassVar[tuple[SeedRun, ...]] = ()
+    term: ClassVar[Any] = "E"
     declared: ClassVar[bool] = False
+
+    @property
+    def seed(self) -> tuple[SeedRun, ...]:
+        return seed_of(self.term)
 
     def source(self, order: int) -> str:
         lines = [
@@ -3973,43 +4158,49 @@ class Motif(abc.ABC, metaclass=PluginRegistryMeta):
         return "\n".join(lines) + "\n"
 
 
+ROOT: Final[Any] = applied(
+    "R", "c", applied("N", "O"), "O", applied("N", applied("N", "O"))
+)
+
+# The tail of a list, from whatever the head settles on.
+TAIL: Final[Any] = applied("B", applied("C", "L", "E"), "A")
+LONGER: Final[Any] = applied(
+    "S", applied("B", "L", "A"), applied("B", applied("C", "L", "E"), applied("B", "H", "A"))
+)
+
+
 class PrimaryMotif(Motif):
-    """Two entries under a group of order four."""
+    """The root and what follows from it, under a group of order four."""
 
     __registry_key__ = "primary"
-    description = "two entries, closed under a group of order four"
-    seed = (
-        SeedRun(Orientation.COLUMN, (1, 0), (0, 0), (2, 0)),
-        SeedRun(Orientation.ROW, (0, 0), (1, 1), (2, 0)),
-    )
+    description = "the root and what follows from it, under a group of order four"
+    term = applied("S", "L", TAIL, ROOT)
 
 
 class DoubledMotif(Motif):
-    """The primary seed with its second entry repeated one step over."""
+    """The same, carried one step further."""
 
     __registry_key__ = "doubled"
-    description = "the primary seed, its second entry doubled"
-    seed = PrimaryMotif.seed + (
-        SeedRun(Orientation.ROW, (0, 1), (1, 1), (2, 0)),
-    )
+    description = "the same, carried one step further"
+    term = applied("S", "L", LONGER, ROOT)
 
 
 class MinimalMotif(Motif):
-    """The primary seed's first entry, and nothing else."""
+    """The root alone."""
 
     __registry_key__ = "minimal"
-    description = "the primary seed's first entry alone"
+    description = "the root alone"
     declared = True
-    seed = PrimaryMotif.seed[:1]
+    term = applied("C", "L", "E", ROOT)
 
 
 class FoldedMotif(Motif):
-    """The primary seed under a group of twice the cardinality."""
+    """The primary term under a group of twice the cardinality."""
 
     __registry_key__ = "folded"
-    description = "the primary seed, closed under a group of order eight"
+    description = "the primary term, closed under a group of order eight"
     family = SymmetryFamily.DIHEDRAL
-    seed = PrimaryMotif.seed
+    term = PrimaryMotif.term
 
 
 class PipelineStage(enum.Enum):
