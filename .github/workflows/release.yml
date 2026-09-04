@@ -69,12 +69,19 @@ jobs:
           mkdir -p dist
           cp ouroboros.py dist/
           python ouroboros.py --emit-elf "dist/glyph-$safe-linux-x86_64" > /dev/null
+          python ouroboros.py --emit-wasm "dist/glyph-$safe.wasm" > /dev/null
           python ouroboros.py --emit-llvm > "dist/glyph-$safe.ll"
           python ouroboros.py --emit-gsl2 glyphc > "dist/glyphc-$safe.gsl2"
 
           # The asset itself, not a sibling build, is what gets checked.
           diff <("./dist/glyph-$safe-linux-x86_64") <(python ouroboros.py)
           file "dist/glyph-$safe-linux-x86_64"
+
+          # The same again for the one that asks for no Linux, through the
+          # five lines of host the file carries.
+          python -c "import ouroboros, pathlib; pathlib.Path('run.js').write_text(ouroboros.WASM_HOST_SCRIPT)"
+          diff <(node run.js "dist/glyph-$safe.wasm") <(python ouroboros.py)
+          file "dist/glyph-$safe.wasm"
           ls -l dist
 
       - name: Release notes from the tag itself

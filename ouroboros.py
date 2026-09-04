@@ -59,6 +59,15 @@
           A little over a kilobyte, and all it asks of the world is write(2)
           and exit_group(2).
 
+  tier 6  WebAssembly           layer 19 encodes the same object module as a
+          wasm reactor, by hand and with nothing installed.  It imports
+          nothing at all: the module exports its memory, the offset of its
+          text and a render that answers a length, so the host is five lines
+          and any engine will do.  Inside a basic block the lowering is one
+          instruction to one, since both machines are stack machines; the
+          branches are where they differ, and the instruction stream becomes
+          a table over a program counter.
+
     python3 ouroboros.py                 render via the virtual machine
     python3 ouroboros.py --emit-llvm     lower the program to LLVM IR
     python3 ouroboros.py --jit           JIT-execute that IR
@@ -66,6 +75,7 @@
     python3 ouroboros.py --close-the-loop    compile the glyph with the
                                              front end written in GSL-2
     python3 ouroboros.py --emit-elf PATH  write a static executable, no toolchain
+    python3 ouroboros.py --emit-wasm PATH write a wasm reactor, no toolchain
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -5285,6 +5295,17 @@ class DifferentialFuzzer:
         else:
             skipped.append("elf tier (this host cannot run x86-64 Linux binaries)")
 
+        wasm = False
+        if wasm_host() is not None:
+            try:
+                self._through_wasm(synthesize(3).unwrap_or_raise().module, scratch)
+                tiers.append("wasm")
+                wasm = True
+            except (GlyphPlatformError, OSError, subprocess.CalledProcessError) as exc:
+                skipped.append(f"wasm tier ({exc})")
+        else:
+            skipped.append("wasm tier (no WebAssembly host is installed)")
+
         front_end: Path | None = None
         if self._front_end and toolchain is not None:
             try:
@@ -5316,6 +5337,11 @@ class DifferentialFuzzer:
             if machine:
                 variants.append(
                     ("elf", lambda: self._through_machine(
+                        self._object_for(source, order), scratch))
+                )
+            if wasm:
+                variants.append(
+                    ("wasm", lambda: self._through_wasm(
                         self._object_for(source, order), scratch))
                 )
             if front_end is not None:
@@ -5352,6 +5378,9 @@ class DifferentialFuzzer:
 
     def _through_machine(self, module: ObjectModule, scratch: Path) -> str:
         return _run(write_executable(module, scratch / "machine"), "").removesuffix("\n")
+
+    def _through_wasm(self, module: ObjectModule, scratch: Path) -> str:
+        return run_wasm(write_wasm(module, scratch / "case.wasm")).removesuffix("\n")
 
     def _through_llvm(
         self, source: str, order: int, toolchain: LlvmToolchainService
@@ -11179,6 +11208,623 @@ def machine_code_runnable() -> bool:
 
 
 # ======================================================================
+# Tier 6: WebAssembly
+# ======================================================================
+#
+# Layer 19 encodes the same object module as a wasm reactor: a module that
+# imports nothing, exports its memory, the offset of its text and a ``render``
+# that returns a length, and so needs no host beyond an engine.  Layer 7's
+# machine is a stack machine and so is wasm, which is most of the reason this
+# is shorter than layer 16: inside a basic block the lowering is one
+# instruction to one, the operand stack never becomes memory, and the frame is
+# locals rather than an address.
+#
+# Control flow is where that stops.  Wasm cannot branch to an arbitrary point,
+# so the instruction stream becomes a br_table over a program counter, one
+# block per branch target, with fallthrough between them costing nothing.
+
+
+class WasmCodeError(GlyphPlatformError):
+    """The object module could not be encoded as WebAssembly."""
+
+
+I32: Final[int] = 0x7F
+I64: Final[int] = 0x7E
+VOID: Final[int] = 0x40
+WASM_PAGE: Final[int] = 65536
+
+WASM_OPCODES: Final[Mapping[str, int]] = {
+    "i32.eqz": 0x45, "i32.lt_s": 0x48, "i32.gt_s": 0x4A, "i32.ge_s": 0x4E,
+    "i32.add": 0x6A, "i32.sub": 0x6B, "i32.mul": 0x6C,
+    "i64.eqz": 0x50, "i64.lt_s": 0x53, "i64.gt_s": 0x55, "i64.le_s": 0x57,
+    "i64.ge_s": 0x59,
+    "i64.add": 0x7C, "i64.sub": 0x7D, "i64.mul": 0x7E, "i64.div_s": 0x7F,
+    "i64.rem_s": 0x81, "i64.xor": 0x85,
+    "i32.wrap_i64": 0xA7, "i64.extend_i32_s": 0xAC,
+}
+
+
+def _uleb(value: int) -> bytes:
+    if value < 0:
+        raise WasmCodeError(f"unsigned LEB128 cannot hold {value}")
+    out = bytearray()
+    while True:
+        octet, value = value & 0x7F, value >> 7
+        if not value:
+            out.append(octet)
+            return bytes(out)
+        out.append(octet | 0x80)
+
+
+def _sleb(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        octet, value = value & 0x7F, value >> 7
+        if (value == 0 and not octet & 0x40) or (value == -1 and octet & 0x40):
+            out.append(octet)
+            return bytes(out)
+        out.append(octet | 0x80)
+
+
+def _wasm_vector(items: Sequence[bytes]) -> bytes:
+    return _uleb(len(items)) + b"".join(items)
+
+
+def _wasm_section(identifier: int, payload: bytes) -> bytes:
+    return bytes([identifier]) + _uleb(len(payload)) + payload
+
+
+def _wasm_name(text: str) -> bytes:
+    encoded = text.encode()
+    return _uleb(len(encoded)) + encoded
+
+
+def _functype(params: Sequence[int], results: Sequence[int]) -> bytes:
+    return (
+        b"\x60"
+        + _wasm_vector([bytes([kind]) for kind in params])
+        + _wasm_vector([bytes([kind]) for kind in results])
+    )
+
+
+class WasmAssembler:
+    """One function body, with branch depths resolved from label names.
+
+    Not to be confused with layer 9's :class:`Assembler`, which resolves the
+    virtual machine's labels, nor with layer 18's :class:`X86Assembler`, which
+    resolves branch displacements.  Wasm names a branch target by how many
+    enclosing structures to leave, so this one keeps the stack of what is open
+    and counts.  There is no fixup pass and there cannot be one: a label is
+    always already open by the time anything branches to it.
+    """
+
+    def __init__(self) -> None:
+        self._code = bytearray()
+        self._open: list[str] = []
+
+    def __len__(self) -> int:
+        return len(self._code)
+
+    # -- structure --------------------------------------------------------
+
+    def block(self, name: str, result: int = VOID) -> "WasmAssembler":
+        self._code.extend((0x02, result))
+        self._open.append(name)
+        return self
+
+    def loop(self, name: str, result: int = VOID) -> "WasmAssembler":
+        self._code.extend((0x03, result))
+        self._open.append(name)
+        return self
+
+    def if_(self, result: int = VOID) -> "WasmAssembler":
+        self._code.extend((0x04, result))
+        self._open.append("if")
+        return self
+
+    def else_(self) -> "WasmAssembler":
+        self._code.append(0x05)
+        return self
+
+    def end(self) -> "WasmAssembler":
+        if not self._open:
+            raise WasmCodeError("end with no open structure")
+        self._open.pop()
+        self._code.append(0x0B)
+        return self
+
+    def depth(self, name: str) -> int:
+        for position in range(len(self._open) - 1, -1, -1):
+            if self._open[position] == name:
+                return len(self._open) - 1 - position
+        raise WasmCodeError(f"no enclosing structure named {name!r}")
+
+    def br(self, name: str) -> "WasmAssembler":
+        self._code.append(0x0C)
+        self._code.extend(_uleb(self.depth(name)))
+        return self
+
+    def br_if(self, name: str) -> "WasmAssembler":
+        self._code.append(0x0D)
+        self._code.extend(_uleb(self.depth(name)))
+        return self
+
+    def br_table(self, names: Sequence[str], default: str) -> "WasmAssembler":
+        self._code.append(0x0E)
+        self._code.extend(_wasm_vector([_uleb(self.depth(name)) for name in names]))
+        self._code.extend(_uleb(self.depth(default)))
+        return self
+
+    def unreachable(self) -> "WasmAssembler":
+        self._code.append(0x00)
+        return self
+
+    def call(self, index: int) -> "WasmAssembler":
+        self._code.append(0x10)
+        self._code.extend(_uleb(index))
+        return self
+
+    # -- values -----------------------------------------------------------
+
+    def i32(self, value: int) -> "WasmAssembler":
+        self._code.append(0x41)
+        self._code.extend(_sleb(value))
+        return self
+
+    def i64(self, value: int) -> "WasmAssembler":
+        self._code.append(0x42)
+        self._code.extend(_sleb(value))
+        return self
+
+    def get(self, local: int) -> "WasmAssembler":
+        self._code.append(0x20)
+        self._code.extend(_uleb(local))
+        return self
+
+    def set(self, local: int) -> "WasmAssembler":
+        self._code.append(0x21)
+        self._code.extend(_uleb(local))
+        return self
+
+    def load8(self, offset: int) -> "WasmAssembler":
+        self._code.extend((0x2D, 0x00))
+        self._code.extend(_uleb(offset))
+        return self
+
+    def store8(self, offset: int) -> "WasmAssembler":
+        self._code.extend((0x3A, 0x00))
+        self._code.extend(_uleb(offset))
+        return self
+
+    def op(self, *names: str) -> "WasmAssembler":
+        for name in names:
+            try:
+                self._code.append(WASM_OPCODES[name])
+            except KeyError as exc:
+                raise WasmCodeError(f"no opcode named {name!r}") from exc
+        return self
+
+    # -- completion -------------------------------------------------------
+
+    def body(self, locals_: Sequence[tuple[int, int]] = ()) -> bytes:
+        if self._open:
+            raise WasmCodeError(f"unclosed structure {self._open[-1]!r}")
+        code = (
+            _wasm_vector([_uleb(count) + bytes([kind]) for count, kind in locals_ if count])
+            + bytes(self._code)
+            + b"\x0b"
+        )
+        return _uleb(len(code)) + code
+
+
+@dataclass(frozen=True, slots=True)
+class WasmLayout:
+    """Where the canvas, the snapshot and the output buffer sit in memory.
+
+    Deliberately not layer 18's :class:`DataLayout`: that one reserves a frame
+    region because the machine has nowhere else to keep the locals, and here
+    they are wasm locals, so the region would only ever be padding.
+    """
+
+    canvas: int
+    snapshot: int
+    output: int
+    size: int
+
+    @classmethod
+    def of(cls, order: int) -> "WasmLayout":
+        cells = order * order
+        return cls(0, cells, 2 * cells, 4 * cells + order + 16)
+
+    @property
+    def pages(self) -> int:
+        return max(1, -(-self.size // WASM_PAGE))
+
+
+class WasmCodeBackend:
+    """Encodes a linked object module as a WebAssembly reactor module.
+
+    The module imports nothing, so the whole host it asks for is an engine.
+    It exports its memory, the offset of the text as a global, and a
+    ``render`` that runs the program and answers how many octets it wrote.
+
+    A branch truncates the value stack to the height of the structure it lands
+    in, so keeping the operand stack on the value stack is only sound while
+    that stack is empty wherever the module branches.  It is, for everything
+    layer 7 emits: statements lower to stack-neutral runs and an iteration
+    pops its condition before it jumps.  That is a property of the emitter and
+    not of the instruction set, so :meth:`_audit` derives it from the
+    instructions' own stack deltas rather than trusting it.
+    """
+
+    ORIENTATION_ENCODING: ClassVar[Mapping[Orientation, int]] = {
+        Orientation.ROW: 0,
+        Orientation.COLUMN: 1,
+        Orientation.DIAGONAL: 2,
+        Orientation.ANTIDIAGONAL: 3,
+    }
+
+    # What each instruction does to the operand stack once an interval is two
+    # words rather than one, which is not what ``Instruction.stack_delta`` says.
+    PHYSICAL_DELTA: ClassVar[Mapping[type, int]] = {
+        PushConstant: +1, LoadIntrinsic: +1, LoadLocal: +1, StoreLocal: -1,
+        BinaryAdd: -1, BinarySubtract: -1, BinaryMultiply: -1, BinaryDivide: -1,
+        Negate: 0, CompareLessEqual: -1, MakeInterval: 0, EmitOrientedRun: -3,
+        Jump: 0, JumpIfFalse: -1, CloseUnderGroup: 0, Halt: 0,
+    }
+
+    # The i64 locals the instruction stream borrows when it has to hold an
+    # operand somewhere other than the top of the stack.
+    SCRATCH: ClassVar[Mapping[str, int]] = {
+        "dividend": 0, "divisor": 1, "quotient": 2, "remainder": 3,
+        "index": 4, "lower": 5, "upper": 6,
+    }
+
+    PAINT, EMIT_RUN, SNAPSHOT, APPLY, DRAW, RENDER = range(6)
+
+    def __init__(self, module: ObjectModule) -> None:
+        self._module = module
+        self._order = module.order
+        self._cells = module.order * module.order
+        self._apothem = module.order // 2
+        self._frame = max(module.frame_size, 1)
+        self._layout = WasmLayout.of(module.order)
+        self._group = SymmetryGroup.generated_by(
+            module.family.generators,
+            Coordinate(self._apothem, self._apothem),
+            module.symmetry_order,
+            presentation=f"{module.family.value}-{module.cardinality} about centroid",
+        )
+        targets = {0}
+        for instruction in module.instructions:
+            if isinstance(instruction, (Jump, JumpIfFalse)):
+                targets.add(int(instruction.target))
+        self._targets = tuple(sorted(targets))
+        self._ordinal = {address: index for index, address in enumerate(self._targets)}
+
+    @property
+    def layout(self) -> WasmLayout:
+        return self._layout
+
+    def _audit(self) -> None:
+        """Rejects a module whose operand stack is not empty where it branches."""
+        depth = 0
+        for address, instruction in enumerate(self._module.instructions):
+            if address in self._ordinal and depth:
+                raise WasmCodeError(
+                    f"branch target {address} is reached with {depth} operand(s) live"
+                )
+            try:
+                depth += self.PHYSICAL_DELTA[type(instruction)]
+            except KeyError as exc:
+                raise WasmCodeError(f"unencodable instruction {instruction!r}") from exc
+            if isinstance(instruction, (Jump, JumpIfFalse, Halt)) and depth:
+                raise WasmCodeError(
+                    f"branch at {address} leaves {depth} operand(s) on the stack"
+                )
+
+    def _intrinsic(self, name: str) -> int:
+        try:
+            return {
+                "zero": 0,
+                "apothem": self._apothem,
+                "extremum": self._order - 1,
+                "magnitude": self._order,
+            }[name]
+        except KeyError as exc:
+            raise WasmCodeError(f"unbound intrinsic {name!r}") from exc
+
+    # -- the module -------------------------------------------------------
+
+    @woven
+    def encode(self) -> bytes:
+        """The whole module: six functions, one memory, three exports."""
+        with TRACER.span("wasm-encode", order=self._order):
+            self._audit()
+            types = [
+                _functype((I64, I64), ()),
+                _functype((I32, I64, I64, I64), ()),
+                _functype((), ()),
+                _functype((I64, I64, I64, I64), ()),
+                _functype((), (I32,)),
+            ]
+            METRICS.increment("wasm.instructions", len(self._module.instructions))
+            return (
+                b"\0asm"
+                + struct.pack("<I", 1)
+                + _wasm_section(1, _wasm_vector(types))
+                + _wasm_section(3, _wasm_vector([_uleb(n) for n in (0, 1, 2, 3, 4, 4)]))
+                + _wasm_section(5, _wasm_vector([b"\x00" + _uleb(self._layout.pages)]))
+                + _wasm_section(6, _wasm_vector(
+                    [bytes([I32, 0x00]) + b"\x41" + _sleb(self._layout.output) + b"\x0b"]
+                ))
+                + _wasm_section(7, _wasm_vector([
+                    _wasm_name("memory") + b"\x02\x00",
+                    _wasm_name("render") + b"\x00" + _uleb(self.RENDER),
+                    _wasm_name("output") + b"\x03\x00",
+                ]))
+                + _wasm_section(10, _wasm_vector([
+                    self._paint(), self._emit_run(), self._snapshot(),
+                    self._apply(), self._draw(), self._render(),
+                ]))
+            )
+
+    # -- the runtime the instruction stream calls into ---------------------
+
+    def _paint(self) -> bytes:
+        """paint(row, column), out of bounds silently ignored.
+
+        The bounds are compared in i64 before the address is narrowed, so a
+        coordinate far outside the lattice cannot wrap back into it.
+        """
+        row, column = 0, 1
+        text = WasmAssembler().block("done")
+        for local in (row, column):
+            text.get(local).i64(0).op("i64.lt_s").br_if("done")
+            text.get(local).i64(self._order).op("i64.ge_s").br_if("done")
+        text.get(row).op("i32.wrap_i64").i32(self._order).op("i32.mul")
+        text.get(column).op("i32.wrap_i64").op("i32.add")
+        text.i32(1).store8(self._layout.canvas)
+        return text.end().body()
+
+    def _emit_run(self) -> bytes:
+        """emit_run(orientation, index, lower, upper): one run of cells."""
+        orientation, index, lower, upper, row, column = range(6)
+        text = WasmAssembler().block("done").loop("next")
+        text.get(lower).get(upper).op("i64.gt_s").br_if("done")
+        text.get(index).set(row)
+        text.get(lower).set(column)
+        text.block("chosen").block("anti").block("diag").block("col")
+        text.get(orientation).br_table(("chosen", "col", "diag", "anti"), "chosen")
+        text.end()
+        text.get(lower).set(row).get(index).set(column).br("chosen")
+        text.end()
+        text.get(lower).set(row)
+        text.get(lower).get(index).op("i64.add").set(column).br("chosen")
+        text.end()
+        text.get(lower).set(row)
+        text.get(index).get(lower).op("i64.sub").set(column)
+        text.end()
+        text.get(row).get(column).call(self.PAINT)
+        text.get(lower).i64(1).op("i64.add").set(lower).br("next")
+        return text.end().end().body(((2, I64),))
+
+    def _snapshot(self) -> bytes:
+        """The canvas as it stood before the closure began."""
+        cursor = 0
+        text = WasmAssembler().block("done").loop("next")
+        text.get(cursor).i32(self._cells).op("i32.ge_s").br_if("done")
+        text.get(cursor).get(cursor).load8(self._layout.canvas)
+        text.store8(self._layout.snapshot)
+        text.get(cursor).i32(1).op("i32.add").set(cursor).br("next")
+        return text.end().end().body(((1, I32),))
+
+    def _apply(self) -> bytes:
+        """apply(a, b, c, d): one group element, read off the snapshot."""
+        a, b, c, d, row, column, dr, dc = range(8)
+        text = WasmAssembler().block("done").loop("rows")
+        text.get(row).i32(self._order).op("i32.ge_s").br_if("done")
+        text.i32(0).set(column)
+        text.block("row.done").loop("columns")
+        text.get(column).i32(self._order).op("i32.ge_s").br_if("row.done")
+        text.get(row).i32(self._order).op("i32.mul").get(column).op("i32.add")
+        text.load8(self._layout.snapshot)
+        text.if_()
+        text.get(row).op("i64.extend_i32_s").i64(self._apothem).op("i64.sub").set(dr)
+        text.get(column).op("i64.extend_i32_s").i64(self._apothem).op("i64.sub").set(dc)
+        text.get(a).get(dr).op("i64.mul").get(b).get(dc).op("i64.mul").op("i64.add")
+        text.i64(self._apothem).op("i64.add")
+        text.get(c).get(dr).op("i64.mul").get(d).get(dc).op("i64.mul").op("i64.add")
+        text.i64(self._apothem).op("i64.add")
+        text.call(self.PAINT)
+        text.end()
+        text.get(column).i32(1).op("i32.add").set(column).br("columns")
+        text.end().end()
+        text.get(row).i32(1).op("i32.add").set(row).br("rows")
+        return text.end().end().body(((2, I32), (2, I64)))
+
+    def _draw(self) -> bytes:
+        """The canvas as text, trailing blanks trimmed; answers the length."""
+        row, column, last, cursor = range(4)
+        canvas, output = self._layout.canvas, self._layout.output
+        text = WasmAssembler().block("flush").loop("rows")
+        text.get(row).i32(self._order).op("i32.ge_s").br_if("flush")
+
+        text.i32(-1).set(last).i32(0).set(column)
+        text.block("scan.done").loop("scan")
+        text.get(column).i32(self._order).op("i32.ge_s").br_if("scan.done")
+        text.get(row).i32(self._order).op("i32.mul").get(column).op("i32.add")
+        text.load8(canvas)
+        text.if_().get(column).set(last).end()
+        text.get(column).i32(1).op("i32.add").set(column).br("scan")
+        text.end().end()
+
+        text.i32(0).set(column)
+        text.block("row.done").loop("cells")
+        text.get(column).get(last).op("i32.gt_s").br_if("row.done")
+        text.get(column).i32(0).op("i32.gt_s")
+        text.if_()
+        text.get(cursor).i32(ord(" ")).store8(output)
+        text.get(cursor).i32(1).op("i32.add").set(cursor)
+        text.end()
+        text.get(cursor)
+        text.get(row).i32(self._order).op("i32.mul").get(column).op("i32.add")
+        text.load8(canvas)
+        text.if_(I32).i32(ord("*")).else_().i32(ord(" ")).end()
+        text.store8(output)
+        text.get(cursor).i32(1).op("i32.add").set(cursor)
+        text.get(column).i32(1).op("i32.add").set(column).br("cells")
+        text.end().end()
+
+        text.get(cursor).i32(ord("\n")).store8(output)
+        text.get(cursor).i32(1).op("i32.add").set(cursor)
+        text.get(row).i32(1).op("i32.add").set(row).br("rows")
+        text.end().end()
+        return text.get(cursor).body(((4, I32),))
+
+    # -- the instruction stream --------------------------------------------
+    #
+    # One block per branch target, opened outermost-last, so that leaving
+    # block A lands on A's code and running off the end of it falls into the
+    # next target's code with no branch at all.
+
+    def _render(self) -> bytes:
+        """The program itself, and then the canvas as text."""
+        frame, scratch = 1, 1 + self._frame
+        text = WasmAssembler().block("exit").loop("top")
+        for address in reversed(self._targets):
+            text.block(f"A{address}")
+        text.block("bad")
+        text.get(0).br_table(tuple(f"A{a}" for a in self._targets), "bad")
+        text.end().unreachable()
+
+        boundaries = (*self._targets, len(self._module.instructions))
+        for index, start in enumerate(self._targets):
+            text.end()
+            for address in range(start, boundaries[index + 1]):
+                self._instruction(
+                    text, self._module.instructions[address], frame, scratch
+                )
+        text.end().end().call(self.DRAW)
+        return text.body(((1, I32), (self._frame + len(self.SCRATCH), I64)))
+
+    def _instruction(
+        self, text: WasmAssembler, instruction: Instruction, frame: int, scratch: int
+    ) -> None:
+        match instruction:
+            case Halt():
+                text.br("exit")
+            case Jump(target=target):
+                text.i32(self._ordinal[int(target)]).set(0).br("top")
+            case JumpIfFalse(target=target):
+                text.op("i64.eqz").if_()
+                text.i32(self._ordinal[int(target)]).set(0).br("top")
+                text.end()
+            case PushConstant(value=value):
+                text.i64(value)
+            case LoadIntrinsic(name=name):
+                text.i64(self._intrinsic(name))
+            case LoadLocal(slot=slot):
+                text.get(frame + slot)
+            case StoreLocal(slot=slot):
+                text.set(frame + slot)
+            case BinaryAdd():
+                text.op("i64.add")
+            case BinarySubtract():
+                text.op("i64.sub")
+            case BinaryMultiply():
+                text.op("i64.mul")
+            case BinaryDivide():
+                self._floor_divide(text, scratch)
+            case Negate():
+                text.i64(-1).op("i64.mul")
+            case CompareLessEqual():
+                text.op("i64.le_s", "i64.extend_i32_s")
+            case MakeInterval():
+                pass
+            case EmitOrientedRun(orientation=orientation):
+                for name in ("upper", "lower", "index"):
+                    text.set(scratch + self.SCRATCH[name])
+                text.i32(self.ORIENTATION_ENCODING[orientation])
+                for name in ("index", "lower", "upper"):
+                    text.get(scratch + self.SCRATCH[name])
+                text.call(self.EMIT_RUN)
+            case CloseUnderGroup():
+                text.call(self.SNAPSHOT)
+                for element in self._group.elements:
+                    linear = element.linear
+                    text.i64(linear.a).i64(linear.b).i64(linear.c).i64(linear.d)
+                    text.call(self.APPLY)
+            case _:
+                raise WasmCodeError(f"unencodable instruction {instruction!r}")
+
+    def _floor_divide(self, text: WasmAssembler, scratch: int) -> None:
+        """i64.div_s truncates towards zero where the interpreter floors.
+
+        The quotient is decremented whenever the division was inexact and the
+        remainder and the divisor disagree about sign, which xor detects in
+        the sign bit.
+        """
+        dividend = scratch + self.SCRATCH["dividend"]
+        divisor = scratch + self.SCRATCH["divisor"]
+        quotient = scratch + self.SCRATCH["quotient"]
+        remainder = scratch + self.SCRATCH["remainder"]
+        text.set(divisor).set(dividend)
+        text.get(dividend).get(divisor).op("i64.div_s").set(quotient)
+        text.get(dividend).get(divisor).op("i64.rem_s").set(remainder)
+        text.get(remainder).op("i64.eqz", "i32.eqz").if_()
+        text.get(remainder).get(divisor).op("i64.xor").i64(0).op("i64.lt_s").if_()
+        text.get(quotient).i64(1).op("i64.sub").set(quotient)
+        text.end().end()
+        text.get(quotient)
+
+
+WASM_HOST_SCRIPT: Final[str] = """
+const fs = require('fs');
+const module_ = process.argv[process.argv.length - 1];
+WebAssembly.instantiate(fs.readFileSync(module_)).then(({instance}) => {
+  const length = instance.exports.render();
+  const offset = instance.exports.output.value;
+  process.stdout.write(
+    Buffer.from(instance.exports.memory.buffer, offset, length)
+  );
+});
+"""
+
+
+def wasm_module(module: ObjectModule) -> bytes:
+    """The object module as a self-contained WebAssembly reactor."""
+    return WasmCodeBackend(module).encode()
+
+
+def write_wasm(module: ObjectModule, path: Path) -> Path:
+    """Writes that module to ``path``."""
+    path.write_bytes(wasm_module(module))
+    return path
+
+
+def wasm_host() -> str | None:
+    """A command that can instantiate what layer 19 emits, if one is installed.
+
+    Only the plain ``WebAssembly`` object is used, which every release of node
+    since v8 has had without a flag, because the module imports nothing: a
+    WASI runtime would be a heavier dependency for no more capability.
+    """
+    return shutil.which("node")
+
+
+def run_wasm(path: Path) -> str:
+    """Instantiates the module and returns the text it wrote."""
+    host = wasm_host()
+    if host is None:
+        raise WasmCodeError("no WebAssembly host is installed")
+    completed = subprocess.run(
+        [host, "-e", WASM_HOST_SCRIPT, str(path)], stdout=subprocess.PIPE, check=True
+    )
+    return completed.stdout.decode()
+
+
+# ======================================================================
 # driver
 # ======================================================================
 
@@ -11217,6 +11863,14 @@ def _selftest(orders: Sequence[int]) -> int:
                 tiers.append(("elf", _run(binary, "").removesuffix("\n")))
         except (GlyphPlatformError, OSError) as exc:
             print(f"  n={order:<3} elf tier skipped: {exc}", file=sys.stderr)
+        try:
+            if wasm_host() is None:
+                raise OSError("no WebAssembly host is installed")
+            with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
+                blob = write_wasm(artifacts.module, Path(scratch) / "glyph.wasm")
+                tiers.append(("wasm", run_wasm(blob).removesuffix("\n")))
+        except (GlyphPlatformError, OSError, subprocess.CalledProcessError) as exc:
+            print(f"  n={order:<3} wasm tier skipped: {exc}", file=sys.stderr)
         verdict = "ok"
         for label, produced in tiers:
             if produced != expected:
@@ -11316,6 +11970,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     machine = parser.add_argument_group("tier 5: machine code, no toolchain")
     machine.add_argument("--emit-elf", metavar="PATH", help="write a static ELF64 executable")
     machine.add_argument("--emit-machine-code", action="store_true")
+
+    wasm = parser.add_argument_group("tier 6: WebAssembly, no host but an engine")
+    wasm.add_argument("--emit-wasm", metavar="PATH", help="write a reactor module")
 
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
@@ -11501,6 +12158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if namespace.emit_elf:
         written = write_executable(artifacts.module, Path(namespace.emit_elf))
+        print(f"wrote {written} ({written.stat().st_size} bytes)", file=sys.stderr)
+
+    if namespace.emit_wasm:
+        written = write_wasm(artifacts.module, Path(namespace.emit_wasm))
         print(f"wrote {written} ({written.stat().st_size} bytes)", file=sys.stderr)
 
     backend_requested = any(
