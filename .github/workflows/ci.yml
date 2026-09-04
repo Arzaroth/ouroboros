@@ -49,6 +49,11 @@ jobs:
           file glyph
           diff <(./glyph) <(python ouroboros.py)
 
+      - name: and the machine this is not, which the arm job runs for real
+        run: |
+          python ouroboros.py --machine aarch64 --emit-elf glyph-aarch64
+          file glyph-aarch64 | grep -q aarch64
+
       - name: a wasm module, and the five lines of host it asks for
         run: |
           python ouroboros.py --emit-wasm glyph.wasm
@@ -63,6 +68,35 @@ jobs:
         run: |
           diff <(python ouroboros.py --emit-wasm - | python ouroboros.py --run-wasm -) \
                <(python ouroboros.py)
+
+  arm:
+    name: aarch64, on a machine that is one
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: nothing is installed
+        run: "! python -c 'import llvmlite' 2>/dev/null"
+
+      - name: every tier that needs no toolchain
+        run: python ouroboros.py --selftest
+
+      - name: 200 random programs across those tiers
+        run: python ouroboros.py --fuzz 200 --fuzz-seed ${{ github.run_number }}
+
+      - name: the executable this machine is, written without one
+        run: |
+          python ouroboros.py --emit-elf glyph
+          file glyph
+          diff <(./glyph) <(python ouroboros.py)
+
+      - name: and the one it is not, which only has to be the right shape here
+        run: |
+          python ouroboros.py --machine x86-64 --emit-elf other
+          file other | grep -q x86-64
 
   toolchain:
     name: llvm, the bootstrap and the closed loop

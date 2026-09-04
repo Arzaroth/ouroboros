@@ -54,10 +54,11 @@
 
   tier 5  machine code          layer 18 drops the toolchain: no llvmlite, no
           assembler, no linker, no libc.  The object module is encoded as
-          x86-64 directly - the operand stack is the hardware stack, the
-          canvas is .bss - and wrapped in a static ELF64 executable by hand.
-          A little over a kilobyte, and all it asks of the world is write(2)
-          and exit_group(2).
+          x86-64 or as aarch64 directly - the operand stack is the hardware
+          stack, the canvas is .bss - and wrapped in a static ELF64 executable
+          by hand.  A little over a kilobyte, and all it asks of the world is
+          write and exit_group.  Two machines behind one ELF writer, which is
+          what obliges the writer to say which of them it means.
 
   tier 6  WebAssembly           layer 19 encodes the same object module as a
           wasm reactor, by hand and with nothing installed.  It imports
@@ -77,6 +78,7 @@
     python3 ouroboros.py --close-the-loop    compile the glyph with the
                                              front end written in GSL-2
     python3 ouroboros.py --emit-elf PATH  write a static executable, no toolchain
+    python3 ouroboros.py --machine aarch64 --emit-elf PATH   for the other one
     python3 ouroboros.py --emit-wasm PATH write a wasm reactor, no toolchain
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --selftest      differential-test every tier
@@ -5293,16 +5295,19 @@ class DifferentialFuzzer:
             toolchain = None
             skipped.append(f"llvm tiers ({exc})")
 
-        machine = False
-        if machine_code_runnable():
+        machines: list[str] = []
+        for architecture in MACHINES:
+            if not machine_code_runnable(architecture):
+                skipped.append(f"elf({architecture}) tier (this host cannot run it)")
+                continue
             try:
-                self._through_machine(synthesize(3).unwrap_or_raise().module, scratch)
-                tiers.append("elf")
-                machine = True
+                self._through_machine(
+                    synthesize(3).unwrap_or_raise().module, scratch, architecture
+                )
+                tiers.append(f"elf({architecture})")
+                machines.append(architecture)
             except (GlyphPlatformError, OSError) as exc:
-                skipped.append(f"elf tier ({exc})")
-        else:
-            skipped.append("elf tier (this host cannot run x86-64 Linux binaries)")
+                skipped.append(f"elf({architecture}) tier ({exc})")
 
         wasm = False
         if wasm_host() is not None:
@@ -5344,10 +5349,10 @@ class DifferentialFuzzer:
                 variants.append(("jit", lambda: self._through_llvm(source, order, toolchain)))
                 if self._native:
                     variants.append(("native", lambda: self._through_native(source, order)))
-            if machine:
+            for architecture in machines:
                 variants.append(
-                    ("elf", lambda: self._through_machine(
-                        self._object_for(source, order), scratch))
+                    (f"elf({architecture})", lambda a=architecture: self._through_machine(
+                        self._object_for(source, order), scratch, a))
                 )
             if wasm:
                 variants.append(
@@ -5390,8 +5395,11 @@ class DifferentialFuzzer:
     def _module_for(self, source: str, order: int) -> LlvmModule:
         return LlvmLoweringBackend().lower(self._object_for(source, order))
 
-    def _through_machine(self, module: ObjectModule, scratch: Path) -> str:
-        return _run(write_executable(module, scratch / "machine"), "").removesuffix("\n")
+    def _through_machine(
+        self, module: ObjectModule, scratch: Path, architecture: str | None = None
+    ) -> str:
+        binary = write_executable(module, scratch / "machine", architecture)
+        return _run(binary, "").removesuffix("\n")
 
     def _through_wasm(self, module: ObjectModule, scratch: Path) -> str:
         return run_wasm(write_wasm(module, scratch / "case.wasm")).removesuffix("\n")
@@ -11178,50 +11186,643 @@ class NativeCodeBackend:
         text.ret()
 
 
+ARM_PAGE: Final[int] = 0x10000
+ARM_SYS_WRITE: Final[int] = 64
+ARM_SYS_EXIT_GROUP: Final[int] = 94
+EM_X86_64: Final[int] = 62
+EM_AARCH64: Final[int] = 183
+
+# Condition codes, in their encoding order.
+CONDITIONS: Final[Mapping[str, int]] = {
+    "eq": 0, "ne": 1, "hs": 2, "lo": 3, "mi": 4, "pl": 5, "vs": 6, "vc": 7,
+    "hi": 8, "ls": 9, "ge": 10, "lt": 11, "gt": 12, "le": 13, "al": 14,
+}
+
+ZERO: Final[int] = 31          # xzr where a register is read
+STACK: Final[int] = 31         # sp where a base register is read
+DATA: Final[int] = 12          # the .bss base, put there by the prologue
+LINK_SAVE: Final[int] = 13     # x30 parked across the one level of nesting
+
+
+class Aarch64Assembler:
+    """An aarch64 encoder: the instructions the machine needs, and no more.
+
+    Every instruction is a word, so there is no ModRM problem to have and no
+    variable length to track: a branch site is a word index and the fixup is
+    a bitfield.  Only the width of that bitfield differs, and only between the
+    two branch forms.
+    """
+
+    def __init__(self) -> None:
+        self._code = bytearray()
+        self._labels: dict[str, int] = {}
+        self._fixups: list[tuple[int, str, str]] = []
+
+    def __len__(self) -> int:
+        return len(self._code)
+
+    # -- labels and relocation --------------------------------------------
+
+    def label(self, name: str) -> None:
+        if name in self._labels:
+            raise MachineCodeError(f"duplicate label {name!r}")
+        self._labels[name] = len(self._code)
+
+    def link(self) -> bytes:
+        """Patches every branch, then freezes the text."""
+        for site, name, kind in self._fixups:
+            try:
+                target = self._labels[name]
+            except KeyError as exc:
+                raise MachineCodeError(f"unresolved branch target {name!r}") from exc
+            offset = (target - site) // 4
+            word = struct.unpack_from("<I", self._code, site)[0]
+            if kind == "imm26":
+                if not -(1 << 25) <= offset < (1 << 25):
+                    raise MachineCodeError(f"branch to {name!r} is out of range")
+                word |= offset & 0x3FFFFFF
+            else:
+                if not -(1 << 18) <= offset < (1 << 18):
+                    raise MachineCodeError(f"branch to {name!r} is out of range")
+                word |= (offset & 0x7FFFF) << 5
+            struct.pack_into("<I", self._code, site, word)
+        return bytes(self._code)
+
+    def _word(self, value: int) -> None:
+        self._code.extend(struct.pack("<I", value & 0xFFFFFFFF))
+
+    def _branch_site(self, word: int, name: str, kind: str) -> None:
+        self._fixups.append((len(self._code), name, kind))
+        self._word(word)
+
+    # -- moving values ----------------------------------------------------
+
+    def move(self, destination: int, source: int) -> None:
+        """mov Xd, Xn, which is orr Xd, xzr, Xn."""
+        self._word(0xAA0003E0 | (source << 16) | destination)
+
+    def immediate(self, destination: int, value: int) -> None:
+        """The 16 bits at a time that a fixed-width instruction can carry."""
+        unsigned = value & 0xFFFFFFFFFFFFFFFF
+        halfwords = [(unsigned >> shift) & 0xFFFF for shift in (0, 16, 32, 48)]
+        if value < 0:
+            # movn writes the complement, which spares three movk for the
+            # common small negative.
+            inverted = [half ^ 0xFFFF for half in halfwords]
+            first = next((i for i, half in enumerate(inverted) if half), 0)
+            self._word(0x92800000 | (first << 21) | (inverted[first] << 5) | destination)
+            for index, half in enumerate(halfwords):
+                if index != first and half != 0xFFFF:
+                    self._word(0xF2800000 | (index << 21) | (half << 5) | destination)
+            return
+        if not unsigned:
+            self._word(0xD2800000 | destination)
+            return
+        written = False
+        for index, half in enumerate(halfwords):
+            if half:
+                self._word(
+                    (0xF2800000 if written else 0xD2800000)
+                    | (index << 21) | (half << 5) | destination
+                )
+                written = True
+
+    # -- arithmetic -------------------------------------------------------
+
+    def arithmetic(self, operation: str, destination: int, left: int, right: int) -> None:
+        opcodes = {"add": 0x8B000000, "sub": 0xCB000000, "eor": 0xCA000000,
+                   "subs": 0xEB000000}
+        self._word(opcodes[operation] | (right << 16) | (left << 5) | destination)
+
+    def arithmetic_immediate(
+        self, operation: str, destination: int, left: int, value: int, scratch: int = 24
+    ) -> None:
+        """add/sub with a 12-bit immediate, or through ``scratch`` when wider."""
+        opcodes = {"add": 0x91000000, "sub": 0xD1000000, "subs": 0xF1000000}
+        if value < 0:
+            opposite = {"add": "sub", "sub": "add"}.get(operation)
+            if opposite is not None:
+                return self.arithmetic_immediate(opposite, destination, left, -value, scratch)
+        if 0 <= value < 4096:
+            self._word(opcodes[operation] | (value << 10) | (left << 5) | destination)
+            return
+        if 0 <= value < (4096 << 12) and not value & 0xFFF:
+            self._word(
+                opcodes[operation] | (1 << 22) | ((value >> 12) << 10) | (left << 5) | destination
+            )
+            return
+        self.immediate(scratch, value)
+        self.arithmetic({"add": "add", "sub": "sub", "subs": "subs"}[operation],
+                        destination, left, scratch)
+
+    def compare(self, left: int, right: int) -> None:
+        self.arithmetic("subs", ZERO, left, right)
+
+    def compare_immediate(self, left: int, value: int, scratch: int = 24) -> None:
+        self.arithmetic_immediate("subs", ZERO, left, value, scratch)
+
+    def multiply(self, destination: int, left: int, right: int) -> None:
+        """madd Xd, Xn, Xm, xzr."""
+        self._word(0x9B007C00 | (right << 16) | (left << 5) | destination)
+
+    def divide(self, destination: int, left: int, right: int) -> None:
+        self._word(0x9AC00C00 | (right << 16) | (left << 5) | destination)
+
+    def multiply_subtract(self, destination: int, left: int, right: int, minuend: int) -> None:
+        """msub Xd, Xn, Xm, Xa: Xa - Xn * Xm, which is the remainder."""
+        self._word(0x9B008000 | (right << 16) | (minuend << 10) | (left << 5) | destination)
+
+    def negate(self, destination: int, source: int) -> None:
+        self.arithmetic("sub", destination, ZERO, source)
+
+    def set_if(self, condition: str, destination: int) -> None:
+        """cset Xd, cond, which is csinc Xd, xzr, xzr, inverted."""
+        inverted = CONDITIONS[condition] ^ 1
+        self._word(0x9A9F07E0 | (inverted << 12) | destination)
+
+    # -- memory -----------------------------------------------------------
+
+    def load(self, destination: int, base: int, offset: int = 0) -> None:
+        self._word(0xF9400000 | ((offset // 8) << 10) | (base << 5) | destination)
+
+    def store(self, source: int, base: int, offset: int = 0) -> None:
+        self._word(0xF9000000 | ((offset // 8) << 10) | (base << 5) | source)
+
+    def load_octet(self, destination: int, base: int, index: int) -> None:
+        self._word(0x38606800 | (index << 16) | (base << 5) | destination)
+
+    def store_octet(self, source: int, base: int, index: int) -> None:
+        self._word(0x38206800 | (index << 16) | (base << 5) | source)
+
+    def push(self, register: int) -> None:
+        """str Xt, [sp, #-16]!  Sixteen keeps sp aligned where eight would not."""
+        self._word(0xF8000C00 | ((-16 & 0x1FF) << 12) | (STACK << 5) | register)
+
+    def pop(self, register: int) -> None:
+        """ldr Xt, [sp], #16."""
+        self._word(0xF8400400 | ((16 & 0x1FF) << 12) | (STACK << 5) | register)
+
+    # -- control ----------------------------------------------------------
+
+    def jump(self, name: str) -> None:
+        self._branch_site(0x14000000, name, "imm26")
+
+    def jump_if(self, condition: str, name: str) -> None:
+        self._branch_site(0x54000000 | CONDITIONS[condition], name, "imm19")
+
+    def jump_if_zero(self, register: int, name: str) -> None:
+        self._branch_site(0xB4000000 | register, name, "imm19")
+
+    def call(self, name: str) -> None:
+        self._branch_site(0x94000000, name, "imm26")
+
+    def ret(self) -> None:
+        self._word(0xD65F03C0)
+
+    def trap(self) -> None:
+        self._word(0xD4200000)
+
+    def syscall(self) -> None:
+        self._word(0xD4000001)
+
+
+class Aarch64CodeBackend:
+    """Encodes a linked object module as aarch64 machine code.
+
+    The same shape as the x86-64 backend: the operand stack is the hardware
+    stack, the runtime is reached by call, and canvas, snapshot, frame and
+    output sit in .bss at a fixed address the prologue puts in a register.
+
+    Three things differ.  A push moves the stack sixteen octets rather than
+    eight, because sp has to stay aligned to sixteen for anything to be able
+    to address off it.  A call leaves its return address in a register rather
+    than on that stack, so the two routines that call another one park it,
+    which is also why there is only ever one level to park.  And division
+    answers zero where the other machine faults, so the divisor is tested
+    first and the trap is written out.
+    """
+
+    ORIENTATION_ENCODING: ClassVar[Mapping[Orientation, int]] = {
+        Orientation.ROW: 0,
+        Orientation.COLUMN: 1,
+        Orientation.DIAGONAL: 2,
+        Orientation.ANTIDIAGONAL: 3,
+    }
+
+    def __init__(self, module: ObjectModule) -> None:
+        self._module = module
+        self._order = module.order
+        self._cells = module.order * module.order
+        self._apothem = module.order // 2
+        self._frame = max(module.frame_size, 1)
+        self._layout = DataLayout.of(self._order, self._frame)
+        self._group = SymmetryGroup.generated_by(
+            module.family.generators,
+            Coordinate(self._apothem, self._apothem),
+            module.symmetry_order,
+            presentation=f"{module.family.value}-{module.cardinality} about centroid",
+        )
+
+    @property
+    def layout(self) -> DataLayout:
+        return self._layout
+
+    @woven
+    def encode(self) -> bytes:
+        """The whole text section: entry point, instruction stream, runtime."""
+        text = Aarch64Assembler()
+        text.label("_start")
+        text.immediate(DATA, DATA_BASE)
+        for address, instruction in enumerate(self._module.instructions):
+            text.label(f"A{address}")
+            self._instruction(text, instruction, address)
+        text.label("exit")
+        text.call("render")
+        text.immediate(8, ARM_SYS_EXIT_GROUP)
+        text.immediate(0, 0)
+        text.syscall()
+        text.label("divide.by.zero")
+        text.trap()
+        self._paint(text)
+        self._emit_run(text)
+        self._snapshot(text)
+        self._apply(text)
+        self._render(text)
+        return text.link()
+
+    def _intrinsic(self, name: str) -> int:
+        try:
+            return {
+                "zero": 0,
+                "apothem": self._apothem,
+                "extremum": self._order - 1,
+                "magnitude": self._order,
+            }[name]
+        except KeyError as exc:
+            raise MachineCodeError(f"unbound intrinsic {name!r}") from exc
+
+    def _instruction(
+        self, text: Aarch64Assembler, instruction: Instruction, address: int
+    ) -> None:
+        match instruction:
+            case Halt():
+                text.jump("exit")
+            case Jump(target=target):
+                text.jump(f"A{int(target)}")
+            case JumpIfFalse(target=target):
+                text.pop(0)
+                text.compare_immediate(0, 0)
+                text.jump_if("eq", f"A{int(target)}")
+            case PushConstant(value=value):
+                text.immediate(0, value)
+                text.push(0)
+            case LoadIntrinsic(name=name):
+                text.immediate(0, self._intrinsic(name))
+                text.push(0)
+            case LoadLocal(slot=slot):
+                text.arithmetic_immediate("add", 9, DATA, self._layout.frame + slot * 8)
+                text.load(0, 9)
+                text.push(0)
+            case StoreLocal(slot=slot):
+                text.pop(0)
+                text.arithmetic_immediate("add", 9, DATA, self._layout.frame + slot * 8)
+                text.store(0, 9)
+            case BinaryAdd() | BinarySubtract():
+                text.pop(1)
+                text.pop(0)
+                text.arithmetic("add" if isinstance(instruction, BinaryAdd) else "sub", 0, 0, 1)
+                text.push(0)
+            case BinaryMultiply():
+                text.pop(1)
+                text.pop(0)
+                text.multiply(0, 0, 1)
+                text.push(0)
+            case BinaryDivide():
+                self._floor_divide(text, address)
+            case Negate():
+                text.pop(0)
+                text.negate(0, 0)
+                text.push(0)
+            case CompareLessEqual():
+                text.pop(1)
+                text.pop(0)
+                text.compare(0, 1)
+                text.set_if("le", 0)
+                text.push(0)
+            case MakeInterval():
+                pass
+            case EmitOrientedRun(orientation=orientation):
+                text.pop(3)
+                text.pop(2)
+                text.pop(1)
+                text.immediate(0, self.ORIENTATION_ENCODING[orientation])
+                text.call("emit_run")
+            case CloseUnderGroup():
+                text.call("snapshot")
+                for element in self._group.elements:
+                    linear = element.linear
+                    text.immediate(0, linear.a)
+                    text.immediate(1, linear.b)
+                    text.immediate(2, linear.c)
+                    text.immediate(3, linear.d)
+                    text.call("apply")
+            case _:
+                raise MachineCodeError(f"unencodable instruction {instruction!r}")
+
+    def _floor_divide(self, text: Aarch64Assembler, address: int) -> None:
+        """sdiv truncates towards zero where the interpreter floors."""
+        floored = f"A{address}.floored"
+        text.pop(1)
+        text.pop(0)
+        text.jump_if_zero(1, "divide.by.zero")
+        text.divide(2, 0, 1)
+        text.multiply_subtract(3, 2, 1, 0)
+        text.compare_immediate(3, 0)
+        text.jump_if("eq", floored)
+        text.arithmetic("eor", 3, 3, 1)
+        text.compare_immediate(3, 0)
+        text.jump_if("ge", floored)
+        text.arithmetic_immediate("sub", 2, 2, 1)
+        text.label(floored)
+        text.push(2)
+
+    # -- the runtime the instruction stream calls into ---------------------
+
+    def _paint(self, text: Aarch64Assembler) -> None:
+        """paint(x0 = row, x1 = column), out of bounds silently ignored."""
+        text.label("paint")
+        for register in (0, 1):
+            text.compare_immediate(register, 0)
+            text.jump_if("lt", "paint.done")
+            text.compare_immediate(register, self._order)
+            text.jump_if("ge", "paint.done")
+        text.immediate(21, self._order)
+        text.multiply(21, 0, 21)
+        text.arithmetic("add", 21, 21, 1)
+        text.arithmetic_immediate("add", 22, DATA, self._layout.canvas)
+        text.immediate(23, 1)
+        text.store_octet(23, 22, 21)
+        text.label("paint.done")
+        text.ret()
+
+    def _emit_run(self, text: Aarch64Assembler) -> None:
+        """emit_run(x0 = orientation, x1 = index, x2 = lower, x3 = upper)."""
+        text.label("emit_run")
+        text.move(LINK_SAVE, 30)
+        text.move(5, 0)
+        text.move(6, 1)
+        text.move(7, 2)
+        text.move(9, 3)
+        text.label("emit_run.head")
+        text.compare(7, 9)
+        text.jump_if("gt", "emit_run.done")
+        for encoding, name in ((1, "column"), (2, "diagonal"), (3, "antidiagonal")):
+            text.compare_immediate(5, encoding)
+            text.jump_if("eq", f"emit_run.{name}")
+        text.move(0, 6)
+        text.move(1, 7)
+        text.jump("emit_run.paint")
+        text.label("emit_run.column")
+        text.move(0, 7)
+        text.move(1, 6)
+        text.jump("emit_run.paint")
+        text.label("emit_run.diagonal")
+        text.move(0, 7)
+        text.arithmetic("add", 1, 7, 6)
+        text.jump("emit_run.paint")
+        text.label("emit_run.antidiagonal")
+        text.move(0, 7)
+        text.arithmetic("sub", 1, 6, 7)
+        text.label("emit_run.paint")
+        text.call("paint")
+        text.arithmetic_immediate("add", 7, 7, 1)
+        text.jump("emit_run.head")
+        text.label("emit_run.done")
+        text.move(30, LINK_SAVE)
+        text.ret()
+
+    def _snapshot(self, text: Aarch64Assembler) -> None:
+        """The canvas as it stood before the closure began."""
+        text.label("snapshot")
+        text.arithmetic_immediate("add", 9, DATA, self._layout.canvas)
+        text.arithmetic_immediate("add", 10, DATA, self._layout.snapshot)
+        text.immediate(5, 0)
+        text.label("snapshot.head")
+        text.compare_immediate(5, self._cells)
+        text.jump_if("ge", "snapshot.done")
+        text.load_octet(7, 9, 5)
+        text.store_octet(7, 10, 5)
+        text.arithmetic_immediate("add", 5, 5, 1)
+        text.jump("snapshot.head")
+        text.label("snapshot.done")
+        text.ret()
+
+    def _apply(self, text: Aarch64Assembler) -> None:
+        """apply(x0 = a, x1 = b, x2 = c, x3 = d): one group element."""
+        text.label("apply")
+        text.move(LINK_SAVE, 30)
+        text.move(5, 0)
+        text.move(6, 1)
+        text.move(7, 2)
+        text.move(9, 3)
+        text.arithmetic_immediate("add", 10, DATA, self._layout.snapshot)
+        text.immediate(11, 0)
+        text.label("apply.row")
+        text.compare_immediate(11, self._order)
+        text.jump_if("ge", "apply.done")
+        text.immediate(15, 0)
+        text.label("apply.column")
+        text.compare_immediate(15, self._order)
+        text.jump_if("ge", "apply.row.step")
+        text.immediate(16, self._order)
+        text.multiply(16, 11, 16)
+        text.arithmetic("add", 16, 16, 15)
+        text.load_octet(17, 10, 16)
+        text.compare_immediate(17, 0)
+        text.jump_if("eq", "apply.column.step")
+        text.arithmetic_immediate("sub", 19, 11, self._apothem)
+        text.arithmetic_immediate("sub", 20, 15, self._apothem)
+        text.multiply(16, 5, 19)
+        text.multiply(17, 6, 20)
+        text.arithmetic("add", 16, 16, 17)
+        text.arithmetic_immediate("add", 0, 16, self._apothem)
+        text.multiply(16, 7, 19)
+        text.multiply(17, 9, 20)
+        text.arithmetic("add", 16, 16, 17)
+        text.arithmetic_immediate("add", 1, 16, self._apothem)
+        text.call("paint")
+        text.label("apply.column.step")
+        text.arithmetic_immediate("add", 15, 15, 1)
+        text.jump("apply.column")
+        text.label("apply.row.step")
+        text.arithmetic_immediate("add", 11, 11, 1)
+        text.jump("apply.row")
+        text.label("apply.done")
+        text.move(30, LINK_SAVE)
+        text.ret()
+
+    def _render(self, text: Aarch64Assembler) -> None:
+        """The canvas as text, trailing blanks trimmed, in a single write."""
+        text.label("render")
+        text.arithmetic_immediate("add", 9, DATA, self._layout.canvas)
+        text.arithmetic_immediate("add", 10, DATA, self._layout.output)
+        text.immediate(11, 0)
+        text.immediate(14, 0)
+        text.label("render.row")
+        text.compare_immediate(11, self._order)
+        text.jump_if("ge", "render.flush")
+        text.immediate(16, -1)
+        text.immediate(15, 0)
+        text.label("render.scan")
+        text.compare_immediate(15, self._order)
+        text.jump_if("ge", "render.print")
+        text.immediate(17, self._order)
+        text.multiply(17, 11, 17)
+        text.arithmetic("add", 17, 17, 15)
+        text.load_octet(17, 9, 17)
+        text.compare_immediate(17, 0)
+        text.jump_if("eq", "render.scan.step")
+        text.move(16, 15)
+        text.label("render.scan.step")
+        text.arithmetic_immediate("add", 15, 15, 1)
+        text.jump("render.scan")
+        text.label("render.print")
+        text.immediate(15, 0)
+        text.label("render.cell")
+        text.compare(15, 16)
+        text.jump_if("gt", "render.newline")
+        text.compare_immediate(15, 0)
+        text.jump_if("le", "render.ink")
+        text.immediate(17, ord(" "))
+        text.store_octet(17, 10, 14)
+        text.arithmetic_immediate("add", 14, 14, 1)
+        text.label("render.ink")
+        text.immediate(17, self._order)
+        text.multiply(17, 11, 17)
+        text.arithmetic("add", 17, 17, 15)
+        text.load_octet(17, 9, 17)
+        text.compare_immediate(17, 0)
+        text.jump_if("eq", "render.blank")
+        text.immediate(17, ord("*"))
+        text.jump("render.advance")
+        text.label("render.blank")
+        text.immediate(17, ord(" "))
+        text.label("render.advance")
+        text.store_octet(17, 10, 14)
+        text.arithmetic_immediate("add", 14, 14, 1)
+        text.arithmetic_immediate("add", 15, 15, 1)
+        text.jump("render.cell")
+        text.label("render.newline")
+        text.immediate(17, ord("\n"))
+        text.store_octet(17, 10, 14)
+        text.arithmetic_immediate("add", 14, 14, 1)
+        text.arithmetic_immediate("add", 11, 11, 1)
+        text.jump("render.row")
+        text.label("render.flush")
+        text.immediate(8, ARM_SYS_WRITE)
+        text.immediate(0, 1)
+        text.arithmetic_immediate("add", 1, DATA, self._layout.output)
+        text.move(2, 14)
+        text.syscall()
+        text.ret()
+
+
 ELF_HEADER_SIZE: Final[int] = 64
 PROGRAM_HEADER_SIZE: Final[int] = 56
 PROGRAM_HEADERS: Final[int] = 2
 
 
-def elf64_image(text: bytes, bss: int) -> bytes:
+def elf64_image(text: bytes, bss: int, machine: int, align: int) -> bytes:
     """Wraps a text section in the smallest static ELF64 executable that runs it.
 
     Two loadable segments and nothing else: the headers and the text, mapped
     read-execute at the image base, and an anonymous read-write span the
     kernel zeroes for us, which is the whole of the program's data.
+
+    Only two fields distinguish the machines: which one the header names, and
+    how coarsely the segments are aligned.  Both bases are aligned to the
+    larger of the two, so either value keeps the mapping congruent.
     """
     prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
     loaded = prologue + len(text)
     header = struct.pack(
         "<4sBBBBB7xHHIQQQIHHHHHH",
         b"\x7fELF", 2, 1, 1, 0, 0,
-        2, 62, 1, IMAGE_BASE + prologue, ELF_HEADER_SIZE, 0, 0,
+        2, machine, 1, IMAGE_BASE + prologue, ELF_HEADER_SIZE, 0, 0,
         ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE, PROGRAM_HEADERS, 64, 0, 0,
     )
     segments = struct.pack(
-        "<IIQQQQQQ", 1, 5, 0, IMAGE_BASE, IMAGE_BASE, loaded, loaded, PAGE_SIZE
+        "<IIQQQQQQ", 1, 5, 0, IMAGE_BASE, IMAGE_BASE, loaded, loaded, align
     ) + struct.pack(
-        "<IIQQQQQQ", 1, 6, 0, DATA_BASE, DATA_BASE, 0, bss, PAGE_SIZE
+        "<IIQQQQQQ", 1, 6, 0, DATA_BASE, DATA_BASE, 0, bss, align
     )
     return header + segments + text
 
 
-def machine_code(module: ObjectModule) -> bytes:
-    """The object module as a static ELF64 executable for x86-64 Linux."""
-    backend = NativeCodeBackend(module)
-    return elf64_image(backend.encode(), backend.layout.size)
+MACHINES: Final[Mapping[str, tuple[type, int, int, str]]] = {
+    "x86-64": (NativeCodeBackend, EM_X86_64, PAGE_SIZE, "x86_64"),
+    "aarch64": (Aarch64CodeBackend, EM_AARCH64, ARM_PAGE, "aarch64"),
+}
 
 
-def write_executable(module: ObjectModule, path: Path) -> Path:
+def host_machine() -> str:
+    """The entry in :data:`MACHINES` this host is, or x86-64 if it is neither."""
+    uname = os.uname().machine if hasattr(os, "uname") else ""
+    for name, (_, _, _, machine) in MACHINES.items():
+        if uname == machine:
+            return name
+    return "x86-64"
+
+
+def machine_text(module: ObjectModule, architecture: str | None = None) -> bytes:
+    """Just the text section, without the ELF wrapper around it."""
+    backend_class, *_ = MACHINES[architecture or host_machine()]
+    return backend_class(module).encode()
+
+
+def machine_code(module: ObjectModule, architecture: str | None = None) -> bytes:
+    """The object module as a static ELF64 executable for ``architecture``."""
+    try:
+        backend_class, machine, align, _ = MACHINES[architecture or host_machine()]
+    except KeyError as exc:
+        raise MachineCodeError(f"no backend for {architecture!r}") from exc
+    backend = backend_class(module)
+    return elf64_image(backend.encode(), backend.layout.size, machine, align)
+
+
+def write_executable(
+    module: ObjectModule, path: Path, architecture: str | None = None
+) -> Path:
     """Writes that executable to ``path`` and makes it runnable."""
-    path.write_bytes(machine_code(module))
+    path.write_bytes(machine_code(module, architecture))
     path.chmod(0o755)
     return path
 
 
-def machine_code_runnable() -> bool:
-    """Whether the host can execute what layer 18 emits."""
-    return sys.platform.startswith("linux") and os.uname().machine == "x86_64"
+def machine_code_runnable(architecture: str | None = None) -> bool:
+    """Whether this host can execute what layer 18 emits for ``architecture``.
+
+    A foreign machine counts when the kernel has been told how to run it,
+    which is what binfmt_misc records, so a registered emulator makes the
+    other backend testable here rather than only on the machine it targets.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    wanted = architecture or host_machine()
+    if wanted not in MACHINES:
+        return False
+    if wanted == host_machine():
+        return True
+    registration = Path(f"/proc/sys/fs/binfmt_misc/qemu-{MACHINES[wanted][3]}")
+    try:
+        return "enabled" in registration.read_text()
+    except OSError:
+        return False
+
+
+def runnable_machines() -> tuple[str, ...]:
+    """Every machine this host can both write for and then run."""
+    return tuple(name for name in MACHINES if machine_code_runnable(name))
 
 
 # ======================================================================
@@ -12368,14 +12969,17 @@ def _selftest(orders: Sequence[int]) -> int:
                 tiers.append(("native", _run(binary, "").removesuffix("\n")))
         except (LlvmToolchainUnavailable, OSError) as exc:
             print(f"  n={order:<3} llvm tiers skipped: {exc}", file=sys.stderr)
-        try:
-            if not machine_code_runnable():
-                raise OSError("this host cannot run x86-64 Linux binaries")
-            with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
-                binary = write_executable(artifacts.module, Path(scratch) / "glyph")
-                tiers.append(("elf", _run(binary, "").removesuffix("\n")))
-        except (GlyphPlatformError, OSError) as exc:
-            print(f"  n={order:<3} elf tier skipped: {exc}", file=sys.stderr)
+        for architecture in MACHINES:
+            try:
+                if not machine_code_runnable(architecture):
+                    raise OSError(f"this host cannot run {architecture} binaries")
+                with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
+                    binary = write_executable(
+                        artifacts.module, Path(scratch) / "glyph", architecture
+                    )
+                    tiers.append((f"elf({architecture})", _run(binary, "").removesuffix("\n")))
+            except (GlyphPlatformError, OSError) as exc:
+                print(f"  n={order:<3} elf({architecture}) skipped: {exc}", file=sys.stderr)
         blob = wasm_module(artifacts.module)
         try:
             if wasm_host() is None:
@@ -12492,6 +13096,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     machine = parser.add_argument_group("tier 5: machine code, no toolchain")
     machine.add_argument("--emit-elf", metavar="PATH", help="write a static ELF64 executable")
     machine.add_argument("--emit-machine-code", action="store_true")
+    machine.add_argument("--machine", choices=sorted(MACHINES), default=host_machine(),
+                         help="which machine to write for (default: this one)")
 
     wasm = parser.add_argument_group("tier 6: WebAssembly, no host but an engine")
     wasm.add_argument("--emit-wasm", metavar="PATH", help="write a reactor module")
@@ -12651,8 +13257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         (namespace.emit_cfg, "control flow graph", artifacts.graph.render),
         (namespace.emit_passes, "optimisation report", artifacts.passes.render),
         (namespace.emit_asm, "disassembly", artifacts.module.disassembly),
-        (namespace.emit_machine_code, "machine code",
-         lambda: _hexdump(NativeCodeBackend(artifacts.module).encode())),
+        (namespace.emit_machine_code, f"machine code ({namespace.machine})",
+         lambda: _hexdump(machine_text(artifacts.module, namespace.machine))),
         (namespace.emit_container_format, "object container", lambda: _hexdump(artifacts.blob)),
         (namespace.emit_group, "symmetry group", artifacts.machine.group.render),
         (namespace.emit_events, "canvas event stream",
@@ -12685,7 +13291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
     if namespace.emit_elf:
-        blob = machine_code(artifacts.module)
+        blob = machine_code(artifacts.module, namespace.machine)
         written = _write_octets(namespace.emit_elf, blob, executable=True)
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
