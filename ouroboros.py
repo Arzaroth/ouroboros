@@ -1581,6 +1581,72 @@ PUNCTUATION: Final[Mapping[str, TokenKind]] = {
 }
 
 
+# ----------------------------------------------------------------------
+# The scanner, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# Three tables: which class a character falls into, tried in the order
+# listed; what a state accepts as when a lexeme ends in it; and where a state
+# goes on a class, with what to do on the way.  The driver below consults
+# them and holds no knowledge of the language itself.
+
+SCANNER_IMAGE: Final[str] = (
+    "alpha LETTER digit DIGIT newline NEWLINE blank SPACE dot DOT hash "
+    "COMMENT punct PUNCTUATION any OTHER IDENTIFIER reserved NUMERAL INTEGER "
+    "RANGE_PENDING RANGE GROUND ACCUMULATE SKIP EMIT_PUNCTUATION REJECT FAIL~"
+    "0.1,2.3,4.5,6.7,8.9,a.b,c.d,e.f~g.h,i.j,k.l~m.1.g.n,m.3.i.n,m.9.k.n,m.7."
+    "m.o,m.5.m.o,m.b.b.o,m.d.m.p,m.f.q.r,g.1.g.n,g.3.g.n,i.3.i.n,k.9.k.n,b.5."
+    "m.o"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ScannerImage:
+    """What the image stands for: the three tables layer 4 is driven by."""
+
+    classifiers: tuple[tuple[str, str], ...]
+    accepting: Mapping[str, str]
+    transitions: Mapping[tuple[str, str], tuple[str, str]]
+
+
+def compile_scanner(image: str) -> ScannerImage:
+    """Reads an image back into the tables the transducer consults."""
+    try:
+        vocabulary, classes, accepting, transitions = image.split("~")
+    except ValueError as exc:
+        raise LexicalError("the image does not have four sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise LexicalError(f"{code!r} addresses no word") from exc
+
+    return ScannerImage(
+        tuple((at(a), at(b)) for a, b in (r.split(".") for r in classes.split(","))),
+        {at(a): at(b) for a, b in (r.split(".") for r in accepting.split(","))},
+        {
+            (at(a), at(b)): (at(c), at(d))
+            for a, b, c, d in (r.split(".") for r in transitions.split(","))
+        },
+    )
+
+
+SCANNER: Final[ScannerImage] = compile_scanner(SCANNER_IMAGE)
+
+CHARACTER_SOURCES: Final[Mapping[str, Callable[[str], bool]]] = {
+    "alpha": lambda character: character in string.ascii_letters or character == "_",
+    "digit": lambda character: character in string.digits,
+    "newline": lambda character: character == "\n",
+    "blank": lambda character: character in " \t\r",
+    "dot": lambda character: character == ".",
+    "hash": lambda character: character == "#",
+    "punct": lambda character: character in PUNCTUATION,
+    "any": lambda character: True,
+}
+
+
 class CharacterClass(enum.Enum):
     LETTER = enum.auto()
     DIGIT = enum.auto()
@@ -1593,21 +1659,10 @@ class CharacterClass(enum.Enum):
 
     @classmethod
     def of(cls, character: str) -> "CharacterClass":
-        if character in string.ascii_letters or character == "_":
-            return cls.LETTER
-        if character in string.digits:
-            return cls.DIGIT
-        if character == "\n":
-            return cls.NEWLINE
-        if character in " \t\r":
-            return cls.SPACE
-        if character == ".":
-            return cls.DOT
-        if character == "#":
-            return cls.COMMENT
-        if character in PUNCTUATION:
-            return cls.PUNCTUATION
-        return cls.OTHER
+        for source, name in SCANNER.classifiers:
+            if CHARACTER_SOURCES[source](character):
+                return cls[name]
+        raise LexicalError(f"{character!r} falls into no class")  # pragma: no cover
 
 
 class TransducerState(enum.Enum):
@@ -1630,20 +1685,27 @@ class TransducerAction(enum.Enum):
 TRANSITION_TABLE: Final[
     Mapping[tuple[TransducerState, CharacterClass], tuple[TransducerState, TransducerAction]]
 ] = {
-    (TransducerState.GROUND, CharacterClass.LETTER): (TransducerState.IDENTIFIER, TransducerAction.ACCUMULATE),
-    (TransducerState.GROUND, CharacterClass.DIGIT): (TransducerState.NUMERAL, TransducerAction.ACCUMULATE),
-    (TransducerState.GROUND, CharacterClass.DOT): (TransducerState.RANGE_PENDING, TransducerAction.ACCUMULATE),
-    (TransducerState.GROUND, CharacterClass.SPACE): (TransducerState.GROUND, TransducerAction.SKIP),
-    (TransducerState.GROUND, CharacterClass.NEWLINE): (TransducerState.GROUND, TransducerAction.SKIP),
-    (TransducerState.GROUND, CharacterClass.COMMENT): (TransducerState.COMMENT, TransducerAction.SKIP),
-    (TransducerState.GROUND, CharacterClass.PUNCTUATION): (TransducerState.GROUND, TransducerAction.EMIT_PUNCTUATION),
-    (TransducerState.GROUND, CharacterClass.OTHER): (TransducerState.REJECT, TransducerAction.FAIL),
-    (TransducerState.IDENTIFIER, CharacterClass.LETTER): (TransducerState.IDENTIFIER, TransducerAction.ACCUMULATE),
-    (TransducerState.IDENTIFIER, CharacterClass.DIGIT): (TransducerState.IDENTIFIER, TransducerAction.ACCUMULATE),
-    (TransducerState.NUMERAL, CharacterClass.DIGIT): (TransducerState.NUMERAL, TransducerAction.ACCUMULATE),
-    (TransducerState.RANGE_PENDING, CharacterClass.DOT): (TransducerState.RANGE_PENDING, TransducerAction.ACCUMULATE),
-    (TransducerState.COMMENT, CharacterClass.NEWLINE): (TransducerState.GROUND, TransducerAction.SKIP),
+    (TransducerState[state], CharacterClass[characters]): (
+        TransducerState[target],
+        TransducerAction[action],
+    )
+    for (state, characters), (target, action) in SCANNER.transitions.items()
 }
+
+
+def _accepting_table() -> Mapping["TransducerState", Callable[[str], "TokenKind"]]:
+    """What each accepting state answers with, the reserved words apart."""
+
+    def constant(name: str) -> Callable[[str], TokenKind]:
+        return lambda lexeme: TokenKind[name]
+
+    def reserved(lexeme: str) -> TokenKind:
+        return TokenKind.KEYWORD if lexeme in KEYWORDS else TokenKind.IDENTIFIER
+
+    return {
+        TransducerState[state]: reserved if kind == "reserved" else constant(kind)
+        for state, kind in SCANNER.accepting.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1666,13 +1728,9 @@ class Token:
 class FiniteStateTransducer:
     """A table-driven maximal-munch scanner over the preprocessed unit."""
 
-    _ACCEPTING: Final[Mapping[TransducerState, Callable[[str], TokenKind]]] = {
-        TransducerState.IDENTIFIER: lambda lexeme: (
-            TokenKind.KEYWORD if lexeme in KEYWORDS else TokenKind.IDENTIFIER
-        ),
-        TransducerState.NUMERAL: lambda lexeme: TokenKind.INTEGER,
-        TransducerState.RANGE_PENDING: lambda lexeme: TokenKind.RANGE,
-    }
+    _ACCEPTING: Final[Mapping[TransducerState, Callable[[str], TokenKind]]] = (
+        _accepting_table()
+    )
 
     def __init__(self, unit: PreprocessedUnit | str) -> None:
         self._unit = unit if isinstance(unit, PreprocessedUnit) else PreprocessedUnit(unit, (), {}, {})
@@ -3081,90 +3139,143 @@ class OptimizationPass(abc.ABC, metaclass=PluginRegistryMeta):
     def apply(self, items: list[IrItem]) -> list[IrItem]: ...
 
 
-_FOLDABLE: Final[Mapping[type, Callable[[int, int], int]]] = {
-    BinaryAdd: operator.add,
-    BinarySubtract: operator.sub,
-    BinaryMultiply: operator.mul,
-    BinaryDivide: operator.floordiv,
+# ----------------------------------------------------------------------
+# The peephole, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# A rule is a window of matchers, how far to advance when it fires, a guard,
+# and what to leave in the window's place.  Which rules answer to which name
+# is the whole of what separates one of the three passes below from another:
+# each is a docstring and a line saying that its name is where to look.
+
+PEEPHOLE_IMAGE: Final[str] = (
+    "BinaryAdd add BinarySubtract sub BinaryMultiply mul BinaryDivide "
+    "floordiv 0 1 constant-folding k f 3 div fold n 2 - neg "
+    "algebraic-identities * neutral redundant-branch-elimination j l same~0.1"
+    ",2.3,4.5,6.7~8.0,8.2,9.4,9.6~a:b.b.c>d>e>f|b.g>h>i>j,k:b.l>h>m>i,n:o.p>9"
+    ">q>i"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PeepholeImage:
+    """What the image stands for: two tables and the rules of each pass."""
+
+    foldable: Mapping[str, str]
+    neutral: tuple[tuple[int, str], ...]
+    rules: Mapping[str, tuple[tuple[tuple[str, ...], int, str, str], ...]]
+
+
+def compile_peephole(image: str) -> PeepholeImage:
+    """Reads an image back into the rules layer 8 rewrites under."""
+    try:
+        vocabulary, foldable, neutral, rules = image.split("~")
+    except ValueError as exc:
+        raise CodeGenerationError("the image does not have four sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise CodeGenerationError(f"{code!r} addresses no word") from exc
+
+    return PeepholeImage(
+        {at(a): at(b) for a, b in (r.split(".") for r in foldable.split(","))},
+        tuple((int(at(a)), at(b)) for a, b in (r.split(".") for r in neutral.split(","))),
+        {
+            at(head): tuple(
+                (tuple(at(m) for m in f.split(".")), int(at(c)), at(g), at(e))
+                for f, c, g, e in (rule.split(">") for rule in body.split("|"))
+            )
+            for head, _, body in (r.partition(":") for r in rules.split(","))
+        },
+    )
+
+
+PEEPHOLE: Final[PeepholeImage] = compile_peephole(PEEPHOLE_IMAGE)
+
+FOLDABLE: Final[Mapping[type, Callable[[int, int], int]]] = {
+    INSTRUCTION_BY_NAME[name]: getattr(operator, function)
+    for name, function in PEEPHOLE.foldable.items()
 }
+
+NEUTRAL: Final[tuple[tuple[int, type], ...]] = tuple(
+    (value, INSTRUCTION_BY_NAME[name]) for value, name in PEEPHOLE.neutral
+)
+
+MATCHERS: Final[Mapping[str, Callable[[Any], bool]]] = {
+    "k": lambda item: isinstance(item, PushConstant),
+    "f": lambda item: type(item) in FOLDABLE,
+    "n": lambda item: isinstance(item, Negate),
+    "j": lambda item: isinstance(item, Jump),
+    "l": lambda item: isinstance(item, Label),
+    "*": lambda item: True,
+}
+
+GUARDS: Final[Mapping[str, Callable[[Sequence[Any]], bool]]] = {
+    "-": lambda window: True,
+    "div": lambda window: not (
+        FOLDABLE[type(window[2])] is operator.floordiv and window[1].value == 0
+    ),
+    "neutral": lambda window: any(
+        window[0].value == value and isinstance(window[1], operation)
+        for value, operation in NEUTRAL
+    ),
+    "same": lambda window: window[0].target == window[1].name,
+}
+
+EMISSIONS: Final[Mapping[str, Callable[[Sequence[Any]], tuple[IrItem, ...]]]] = {
+    "-": lambda window: (),
+    "fold": lambda window: (
+        PushConstant(FOLDABLE[type(window[2])](window[0].value, window[1].value)),
+    ),
+    "neg": lambda window: (PushConstant(-window[0].value),),
+}
+
+
+def run_rules(name: str, items: list[IrItem]) -> list[IrItem]:
+    """Rewrites a listing under whichever rules the image lists against a name."""
+    rules = PEEPHOLE.rules.get(name, ())
+    output: list[IrItem] = []
+    index = 0
+    while index < len(items):
+        for matchers, consume, guard, emission in rules:
+            window = items[index : index + len(matchers)]
+            if len(window) != len(matchers):
+                continue
+            if not all(MATCHERS[code](item) for code, item in zip(matchers, window)):
+                continue
+            if not GUARDS[guard](window):
+                continue
+            output.extend(EMISSIONS[emission](window))
+            index += consume
+            break
+        else:
+            output.append(items[index])
+            index += 1
+    return output
 
 
 class ConstantFolding(OptimizationPass):
     """Evaluates closed integer subexpressions at compile time."""
 
     def apply(self, items: list[IrItem]) -> list[IrItem]:
-        output: list[IrItem] = []
-        index = 0
-        while index < len(items):
-            window = items[index : index + 3]
-            if (
-                len(window) == 3
-                and isinstance(window[0], PushConstant)
-                and isinstance(window[1], PushConstant)
-                and type(window[2]) in _FOLDABLE
-            ):
-                operation = _FOLDABLE[type(window[2])]
-                left, right = window[0].value, window[1].value
-                if not (operation is operator.floordiv and right == 0):
-                    output.append(PushConstant(operation(left, right)))
-                    index += 3
-                    continue
-            if (
-                len(window) >= 2
-                and isinstance(window[0], PushConstant)
-                and isinstance(window[1], Negate)
-            ):
-                output.append(PushConstant(-window[0].value))
-                index += 2
-                continue
-            output.append(items[index])
-            index += 1
-        return output
+        return run_rules(self.name, items)
 
 
 class AlgebraicIdentities(OptimizationPass):
     """Deletes operations that are neutral elements of their operator."""
 
-    _NEUTRAL: Final[tuple[tuple[int, type], ...]] = (
-        (0, BinaryAdd), (0, BinarySubtract), (1, BinaryMultiply), (1, BinaryDivide),
-    )
-
     def apply(self, items: list[IrItem]) -> list[IrItem]:
-        output: list[IrItem] = []
-        index = 0
-        while index < len(items):
-            window = items[index : index + 2]
-            if len(window) == 2 and isinstance(window[0], PushConstant):
-                if any(
-                    window[0].value == value and isinstance(window[1], operation)
-                    for value, operation in self._NEUTRAL
-                ):
-                    index += 2
-                    continue
-            output.append(items[index])
-            index += 1
-        return output
+        return run_rules(self.name, items)
 
 
 class RedundantBranchElimination(OptimizationPass):
     """Removes jumps whose target is the immediately following label."""
 
     def apply(self, items: list[IrItem]) -> list[IrItem]:
-        output: list[IrItem] = []
-        index = 0
-        while index < len(items):
-            item = items[index]
-            following = items[index + 1] if index + 1 < len(items) else None
-            if (
-                isinstance(item, Jump)
-                and isinstance(following, Label)
-                and following.name == item.target
-            ):
-                index += 1
-                continue
-            output.append(item)
-            index += 1
-        return output
+        return run_rules(self.name, items)
 
 
 class UnreachableCodeElimination(OptimizationPass):
