@@ -59,6 +59,11 @@ jobs:
       - name: the same module again, with no engine at all
         run: diff <(python ouroboros.py --run-wasm glyph.wasm) <(python ouroboros.py)
 
+      - name: and once more without ever touching a file
+        run: |
+          diff <(python ouroboros.py --emit-wasm - | python ouroboros.py --run-wasm -) \
+               <(python ouroboros.py)
+
   toolchain:
     name: llvm, the bootstrap and the closed loop
     runs-on: ubuntu-latest

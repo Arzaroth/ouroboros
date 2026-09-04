@@ -82,6 +82,10 @@
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
+  A PATH of - is standard input or standard output, so the tiers pipe:
+
+    python3 ouroboros.py --emit-wasm - | python3 ouroboros.py --run-wasm -
+
 """
 
 from __future__ import annotations
@@ -5008,10 +5012,12 @@ class LlvmToolchainService:
         return LlvmModule(str(parsed), module.profile, module.order)
 
     @woven
+    def object_code(self, module: LlvmModule) -> bytes:
+        return self._target_machine().emit_object(self._parse(module))
+
+    @woven
     def emit_object(self, module: LlvmModule, path: str) -> str:
-        machine = self._target_machine()
-        with open(path, "wb") as handle:
-            handle.write(machine.emit_object(self._parse(module)))
+        Path(path).write_bytes(self.object_code(module))
         return path
 
     @woven
@@ -12310,6 +12316,33 @@ def execute_wasm(blob: bytes) -> str:
 # ======================================================================
 
 
+STREAM: Final[str] = "-"
+
+
+def _read_octets(source: str) -> bytes:
+    """What ``source`` holds, or what standard input holds when it is ``-``."""
+    if source == STREAM:
+        return sys.stdin.buffer.read()
+    return Path(source).read_bytes()
+
+
+def _write_octets(destination: str, blob: bytes, executable: bool = False) -> str:
+    """Writes ``blob`` where asked, and answers what to call the place.
+
+    A destination of ``-`` is standard output, which cannot be made executable
+    and does not need to be: whoever redirects it decides what it becomes.
+    """
+    if destination == STREAM:
+        sys.stdout.buffer.write(blob)
+        sys.stdout.buffer.flush()
+        return "standard output"
+    path = Path(destination)
+    path.write_bytes(blob)
+    if executable:
+        path.chmod(0o755)
+    return str(path)
+
+
 def _hexdump(blob: bytes, width: int = 16) -> str:
     lines = []
     for offset in range(0, len(blob), width):
@@ -12414,6 +12447,7 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ouroboros",
         description=f"ouroboros {PLATFORM_VERSION} - the pattern, and everything it grew into",
+        epilog="A PATH of - is standard input or standard output, whichever the option takes.",
     )
     parser.add_argument("-n", "--order", type=int, help="lattice edge length (odd)")
     parser.add_argument("-m", "--motif", choices=Motif.catalogue(), help="registered motif")
@@ -12465,7 +12499,7 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
-    boot.add_argument("--workdir", metavar="PATH")
+    boot.add_argument("--workdir", metavar="DIR")
     boot.add_argument("--emit-gsl2", choices=("gslc", "glyph", "glyphc"))
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
@@ -12509,7 +12543,9 @@ def _run_backend(namespace: argparse.Namespace, artifacts: CompilationArtifacts)
         if namespace.verify_llvm:
             print(toolchain.verify(module), file=sys.stderr)
         if namespace.emit_object:
-            print(f"wrote {toolchain.emit_object(module, namespace.emit_object)}", file=sys.stderr)
+            blob = toolchain.object_code(module)
+            written = _write_octets(namespace.emit_object, blob)
+            print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
         if namespace.emit_native_assembly:
             sys.stdout.write(toolchain.emit_assembly(module))
         if namespace.emit_llvm:
@@ -12545,7 +12581,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if namespace.run_wasm:
-        sys.stdout.write(execute_wasm(Path(namespace.run_wasm).read_bytes()))
+        sys.stdout.write(execute_wasm(_read_octets(namespace.run_wasm)))
         return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))
@@ -12649,12 +12685,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
     if namespace.emit_elf:
-        written = write_executable(artifacts.module, Path(namespace.emit_elf))
-        print(f"wrote {written} ({written.stat().st_size} bytes)", file=sys.stderr)
+        blob = machine_code(artifacts.module)
+        written = _write_octets(namespace.emit_elf, blob, executable=True)
+        print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
     if namespace.emit_wasm:
-        written = write_wasm(artifacts.module, Path(namespace.emit_wasm))
-        print(f"wrote {written} ({written.stat().st_size} bytes)", file=sys.stderr)
+        blob = wasm_module(artifacts.module)
+        written = _write_octets(namespace.emit_wasm, blob)
+        print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
     backend_requested = any(
         (
@@ -12669,7 +12707,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if backend_requested:
         return _run_backend(namespace, artifacts)
 
-    sys.stdout.write(artifacts.rendering + "\n")
+    if STREAM not in (namespace.emit_elf, namespace.emit_wasm):
+        sys.stdout.write(artifacts.rendering + "\n")
     return 0
 
 
