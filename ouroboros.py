@@ -66,7 +66,9 @@
           and any engine will do.  Inside a basic block the lowering is one
           instruction to one, since both machines are stack machines; the
           branches are where they differ, and the instruction stream becomes
-          a table over a program counter.
+          a table over a program counter.  Layer 20 then reads that module
+          back and runs it here, so the file executes its own output and the
+          tier stops needing an engine at all.
 
     python3 ouroboros.py                 render via the virtual machine
     python3 ouroboros.py --emit-llvm     lower the program to LLVM IR
@@ -76,6 +78,7 @@
                                              front end written in GSL-2
     python3 ouroboros.py --emit-elf PATH  write a static executable, no toolchain
     python3 ouroboros.py --emit-wasm PATH write a wasm reactor, no toolchain
+    python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -5305,6 +5308,7 @@ class DifferentialFuzzer:
                 skipped.append(f"wasm tier ({exc})")
         else:
             skipped.append("wasm tier (no WebAssembly host is installed)")
+        tiers.append("read-back")
 
         front_end: Path | None = None
         if self._front_end and toolchain is not None:
@@ -5344,6 +5348,10 @@ class DifferentialFuzzer:
                     ("wasm", lambda: self._through_wasm(
                         self._object_for(source, order), scratch))
                 )
+            variants.append(
+                ("read-back", lambda: self._through_read_back(
+                    self._object_for(source, order)))
+            )
             if front_end is not None:
                 # The front end's claim is byte equality with layer 16, which is
                 # stronger than agreeing on the glyph, so both are checked.
@@ -5381,6 +5389,9 @@ class DifferentialFuzzer:
 
     def _through_wasm(self, module: ObjectModule, scratch: Path) -> str:
         return run_wasm(write_wasm(module, scratch / "case.wasm")).removesuffix("\n")
+
+    def _through_read_back(self, module: ObjectModule) -> str:
+        return execute_wasm(wasm_module(module)).removesuffix("\n")
 
     def _through_llvm(
         self, source: str, order: int, toolchain: LlvmToolchainService
@@ -11825,6 +11836,476 @@ def run_wasm(path: Path) -> str:
 
 
 # ======================================================================
+# Layer 20: the module read back
+# ======================================================================
+#
+# The emitter needed none of LEB128 decoding, structured control flow or the
+# validation rules; reading its own output back needs all three.  What comes
+# of it is a fourth way to execute the object module with nothing installed,
+# and the only one that never leaves this file.
+
+
+MASK32: Final[int] = 0xFFFFFFFF
+MASK64: Final[int] = 0xFFFFFFFFFFFFFFFF
+
+
+class WasmDecodeError(GlyphPlatformError):
+    """The module could not be read."""
+
+
+class WasmTrap(GlyphPlatformError):
+    """The module trapped while running."""
+
+
+def _signed(value: int, bits: int) -> int:
+    return value - (1 << bits) if value & (1 << (bits - 1)) else value
+
+
+# ----------------------------------------------------------------------
+# decoding
+# ----------------------------------------------------------------------
+
+
+class WasmReader:
+    """A cursor over the binary format's little-endian, LEB128-heavy scalars."""
+
+    __slots__ = ("_data", "_at")
+
+    def __init__(self, data: bytes, at: int = 0) -> None:
+        self._data = data
+        self._at = at
+
+    @property
+    def at(self) -> int:
+        return self._at
+
+    def done(self, limit: int) -> bool:
+        return self._at >= limit
+
+    def octet(self) -> int:
+        try:
+            value = self._data[self._at]
+        except IndexError as exc:
+            raise WasmDecodeError("the module ends inside an instruction") from exc
+        self._at += 1
+        return value
+
+    def take(self, count: int) -> bytes:
+        chunk = self._data[self._at : self._at + count]
+        if len(chunk) != count:
+            raise WasmDecodeError(f"the module ends {count - len(chunk)} octets early")
+        self._at += count
+        return chunk
+
+    def uleb(self) -> int:
+        value, shift = 0, 0
+        while True:
+            octet = self.octet()
+            value |= (octet & 0x7F) << shift
+            if not octet & 0x80:
+                return value
+            shift += 7
+            if shift > 63:
+                raise WasmDecodeError("unsigned LEB128 runs past 64 bits")
+
+    def sleb(self) -> int:
+        value, shift = 0, 0
+        while True:
+            octet = self.octet()
+            value |= (octet & 0x7F) << shift
+            shift += 7
+            if not octet & 0x80:
+                if octet & 0x40 and shift < 128:
+                    value -= 1 << shift
+                return value
+            if shift > 127:
+                raise WasmDecodeError("signed LEB128 runs past its range")
+
+    def vector(self, element: Callable[[], Any]) -> list[Any]:
+        return [element() for _ in range(self.uleb())]
+
+
+@dataclass(frozen=True, slots=True)
+class WasmType:
+    params: tuple[int, ...]
+    results: tuple[int, ...]
+
+
+@dataclass(slots=True)
+class WasmFunction:
+    type_index: int
+    signature: WasmType
+    locals: tuple[int, ...]
+    code: list[tuple] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class DecodedModule:
+    types: list[WasmType]
+    functions: list[WasmFunction]
+    pages: int
+    globals: list[int]
+    exports: dict[str, tuple[int, int]]
+
+
+# Every opcode layer 19 emits, and its immediate shape.  Anything absent is
+# rejected rather than guessed at.
+_NO_IMMEDIATE: Final[frozenset[int]] = frozenset(
+    {
+        0x00, 0x05, 0x0B, 0x0F, 0x1A,
+        0x45, 0x46, 0x47, 0x48, 0x4A, 0x4C, 0x4E,
+        0x50, 0x51, 0x53, 0x55, 0x57, 0x59,
+        0x6A, 0x6B, 0x6C,
+        0x7C, 0x7D, 0x7E, 0x7F, 0x81, 0x85,
+        0xA7, 0xAC,
+    }
+)
+_BLOCK_TYPE: Final[frozenset[int]] = frozenset({0x02, 0x03, 0x04})
+_ONE_INDEX: Final[frozenset[int]] = frozenset({0x0C, 0x0D, 0x10, 0x20, 0x21, 0x22, 0x23, 0x24})
+_MEMARG: Final[frozenset[int]] = frozenset({0x28, 0x2D, 0x36, 0x3A})
+
+
+def _decode_body(reader: WasmReader, limit: int) -> list[tuple]:
+    """Flattens a function body into (opcode, immediate) pairs."""
+    code: list[tuple] = []
+    while not reader.done(limit):
+        opcode = reader.octet()
+        if opcode in _NO_IMMEDIATE:
+            code.append((opcode, None))
+        elif opcode in _BLOCK_TYPE:
+            code.append((opcode, reader.octet()))
+        elif opcode in _ONE_INDEX:
+            code.append((opcode, reader.uleb()))
+        elif opcode in _MEMARG:
+            reader.uleb()
+            code.append((opcode, reader.uleb()))
+        elif opcode == 0x41:
+            code.append((opcode, reader.sleb() & MASK32))
+        elif opcode == 0x42:
+            code.append((opcode, reader.sleb() & MASK64))
+        elif opcode == 0x0E:
+            targets = tuple(reader.vector(reader.uleb))
+            code.append((opcode, (targets, reader.uleb())))
+        else:
+            raise WasmDecodeError(f"opcode 0x{opcode:02x} is not one this reads")
+    return code
+
+
+def _resolve(code: list[tuple]) -> list[tuple]:
+    """Pairs every structured instruction with its else and its end.
+
+    Wasm names a branch target by how many structures to leave rather than by
+    where to land, so the landing places have to be recovered once here or
+    found again on every branch.
+    """
+    resolved: list[Any] = [immediate for _, immediate in code]
+    open_: list[int] = []
+    for position, (opcode, immediate) in enumerate(code):
+        if opcode in _BLOCK_TYPE:
+            resolved[position] = [immediate, None, None]
+            open_.append(position)
+        elif opcode == 0x05:
+            if not open_ or code[open_[-1]][0] != 0x04:
+                raise WasmDecodeError("else outside an if")
+            resolved[open_[-1]][1] = position
+        elif opcode == 0x0B and open_:
+            resolved[open_.pop()][2] = position
+    if open_:
+        raise WasmDecodeError("a structured instruction is never closed")
+    return [
+        (opcode, tuple(immediate) if isinstance(immediate, list) else immediate)
+        for (opcode, _), immediate in zip(code, resolved)
+    ]
+
+
+def decode_wasm(blob: bytes) -> DecodedModule:
+    """Reads a module far enough to run it."""
+    reader = WasmReader(blob)
+    if reader.take(4) != b"\0asm":
+        raise WasmDecodeError("not a WebAssembly module")
+    if reader.take(4) != b"\x01\0\0\0":
+        raise WasmDecodeError("unsupported module version")
+
+    types: list[WasmType] = []
+    type_indices: list[int] = []
+    bodies: list[tuple[tuple[int, ...], list[tuple]]] = []
+    pages = 1
+    globals_: list[int] = []
+    exports: dict[str, tuple[int, int]] = {}
+
+    while not reader.done(len(blob)):
+        identifier = reader.octet()
+        size = reader.uleb()
+        end = reader.at + size
+        if identifier == 1:
+            def one_type() -> WasmType:
+                if reader.octet() != 0x60:
+                    raise WasmDecodeError("malformed function type")
+                params = tuple(reader.vector(reader.octet))
+                return WasmType(params, tuple(reader.vector(reader.octet)))
+
+            types = reader.vector(one_type)
+        elif identifier == 3:
+            type_indices = reader.vector(reader.uleb)
+        elif identifier == 5:
+            def one_memory() -> int:
+                flags = reader.octet()
+                minimum = reader.uleb()
+                if flags:
+                    reader.uleb()
+                return minimum
+
+            memories = reader.vector(one_memory)
+            pages = memories[0] if memories else 1
+        elif identifier == 6:
+            def one_global() -> int:
+                reader.octet()
+                reader.octet()
+                if reader.octet() != 0x41:
+                    raise WasmDecodeError("only i32.const initialisers are read")
+                value = reader.sleb() & MASK32
+                if reader.octet() != 0x0B:
+                    raise WasmDecodeError("global initialiser does not end")
+                return value
+
+            globals_ = reader.vector(one_global)
+        elif identifier == 7:
+            def one_export() -> None:
+                name = reader.take(reader.uleb()).decode()
+                exports[name] = (reader.octet(), reader.uleb())
+
+            reader.vector(one_export)
+        elif identifier == 10:
+            def one_body() -> tuple[tuple[int, ...], list[tuple]]:
+                stop = reader.uleb() + reader.at
+                declared: list[int] = []
+                for _ in range(reader.uleb()):
+                    count = reader.uleb()
+                    kind = reader.octet()
+                    declared.extend([kind] * count)
+                return tuple(declared), _resolve(_decode_body(reader, stop))
+
+            bodies = reader.vector(one_body)
+        else:
+            reader.take(size)
+        if reader.at != end:
+            raise WasmDecodeError(f"section {identifier} does not end where it says")
+
+    if len(type_indices) != len(bodies):
+        raise WasmDecodeError("the function and code sections disagree")
+    functions = [
+        WasmFunction(index, types[index], declared, code)
+        for index, (declared, code) in zip(type_indices, bodies)
+    ]
+    return DecodedModule(types, functions, pages, globals_, exports)
+
+
+# ----------------------------------------------------------------------
+# execution
+# ----------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _Frame:
+    """One open structure: where a branch to it lands, and how much it keeps."""
+
+    arity: int
+    target: int
+    end: int
+    height: int
+
+
+class WasmMachine:
+    """Runs the subset of the instruction set layer 19 emits, and no more."""
+
+    def __init__(self, module: DecodedModule) -> None:
+        self._module = module
+        self._memory = bytearray(module.pages * WASM_PAGE)
+
+    @property
+    def memory(self) -> bytearray:
+        return self._memory
+
+    def invoke(self, index: int, arguments: Sequence[int] = ()) -> list[int]:
+        function = self._module.functions[index]
+        if len(arguments) != len(function.signature.params):
+            raise WasmTrap(f"function {index} wants {len(function.signature.params)} argument(s)")
+        return self._run(function, [*arguments, *([0] * len(function.locals))])
+
+    def _run(self, function: WasmFunction, slots: list[int]) -> list[int]:
+        code = function.code
+        length = len(code)
+        results = len(function.signature.results)
+        memory = self._memory
+        stack: list[int] = []
+        frames: list[_Frame] = []
+        pc = 0
+
+        while pc < length:
+            opcode, immediate = code[pc]
+
+            if opcode == 0x20:                                    # local.get
+                stack.append(slots[immediate])
+            elif opcode == 0x21:                                  # local.set
+                slots[immediate] = stack.pop()
+            elif opcode == 0x41 or opcode == 0x42:                # i32/i64.const
+                stack.append(immediate)
+            elif opcode == 0x6A:                                  # i32.add
+                right = stack.pop()
+                stack[-1] = (stack[-1] + right) & MASK32
+            elif opcode == 0x6C:                                  # i32.mul
+                right = stack.pop()
+                stack[-1] = (stack[-1] * right) & MASK32
+            elif opcode == 0x2D:                                  # i32.load8_u
+                stack[-1] = memory[stack[-1] + immediate]
+            elif opcode == 0x3A:                                  # i32.store8
+                value = stack.pop()
+                memory[stack.pop() + immediate] = value & 0xFF
+            elif opcode == 0x0D:                                  # br_if
+                if stack.pop():
+                    pc = self._branch(frames, stack, immediate)
+                    if pc < 0:
+                        return stack[len(stack) - results:] if results else []
+                    continue
+            elif opcode == 0x0B:                                  # end
+                if frames:
+                    frames.pop()
+            elif opcode == 0x03:                                  # loop
+                # A branch to a loop lands on the loop itself, which opens it
+                # again; a branch leaves the structure it names either way.
+                block_type, _, end = immediate
+                frames.append(_Frame(0, pc, end, len(stack)))
+            elif opcode == 0x02:                                  # block
+                block_type, _, end = immediate
+                arity = 0 if block_type == 0x40 else 1
+                frames.append(_Frame(arity, end + 1, end, len(stack)))
+            elif opcode == 0x0C:                                  # br
+                pc = self._branch(frames, stack, immediate)
+                if pc < 0:
+                    return stack[len(stack) - results:] if results else []
+                continue
+            elif opcode == 0x04:                                  # if
+                block_type, else_at, end = immediate
+                condition = stack.pop()
+                arity = 0 if block_type == 0x40 else 1
+                frames.append(_Frame(arity, end + 1, end, len(stack)))
+                if not condition:
+                    pc = end if else_at is None else else_at + 1
+                    continue
+            elif opcode == 0x05:                                  # else
+                pc = frames[-1].end
+                continue
+            elif opcode == 0x10:                                  # call
+                callee = self._module.functions[immediate]
+                taken = len(callee.signature.params)
+                arguments = stack[len(stack) - taken:] if taken else []
+                del stack[len(stack) - taken:]
+                stack.extend(self.invoke(immediate, arguments))
+            elif opcode == 0x6B:                                  # i32.sub
+                right = stack.pop()
+                stack[-1] = (stack[-1] - right) & MASK32
+            elif opcode == 0x4E:                                  # i32.ge_s
+                right = _signed(stack.pop(), 32)
+                stack[-1] = 1 if _signed(stack[-1], 32) >= right else 0
+            elif opcode == 0x4A:                                  # i32.gt_s
+                right = _signed(stack.pop(), 32)
+                stack[-1] = 1 if _signed(stack[-1], 32) > right else 0
+            elif opcode == 0x48:                                  # i32.lt_s
+                right = _signed(stack.pop(), 32)
+                stack[-1] = 1 if _signed(stack[-1], 32) < right else 0
+            elif opcode == 0x7C:                                  # i64.add
+                right = stack.pop()
+                stack[-1] = (stack[-1] + right) & MASK64
+            elif opcode == 0x7D:                                  # i64.sub
+                right = stack.pop()
+                stack[-1] = (stack[-1] - right) & MASK64
+            elif opcode == 0x7E:                                  # i64.mul
+                right = stack.pop()
+                stack[-1] = (stack[-1] * right) & MASK64
+            elif opcode == 0x59:                                  # i64.ge_s
+                right = _signed(stack.pop(), 64)
+                stack[-1] = 1 if _signed(stack[-1], 64) >= right else 0
+            elif opcode == 0x55:                                  # i64.gt_s
+                right = _signed(stack.pop(), 64)
+                stack[-1] = 1 if _signed(stack[-1], 64) > right else 0
+            elif opcode == 0x57:                                  # i64.le_s
+                right = _signed(stack.pop(), 64)
+                stack[-1] = 1 if _signed(stack[-1], 64) <= right else 0
+            elif opcode == 0x53:                                  # i64.lt_s
+                right = _signed(stack.pop(), 64)
+                stack[-1] = 1 if _signed(stack[-1], 64) < right else 0
+            elif opcode == 0x50:                                  # i64.eqz
+                stack[-1] = 1 if stack[-1] == 0 else 0
+            elif opcode == 0x45:                                  # i32.eqz
+                stack[-1] = 1 if stack[-1] == 0 else 0
+            elif opcode == 0xA7:                                  # i32.wrap_i64
+                stack[-1] &= MASK32
+            elif opcode == 0xAC:                                  # i64.extend_i32_s
+                stack[-1] = _signed(stack[-1], 32) & MASK64
+            elif opcode == 0x7F:                                  # i64.div_s
+                right = _signed(stack.pop(), 64)
+                left = _signed(stack[-1], 64)
+                if right == 0:
+                    raise WasmTrap("integer divide by zero")
+                quotient = abs(left) // abs(right)
+                stack[-1] = (
+                    -quotient if (left < 0) != (right < 0) else quotient
+                ) & MASK64
+            elif opcode == 0x81:                                  # i64.rem_s
+                right = _signed(stack.pop(), 64)
+                left = _signed(stack[-1], 64)
+                if right == 0:
+                    raise WasmTrap("integer remainder by zero")
+                remainder = abs(left) % abs(right)
+                stack[-1] = (-remainder if left < 0 else remainder) & MASK64
+            elif opcode == 0x85:                                  # i64.xor
+                right = stack.pop()
+                stack[-1] ^= right
+            elif opcode == 0x0E:                                  # br_table
+                targets, default = immediate
+                index = stack.pop()
+                depth = targets[index] if index < len(targets) else default
+                pc = self._branch(frames, stack, depth)
+                if pc < 0:
+                    return stack[len(stack) - results:] if results else []
+                continue
+            elif opcode == 0x23:                                  # global.get
+                stack.append(self._module.globals[immediate])
+            elif opcode == 0x0F:                                  # return
+                return stack[len(stack) - results:] if results else []
+            elif opcode == 0x1A:                                  # drop
+                stack.pop()
+            elif opcode == 0x00:                                  # unreachable
+                raise WasmTrap("the module reached an unreachable instruction")
+            else:
+                raise WasmTrap(f"opcode 0x{opcode:02x} is not one this runs")
+            pc += 1
+
+        return stack[len(stack) - results:] if results else []
+
+    @staticmethod
+    def _branch(frames: list[_Frame], stack: list[int], depth: int) -> int:
+        """Leaves ``depth`` structures; answers -1 when that leaves the function."""
+        if depth >= len(frames):
+            return -1
+        frame = frames[len(frames) - 1 - depth]
+        carried = stack[len(stack) - frame.arity:] if frame.arity else ()
+        del frames[len(frames) - 1 - depth:]
+        del stack[frame.height:]
+        stack.extend(carried)
+        return frame.target
+
+
+def execute_wasm(blob: bytes) -> str:
+    """Instantiates a module this file emitted and returns the text it wrote."""
+    module = decode_wasm(blob)
+    machine = WasmMachine(module)
+    length = machine.invoke(module.exports["render"][1])[0]
+    offset = module.globals[module.exports["output"][1]]
+    return machine.memory[offset : offset + length].decode()
+
+
+# ======================================================================
 # driver
 # ======================================================================
 
@@ -11862,14 +12343,17 @@ def _selftest(orders: Sequence[int]) -> int:
                 tiers.append(("elf", _run(binary, "").removesuffix("\n")))
         except (GlyphPlatformError, OSError) as exc:
             print(f"  n={order:<3} elf tier skipped: {exc}", file=sys.stderr)
+        blob = wasm_module(artifacts.module)
         try:
             if wasm_host() is None:
                 raise OSError("no WebAssembly host is installed")
             with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
-                blob = write_wasm(artifacts.module, Path(scratch) / "glyph.wasm")
-                tiers.append(("wasm", run_wasm(blob).removesuffix("\n")))
+                path = Path(scratch) / "glyph.wasm"
+                path.write_bytes(blob)
+                tiers.append(("wasm", run_wasm(path).removesuffix("\n")))
         except (GlyphPlatformError, OSError, subprocess.CalledProcessError) as exc:
             print(f"  n={order:<3} wasm tier skipped: {exc}", file=sys.stderr)
+        tiers.append(("read-back", execute_wasm(blob).removesuffix("\n")))
         witness = REFERENCE_DIGESTS.get(order)
         names = ["tier0"] if witness is not None else []
         if witness is None:
@@ -11977,6 +12461,7 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     wasm = parser.add_argument_group("tier 6: WebAssembly, no host but an engine")
     wasm.add_argument("--emit-wasm", metavar="PATH", help="write a reactor module")
+    wasm.add_argument("--run-wasm", metavar="PATH", help="run one, reading it back here")
 
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
@@ -12058,6 +12543,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 namespace.emit_gsl2
             ]
         )
+        return 0
+    if namespace.run_wasm:
+        sys.stdout.write(execute_wasm(Path(namespace.run_wasm).read_bytes()))
         return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))

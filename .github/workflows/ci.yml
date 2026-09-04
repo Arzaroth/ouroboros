@@ -56,6 +56,9 @@ jobs:
           python -c "import ouroboros, pathlib; pathlib.Path('run.js').write_text(ouroboros.WASM_HOST_SCRIPT)"
           diff <(node run.js glyph.wasm) <(python ouroboros.py)
 
+      - name: the same module again, with no engine at all
+        run: diff <(python ouroboros.py --run-wasm glyph.wasm) <(python ouroboros.py)
+
   toolchain:
     name: llvm, the bootstrap and the closed loop
     runs-on: ubuntu-latest
