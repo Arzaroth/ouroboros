@@ -2211,6 +2211,78 @@ INFIX_TABLE: Final[Mapping[TokenKind, InfixOperatorSpec]] = {
 }
 
 
+# ----------------------------------------------------------------------
+# The statement forms, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# Each form is a run of steps: expect a keyword or a kind of token, take an
+# identifier or an integer or a member of an enumeration, descend for an
+# expression or a run or a body, and at the end build a node out of whatever
+# was taken.  The position a node carries is the first token the form
+# consumed.  Expressions are not here: they climb by the binding powers the
+# surface image already carries.
+
+PARSER_IMAGE: Final[str] = (
+    "let binding stroke emit emission paint painting for iteration lattice kw"
+    " order expr tok SEMICOLON make LatticeDeclaration symmetry enum "
+    "SymmetryFamily family int about centroid SymmetryDeclaration id EQUALS "
+    "Binding run StrokeDeclaration Emission Painting in RANGE LEFT_BRACE body"
+    " RIGHT_BRACE Iteration Orientation orientation at span Run~0.1,2.2,3.4,5"
+    ".6,7.8~9:a.9|a.b|c|d.e|f.g,h:a.h|i.j.h.k|l|a.m|a.n|d.e|f.o,1:a.0|p|d.q|c"
+    "|d.e|f.r,2:a.2|p|d.q|s|d.e|f.t,4:a.3|p|d.e|f.u,6:a.5|s|d.e|f.v,8:a.7|p|a"
+    ".w|c|d.x|c|d.y|z.10|d.10|f.11,s:i.12.13|a.14|c|a.15|c|d.x|c|f.16"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ParserImage:
+    """What the image stands for: which keyword opens which form, and each."""
+
+    statements: Mapping[str, str]
+    forms: Mapping[str, tuple[tuple[str, ...], ...]]
+
+
+def compile_parser(image: str) -> ParserImage:
+    """Reads an image back into the forms layer 5 descends by."""
+    try:
+        vocabulary, statements, forms = image.split("~")
+    except ValueError as exc:
+        raise SyntaxError_("the image does not have three sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise SyntaxError_(f"{code!r} addresses no word") from exc
+
+    return ParserImage(
+        {at(a): at(b) for a, b in (r.split(".") for r in statements.split(","))},
+        {
+            at(head): tuple(
+                tuple(at(t) for t in step.split(".")) for step in body.split("|")
+            )
+            for head, _, body in (r.partition(":") for r in forms.split(","))
+        },
+    )
+
+
+PARSER: Final[ParserImage] = compile_parser(PARSER_IMAGE)
+
+NODE_BY_NAME: Final[Mapping[str, type]] = {
+    node.__name__: node
+    for node in (
+        LatticeDeclaration, SymmetryDeclaration, Binding, StrokeDeclaration,
+        Emission, Painting, Iteration, Run,
+    )
+}
+
+ENUM_BY_NAME: Final[Mapping[str, type[enum.Enum]]] = {
+    "SymmetryFamily": SymmetryFamily,
+    "Orientation": Orientation,
+}
+
+
 class RecursiveDescentParser:
     """Recursive descent for statements, precedence climbing for expressions."""
 
@@ -2221,33 +2293,53 @@ class RecursiveDescentParser:
     @woven
     def parse(self) -> Program:
         with TRACER.span("parse"):
-            lattice = self._parse_lattice()
-            symmetry = self._parse_symmetry()
+            lattice = self._parse_form("lattice")
+            symmetry = self._parse_form("symmetry")
             body = self._parse_body(terminator=TokenKind.END_OF_INPUT)
             self._stream.expect(TokenKind.END_OF_INPUT)
             return Program(lattice, symmetry, body)
 
-    def _parse_lattice(self) -> LatticeDeclaration:
-        token = self._stream.expect(TokenKind.KEYWORD, "lattice")
-        self._stream.expect(TokenKind.KEYWORD, "order")
-        order = self._parse_expression()
-        self._stream.expect(TokenKind.SEMICOLON)
-        return LatticeDeclaration(order, token.position)
-
-    def _parse_symmetry(self) -> SymmetryDeclaration:
-        token = self._stream.expect(TokenKind.KEYWORD, "symmetry")
-        family_token = self._stream.expect(TokenKind.KEYWORD)
+    def _member(self, names: Sequence[str], token: Token) -> enum.Enum:
         try:
-            family = SymmetryFamily(family_token.lexeme)
+            return ENUM_BY_NAME[names[0]](token.lexeme)
         except ValueError as exc:
+            what = " ".join(names[1:])
             raise SyntaxError_(
-                f"{family_token.position}: unknown symmetry family {family_token.lexeme!r}"
+                f"{token.position}: unknown {what} {token.lexeme!r}"
             ) from exc
-        cardinality = self._stream.expect(TokenKind.INTEGER).value
-        self._stream.expect(TokenKind.KEYWORD, "about")
-        self._stream.expect(TokenKind.KEYWORD, "centroid")
-        self._stream.expect(TokenKind.SEMICOLON)
-        return SymmetryDeclaration(family, cardinality, token.position)
+
+    def _parse_form(self, form: str) -> AstNode:
+        """Runs one form, and answers the node its last step builds."""
+        taken: list[Any] = []
+        position: SourcePosition | None = None
+        for code, *arguments in PARSER.forms[form]:
+            token: Token | None = None
+            if code == "kw":
+                token = self._stream.expect(TokenKind.KEYWORD, arguments[0])
+            elif code == "tok":
+                token = self._stream.expect(TokenKind[arguments[0]])
+            elif code == "id":
+                token = self._stream.expect(TokenKind.IDENTIFIER)
+                taken.append(token.lexeme)
+            elif code == "int":
+                token = self._stream.expect(TokenKind.INTEGER)
+                taken.append(token.value)
+            elif code == "enum":
+                token = self._stream.expect(TokenKind.KEYWORD)
+                taken.append(self._member(arguments, token))
+            elif code == "expr":
+                taken.append(self._parse_expression())
+            elif code == "run":
+                taken.append(self._parse_form("run"))
+            elif code == "body":
+                taken.append(self._parse_body(terminator=TokenKind[arguments[0]]))
+            elif code == "make":
+                return NODE_BY_NAME[arguments[0]](*taken, position)
+            else:  # pragma: no cover - defensive
+                raise SyntaxError_(f"{code!r} is not a step this takes")
+            if position is None and token is not None:
+                position = token.position
+        raise SyntaxError_(f"the form {form!r} builds nothing")  # pragma: no cover
 
     def _parse_body(self, terminator: TokenKind) -> tuple[AstNode, ...]:
         statements: list[AstNode] = []
@@ -2257,78 +2349,19 @@ class RecursiveDescentParser:
 
     def _parse_statement(self) -> AstNode:
         token = self._stream.peek()
-        dispatch: Mapping[str, Callable[[], AstNode]] = {
-            "let": self._parse_binding,
-            "stroke": self._parse_stroke,
-            "emit": self._parse_emission,
-            "paint": self._parse_painting,
-            "for": self._parse_iteration,
-        }
-        handler = dispatch.get(token.lexeme) if token.kind is TokenKind.KEYWORD else None
-        if handler is None:
+        form = (
+            PARSER.statements.get(token.lexeme)
+            if token.kind is TokenKind.KEYWORD
+            else None
+        )
+        if form is None:
             self._diagnostics.emit(
                 Severity.FATAL, "SY0002", "diag.unexpected_token", token.position,
                 expected="a statement keyword", found=str(token),
             )
             self._stream.synchronise(STATEMENT_ANCHORS)
             raise SyntaxError_(f"{token.position}: {token} cannot begin a statement")
-        return handler()
-
-    def _parse_binding(self) -> Binding:
-        token = self._stream.expect(TokenKind.KEYWORD, "let")
-        name = self._stream.expect(TokenKind.IDENTIFIER).lexeme
-        self._stream.expect(TokenKind.EQUALS)
-        value = self._parse_expression()
-        self._stream.expect(TokenKind.SEMICOLON)
-        return Binding(name, value, token.position)
-
-    def _parse_stroke(self) -> StrokeDeclaration:
-        token = self._stream.expect(TokenKind.KEYWORD, "stroke")
-        name = self._stream.expect(TokenKind.IDENTIFIER).lexeme
-        self._stream.expect(TokenKind.EQUALS)
-        run = self._parse_run()
-        self._stream.expect(TokenKind.SEMICOLON)
-        return StrokeDeclaration(name, run, token.position)
-
-    def _parse_emission(self) -> Emission:
-        token = self._stream.expect(TokenKind.KEYWORD, "emit")
-        name = self._stream.expect(TokenKind.IDENTIFIER).lexeme
-        self._stream.expect(TokenKind.SEMICOLON)
-        return Emission(name, token.position)
-
-    def _parse_painting(self) -> Painting:
-        token = self._stream.expect(TokenKind.KEYWORD, "paint")
-        run = self._parse_run()
-        self._stream.expect(TokenKind.SEMICOLON)
-        return Painting(run, token.position)
-
-    def _parse_iteration(self) -> Iteration:
-        token = self._stream.expect(TokenKind.KEYWORD, "for")
-        variable = self._stream.expect(TokenKind.IDENTIFIER).lexeme
-        self._stream.expect(TokenKind.KEYWORD, "in")
-        lower = self._parse_expression()
-        self._stream.expect(TokenKind.RANGE)
-        upper = self._parse_expression()
-        self._stream.expect(TokenKind.LEFT_BRACE)
-        body = self._parse_body(terminator=TokenKind.RIGHT_BRACE)
-        self._stream.expect(TokenKind.RIGHT_BRACE)
-        return Iteration(variable, lower, upper, body, token.position)
-
-    def _parse_run(self) -> Run:
-        token = self._stream.expect(TokenKind.KEYWORD)
-        try:
-            orientation = Orientation(token.lexeme)
-        except ValueError as exc:
-            raise SyntaxError_(
-                f"{token.position}: unknown orientation {token.lexeme!r}"
-            ) from exc
-        self._stream.expect(TokenKind.KEYWORD, "at")
-        index = self._parse_expression()
-        self._stream.expect(TokenKind.KEYWORD, "span")
-        lower = self._parse_expression()
-        self._stream.expect(TokenKind.RANGE)
-        upper = self._parse_expression()
-        return Run(orientation, index, lower, upper, token.position)
+        return self._parse_form(form)
 
     def _parse_expression(self, minimum_precedence: int = 0) -> AstNode:
         left = self._parse_prefix()
@@ -2559,6 +2592,57 @@ class ConstantEvaluator(AstVisitor[int]):
     visit_program = _reject
 
 
+# ----------------------------------------------------------------------
+# Analysis, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# A program per kind of node again, though the opcodes here earn their keep
+# less evenly than the ones lowering uses: half are read by several nodes and
+# half by exactly one, because what a declaration has to check is particular
+# to that declaration.  The sequence is the part that is data.
+
+ANALYSIS_IMAGE: Final[str] = (
+    "Program visit lattice symmetry intrinsics each body answer UNIT "
+    "LatticeDeclaration order SymmetryDeclaration cardinality Binding fresh "
+    "value bind BINDING name StrokeDeclaration stroke run strokes Emission "
+    "use STROKE Painting Iteration int lower upper push for- variable "
+    "INDUCTION Run index IntegerLiteral INT SymbolReference deny answer-of "
+    "UnaryOperation operand BinaryOperation left right~0:1.2|1.3|4|5.6|7.8,9:"
+    "a|7.8,b:c|7.8,d:e.f|g.h.i|7.8,j:k.l|m|7.8,n:o.p|7.8,q:k.l|7.8,r:s.t|s.u|"
+    "v.w.x|g.y.x|5.6|7.8,z:s.10|s.t|s.u|7.p,11:7.12,13:14.p|15,16:s.17|7.12,1"
+    "8:s.19|s.1a|7.12"
+)
+
+
+def compile_analysis(image: str) -> Mapping[str, tuple[tuple[str, ...], ...]]:
+    """Reads an image back into the programs layer 6 runs."""
+    try:
+        vocabulary, programs = image.split("~")
+    except ValueError as exc:
+        raise SemanticError("the image does not have two sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise SemanticError(f"{code!r} addresses no word") from exc
+
+    return {
+        at(head): tuple(
+            tuple(at(t) for t in step.split(".")) for step in body.split("|")
+        )
+        for head, _, body in (r.partition(":") for r in programs.split(","))
+    }
+
+
+ANALYSIS: Final[Mapping[str, tuple[tuple[str, ...], ...]]] = compile_analysis(ANALYSIS_IMAGE)
+
+TYPE_BY_NAME: Final[Mapping[str, TypeTerm]] = {
+    "INT": INT_TYPE, "STROKE": STROKE_TYPE, "UNIT": UNIT_TYPE,
+}
+
+
 class SemanticAnalyzer(AstVisitor[TypeTerm]):
     """Resolves names, allocates frame slots and infers (all four) types."""
 
@@ -2585,102 +2669,107 @@ class SemanticAnalyzer(AstVisitor[TypeTerm]):
         self._model.types[id(node)] = str(self._unifier.resolve(term))
         return term
 
-    def visit_program(self, node: Program) -> TypeTerm:
-        self.visit(node.lattice)
-        self.visit(node.symmetry)
-        for name in INTRINSIC_NAMES:
-            self._scope.declare(Symbol(name, SymbolKind.INTRINSIC, INT_TYPE))
-        for statement in node.body:
-            self.visit(statement)
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_lattice_declaration(self, node: LatticeDeclaration) -> TypeTerm:
-        order = ConstantEvaluator({}).visit(node.order)
-        if order <= 0 or order % 2 == 0:
-            self._diagnostics.emit(
-                Severity.FATAL, "SE0003", "diag.bad_order", node.position, order=order
-            )
-            raise SemanticError(f"{node.position}: illegal lattice order {order}")
-        self._model.order = order
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_symmetry_declaration(self, node: SymmetryDeclaration) -> TypeTerm:
-        if node.cardinality != 4:
-            raise SemanticError(
-                f"{node.position}: this platform only implements 4-fold symmetry, "
-                f"got {node.cardinality}"
-            )
-        self._model.family = node.family
-        self._model.cardinality = node.cardinality
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_binding(self, node: Binding) -> TypeTerm:
-        value_type = self.visit(node.value)
-        variable = self._unifier.fresh()
-        self._unifier.unify(variable, value_type)
-        self._unifier.unify(variable, INT_TYPE)
-        symbol = Symbol(node.name, SymbolKind.BINDING, INT_TYPE, self._allocate())
-        self._scope.declare(symbol, node.position)
-        self._model.resolutions[id(node)] = symbol
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_stroke_declaration(self, node: StrokeDeclaration) -> TypeTerm:
-        run_type = self.visit(node.run)
-        self._unifier.unify(run_type, STROKE_TYPE)
-        self._scope.declare(
-            Symbol(node.name, SymbolKind.STROKE, STROKE_TYPE, run=node.run), node.position
-        )
-        self._model.strokes[node.name] = node.run
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_emission(self, node: Emission) -> TypeTerm:
-        symbol = self._scope.resolve(node.name, node.position)
-        if symbol.kind is not SymbolKind.STROKE:
-            raise SemanticError(f"{node.position}: {node.name!r} is not a stroke")
-        self._model.resolutions[id(node)] = symbol
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_painting(self, node: Painting) -> TypeTerm:
-        self._unifier.unify(self.visit(node.run), STROKE_TYPE)
-        return self._annotate(node, UNIT_TYPE)
-
-    def visit_iteration(self, node: Iteration) -> TypeTerm:
-        self._unifier.unify(self.visit(node.lower), INT_TYPE)
-        self._unifier.unify(self.visit(node.upper), INT_TYPE)
-        outer, self._scope = self._scope, self._scope.child(f"for-{node.variable}")
-        symbol = Symbol(node.variable, SymbolKind.INDUCTION, INT_TYPE, self._allocate())
-        self._scope.declare(symbol, node.position)
-        self._model.resolutions[id(node)] = symbol
+    def _dispatch(self, node: AstNode) -> TypeTerm:
+        resolved: Symbol | None = None
+        outer: list[LexicalScope] = []
         try:
-            for statement in node.body:
-                self.visit(statement)
+            for code, *arguments in ANALYSIS.get(type(node).__name__, ()):
+                if code == "visit":
+                    self.visit(getattr(node, arguments[0]))
+                elif code == "int":
+                    self._unifier.unify(self.visit(getattr(node, arguments[0])), INT_TYPE)
+                elif code == "stroke":
+                    self._unifier.unify(self.visit(getattr(node, arguments[0])), STROKE_TYPE)
+                elif code == "each":
+                    for statement in getattr(node, arguments[0]):
+                        self.visit(statement)
+                elif code == "push":
+                    outer.append(self._scope)
+                    self._scope = self._scope.child(
+                        arguments[0] + getattr(node, arguments[1])
+                    )
+                elif code == "fresh":
+                    value_type = self.visit(getattr(node, arguments[0]))
+                    variable = self._unifier.fresh()
+                    self._unifier.unify(variable, value_type)
+                    self._unifier.unify(variable, INT_TYPE)
+                elif code == "bind":
+                    symbol = Symbol(
+                        getattr(node, arguments[1]),
+                        SymbolKind[arguments[0]],
+                        INT_TYPE,
+                        self._allocate(),
+                    )
+                    self._scope.declare(symbol, node.position)
+                    self._model.resolutions[id(node)] = symbol
+                elif code == "intrinsics":
+                    for name in INTRINSIC_NAMES:
+                        self._scope.declare(Symbol(name, SymbolKind.INTRINSIC, INT_TYPE))
+                elif code == "order":
+                    order = ConstantEvaluator({}).visit(node.order)
+                    if order <= 0 or order % 2 == 0:
+                        self._diagnostics.emit(
+                            Severity.FATAL, "SE0003", "diag.bad_order",
+                            node.position, order=order,
+                        )
+                        raise SemanticError(
+                            f"{node.position}: illegal lattice order {order}"
+                        )
+                    self._model.order = order
+                elif code == "cardinality":
+                    if node.cardinality != 4:
+                        raise SemanticError(
+                            f"{node.position}: this platform only implements 4-fold "
+                            f"symmetry, got {node.cardinality}"
+                        )
+                    self._model.family = node.family
+                    self._model.cardinality = node.cardinality
+                elif code == "strokes":
+                    self._scope.declare(
+                        Symbol(node.name, SymbolKind.STROKE, STROKE_TYPE, run=node.run),
+                        node.position,
+                    )
+                    self._model.strokes[node.name] = node.run
+                elif code == "use":
+                    resolved = self._scope.resolve(node.name, node.position)
+                    if resolved.kind is not SymbolKind[arguments[0]]:
+                        raise SemanticError(
+                            f"{node.position}: {node.name!r} is not a stroke"
+                        )
+                    self._model.resolutions[id(node)] = resolved
+                elif code == "deny":
+                    resolved = self._scope.resolve(node.name, node.position)
+                    if resolved.kind is SymbolKind[arguments[0]]:
+                        raise SemanticError(
+                            f"{node.position}: strokes are not first-class values"
+                        )
+                    self._model.resolutions[id(node)] = resolved
+                elif code == "answer":
+                    return self._annotate(node, TYPE_BY_NAME[arguments[0]])
+                elif code == "answer-of":
+                    return self._annotate(node, typing.cast(Symbol, resolved).type_term)
+                else:  # pragma: no cover - defensive
+                    raise SemanticError(f"{code!r} is not an opcode this runs")
         finally:
-            self._scope = outer
-        return self._annotate(node, UNIT_TYPE)
+            if outer:
+                self._scope = outer[0]
+        raise SemanticError(  # pragma: no cover - defensive
+            f"the program for {type(node).__name__} answers nothing"
+        )
 
-    def visit_run(self, node: Run) -> TypeTerm:
-        for component in (node.index, node.lower, node.upper):
-            self._unifier.unify(self.visit(component), INT_TYPE)
-        return self._annotate(node, STROKE_TYPE)
-
-    def visit_integer_literal(self, node: IntegerLiteral) -> TypeTerm:
-        return self._annotate(node, INT_TYPE)
-
-    def visit_symbol_reference(self, node: SymbolReference) -> TypeTerm:
-        symbol = self._scope.resolve(node.name, node.position)
-        if symbol.kind is SymbolKind.STROKE:
-            raise SemanticError(f"{node.position}: strokes are not first-class values")
-        self._model.resolutions[id(node)] = symbol
-        return self._annotate(node, symbol.type_term)
-
-    def visit_unary_operation(self, node: UnaryOperation) -> TypeTerm:
-        self._unifier.unify(self.visit(node.operand), INT_TYPE)
-        return self._annotate(node, INT_TYPE)
-
-    def visit_binary_operation(self, node: BinaryOperation) -> TypeTerm:
-        self._unifier.unify(self.visit(node.left), INT_TYPE)
-        self._unifier.unify(self.visit(node.right), INT_TYPE)
-        return self._annotate(node, INT_TYPE)
+    visit_program = _dispatch
+    visit_lattice_declaration = _dispatch
+    visit_symmetry_declaration = _dispatch
+    visit_binding = _dispatch
+    visit_stroke_declaration = _dispatch
+    visit_emission = _dispatch
+    visit_painting = _dispatch
+    visit_iteration = _dispatch
+    visit_run = _dispatch
+    visit_integer_literal = _dispatch
+    visit_symbol_reference = _dispatch
+    visit_unary_operation = _dispatch
+    visit_binary_operation = _dispatch
 
 
 # ======================================================================
@@ -3443,6 +3532,53 @@ def _packed(layout: str, value: int, field: str) -> bytes:
         ) from exc
 
 
+# ----------------------------------------------------------------------
+# The container's header, as one image compiled at import
+# ----------------------------------------------------------------------
+#
+# The layout was stated twice: once as the fields the encoder wrote in order
+# and once as the format the decoder unpacked them with.  It is stated here
+# instead, and both directions are read off it - the format string is the
+# codes joined, and the names are what the decoder unpacks into.
+
+CONTAINER_IMAGE: Final[str] = (
+    "4s magic B version container H order lattice family symmetry cardinality"
+    " frame size~0.1.1,2.3.4.3,5.6.7.6,2.8.9.8,2.a.9.a,5.b.b.c"
+)
+
+
+def compile_container(image: str) -> tuple[tuple[str, str, str], ...]:
+    """Reads an image back into the fields the container's header carries."""
+    try:
+        vocabulary, fields = image.split("~")
+    except ValueError as exc:
+        raise ObjectFormatError("the image does not have two sections") from exc
+    words = vocabulary.split(" ")
+
+    def at(code: str) -> str:
+        try:
+            return words[int(code, 36)]
+        except (ValueError, IndexError) as exc:
+            raise ObjectFormatError(f"{code!r} addresses no word") from exc
+
+    return tuple(
+        (at(parts[0]), at(parts[1]), " ".join(at(part) for part in parts[2:]))
+        for parts in (record.split(".") for record in fields.split(","))
+    )
+
+
+CONTAINER_HEADER: Final[tuple[tuple[str, str, str], ...]] = compile_container(CONTAINER_IMAGE)
+
+HEADER_SOURCES: Final[Mapping[str, Callable[["ObjectModule"], Any]]] = {
+    "magic": lambda module: OBJECT_MAGIC,
+    "version": lambda module: OBJECT_FORMAT_VERSION,
+    "order": lambda module: module.order,
+    "family": lambda module: list(SymmetryFamily).index(module.family),
+    "cardinality": lambda module: module.cardinality,
+    "frame": lambda module: module.frame_size,
+}
+
+
 class ObjectCodec:
     """Serialises and reloads modules through a checksummed binary container.
 
@@ -3453,7 +3589,7 @@ class ObjectCodec:
         crc32(I)
     """
 
-    _HEADER = struct.Struct("<4sBHBBH")
+    _HEADER = struct.Struct("<" + "".join(code for code, _, _ in CONTAINER_HEADER))
 
     @woven
     def encode(self, module: ObjectModule) -> bytes:
@@ -3479,14 +3615,8 @@ class ObjectCodec:
             encoded.append((instruction.opcode, argument))
 
         buffer = io.BytesIO()
-        buffer.write(OBJECT_MAGIC)
-        buffer.write(_packed("<B", OBJECT_FORMAT_VERSION, "container version"))
-        buffer.write(_packed("<H", module.order, "lattice order"))
-        buffer.write(
-            _packed("<B", list(SymmetryFamily).index(module.family), "symmetry family")
-        )
-        buffer.write(_packed("<B", module.cardinality, "symmetry cardinality"))
-        buffer.write(_packed("<H", module.frame_size, "frame size"))
+        for code, source, label in CONTAINER_HEADER:
+            buffer.write(_packed("<" + code, HEADER_SOURCES[source](module), label))
         buffer.write(_packed("<H", len(constants), "constant pool size"))
         for value in constants:
             buffer.write(_packed("<i", value, "constant"))
@@ -3508,9 +3638,15 @@ class ObjectCodec:
         body, checksum = blob[:-4], struct.unpack("<I", blob[-4:])[0]
         if binascii.crc32(body) & 0xFFFFFFFF != checksum:
             raise ObjectFormatError("object blob failed its CRC-32 integrity check")
-        magic, version, order, family_index, cardinality, frame_size = self._HEADER.unpack(
-            body[: self._HEADER.size]
+        header = dict(
+            zip(
+                (source for _, source, _ in CONTAINER_HEADER),
+                self._HEADER.unpack(body[: self._HEADER.size]),
+            )
         )
+        magic, version = header["magic"], header["version"]
+        order, family_index = header["order"], header["family"]
+        cardinality, frame_size = header["cardinality"], header["frame"]
         if magic != OBJECT_MAGIC:
             raise ObjectFormatError(f"bad magic {magic!r}, expected {OBJECT_MAGIC!r}")
         if version != OBJECT_FORMAT_VERSION:
