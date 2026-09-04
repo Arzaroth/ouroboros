@@ -4965,8 +4965,20 @@ class LlvmToolchainService:
         parsed.verify()
         return parsed
 
-    def _target_machine(self) -> Any:
-        return self._binding.Target.from_default_triple().create_target_machine()
+    def _target_machine(self, *, jit: bool = False) -> Any:
+        """The machine to lower for, which is not the same one twice.
+
+        Objects go to a linker whose default is a position-independent
+        executable, so they are emitted small and PIC.  llvmlite's default code
+        model is the large one: it puts the text in ``.ltext`` with absolute
+        relocations, and the linker then warns its way around them and marks
+        the result DT_TEXTREL.  The JIT keeps that default, since it resolves
+        the addresses itself and never goes near a linker.
+        """
+        target = self._binding.Target.from_default_triple()
+        if jit:
+            return target.create_target_machine()
+        return target.create_target_machine(reloc="pic", codemodel="small")
 
     @woven
     def verify(self, module: LlvmModule) -> str:
@@ -4998,7 +5010,7 @@ class LlvmToolchainService:
         import ctypes
 
         binding = self._binding
-        machine = self._target_machine()
+        machine = self._target_machine(jit=True)
         parsed = self._parse(module)
         with binding.create_mcjit_compiler(parsed, machine) as engine:
             engine.finalize_object()
