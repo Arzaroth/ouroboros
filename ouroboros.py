@@ -2212,62 +2212,100 @@ INFIX_TABLE: Final[Mapping[TokenKind, InfixOperatorSpec]] = {
 
 
 # ----------------------------------------------------------------------
-# The statement forms, as one image compiled at import
+# The statement forms, derived from the productions
 # ----------------------------------------------------------------------
 #
-# Each form is a run of steps: expect a keyword or a kind of token, take an
-# identifier or an integer or a member of an enumeration, descend for an
-# expression or a run or a body, and at the end build a node out of whatever
-# was taken.  The position a node carries is the first token the form
-# consumed.  Expressions are not here: they climb by the binding powers the
-# surface image already carries.
+# The productions used to describe the syntax and something else used to
+# parse it, which left two descriptions free to drift apart.  The forms are
+# read off the productions now, so there is one description and the grammar
+# is the one that speaks.
+#
+# What cannot come off a production stays here: which node a nonterminal
+# builds, and which enumeration a symbol names along with what to call it
+# when the word is not one of its members.  Expressions are still climbed by
+# the binding powers the surface image carries, not descended by the
+# expression productions, because those are right recursive where the
+# operators are left associative.
 
-PARSER_IMAGE: Final[str] = (
-    "let binding stroke emit emission paint painting for iteration lattice kw"
-    " order expr tok SEMICOLON make LatticeDeclaration symmetry enum "
-    "SymmetryFamily family int about centroid SymmetryDeclaration id EQUALS "
-    "Binding run StrokeDeclaration Emission Painting in RANGE LEFT_BRACE body"
-    " RIGHT_BRACE Iteration Orientation orientation at span Run~0.1,2.2,3.4,5"
-    ".6,7.8~9:a.9|a.b|c|d.e|f.g,h:a.h|i.j.h.k|l|a.m|a.n|d.e|f.o,1:a.0|p|d.q|c"
-    "|d.e|f.r,2:a.2|p|d.q|s|d.e|f.t,4:a.3|p|d.e|f.u,6:a.5|s|d.e|f.v,8:a.7|p|a"
-    ".w|c|d.x|c|d.y|z.10|d.10|f.11,s:i.12.13|a.14|c|a.15|c|d.x|c|f.16"
-)
+FORM_BUILDS: Final[Mapping[str, str]] = {
+    "lattice": "LatticeDeclaration",
+    "symmetry": "SymmetryDeclaration",
+    "binding": "Binding",
+    "stroke": "StrokeDeclaration",
+    "emission": "Emission",
+    "painting": "Painting",
+    "iteration": "Iteration",
+    "run": "Run",
+}
+
+ENUM_FORMS: Final[Mapping[str, tuple[str, str]]] = {
+    "family": ("SymmetryFamily", "symmetry family"),
+    "orientation": ("Orientation", "orientation"),
+}
+
+DESCENDING_STEPS: Final[Mapping[str, str]] = {"expression": "expr", "run": "run"}
+
+TERMINAL_KINDS: Final[Mapping[str, str]] = {
+    **{mark: kind.name for mark, kind in PUNCTUATION.items()},
+    "..": "RANGE",
+}
 
 
-@dataclass(frozen=True, slots=True)
-class ParserImage:
-    """What the image stands for: which keyword opens which form, and each."""
-
-    statements: Mapping[str, str]
-    forms: Mapping[str, tuple[tuple[str, ...], ...]]
-
-
-def compile_parser(image: str) -> ParserImage:
-    """Reads an image back into the forms layer 5 descends by."""
+def _step_for(symbol: str, production: Sequence[str], position: int) -> tuple[str, ...]:
+    """The step a production symbol asks the parser to take."""
+    if symbol.startswith("'"):
+        literal = symbol[1:-1]
+        if literal in KEYWORDS:
+            return ("kw", literal)
+        return ("tok", TERMINAL_KINDS[literal])
+    if symbol == "IDENTIFIER":
+        return ("id",)
+    if symbol == "INTEGER":
+        return ("int",)
+    if symbol in ENUM_FORMS:
+        name, phrase = ENUM_FORMS[symbol]
+        return ("enum", name, *phrase.split(" "))
+    if symbol == "body":
+        closing = production[position + 1]
+        return ("body", TERMINAL_KINDS[closing[1:-1]])
     try:
-        vocabulary, statements, forms = image.split("~")
-    except ValueError as exc:
-        raise SyntaxError_("the image does not have three sections") from exc
-    words = vocabulary.split(" ")
+        return (DESCENDING_STEPS[symbol],)
+    except KeyError as exc:
+        raise SyntaxError_(f"no step descends for {symbol!r}") from exc
 
-    def at(code: str) -> str:
-        try:
-            return words[int(code, 36)]
-        except (ValueError, IndexError) as exc:
-            raise SyntaxError_(f"{code!r} addresses no word") from exc
 
-    return ParserImage(
-        {at(a): at(b) for a, b in (r.split(".") for r in statements.split(","))},
-        {
-            at(head): tuple(
-                tuple(at(t) for t in step.split(".")) for step in body.split("|")
+def derive_forms() -> Mapping[str, tuple[tuple[str, ...], ...]]:
+    """Each form, read off the single production of the nonterminal it builds."""
+    forms: dict[str, tuple[tuple[str, ...], ...]] = {}
+    for name, builds in FORM_BUILDS.items():
+        alternatives = GSL_GRAMMAR.get(name, ())
+        if len(alternatives) != 1:
+            raise SyntaxError_(
+                f"{name!r} has {len(alternatives)} production(s) and a form wants one"
             )
-            for head, _, body in (r.partition(":") for r in forms.split(","))
-        },
-    )
+        production = alternatives[0]
+        steps = [
+            _step_for(symbol, production, position)
+            for position, symbol in enumerate(production)
+        ]
+        steps.append(("make", builds))
+        forms[name] = tuple(steps)
+    return forms
 
 
-PARSER: Final[ParserImage] = compile_parser(PARSER_IMAGE)
+def derive_statements() -> Mapping[str, str]:
+    """Which keyword opens which form, from what a statement may be."""
+    opening: dict[str, str] = {}
+    for alternative in GSL_GRAMMAR["statement"]:
+        form = alternative[0]
+        if form not in FORM_BUILDS:
+            raise SyntaxError_(f"the statement {form!r} builds nothing")
+        opening[GSL_GRAMMAR[form][0][0][1:-1]] = form
+    return opening
+
+
+FORMS: Final[Mapping[str, tuple[tuple[str, ...], ...]]] = derive_forms()
+STATEMENT_FORMS: Final[Mapping[str, str]] = derive_statements()
 
 NODE_BY_NAME: Final[Mapping[str, type]] = {
     node.__name__: node
@@ -2283,65 +2321,25 @@ ENUM_BY_NAME: Final[Mapping[str, type[enum.Enum]]] = {
 }
 
 
-GRAMMAR_TERMINALS: Final[Mapping[str, str]] = {
-    **{kind.name: f"'{mark}'" for mark, kind in PUNCTUATION.items()},
-    "RANGE": "'..'",
-}
-
-STEP_SYMBOLS: Final[Mapping[str, str]] = {
-    "id": "IDENTIFIER",
-    "int": "INTEGER",
-    "expr": "expression",
-    "run": "run",
-    "body": "body",
-}
-
-ENUM_NONTERMINALS: Final[Mapping[str, str]] = {
-    "SymmetryFamily": "family",
-    "Orientation": "orientation",
-}
-
-
-def form_sentence(steps: Sequence[Sequence[str]]) -> tuple[str, ...]:
-    """The grammar symbols a form consumes, in the order it consumes them."""
-    sentence: list[str] = []
-    for code, *arguments in steps:
-        if code == "kw":
-            sentence.append(f"'{arguments[0]}'")
-        elif code == "tok":
-            sentence.append(GRAMMAR_TERMINALS[arguments[0]])
-        elif code == "enum":
-            sentence.append(ENUM_NONTERMINALS[arguments[0]])
-        elif code != "make":
-            sentence.append(STEP_SYMBOLS[code])
-    return tuple(sentence)
-
-
 def grammar_disagreements() -> tuple[str, ...]:
-    """Where the forms and the productions describe different languages.
+    """Where the grammar cannot be taken at its word.
 
-    Two descriptions of one syntax sit in the images and only one of them
-    parses: the forms are walked, and the productions are what FIRST and
-    FOLLOW - and so what a recovering parser reports against - are computed
-    from.  Nothing but this obliges them to agree, so nothing but this would
-    notice them drifting apart.
-
-    It settles which is authoritative not at all.  It only says they still
-    say the same thing.
+    The forms are read off the productions, so the two can no longer say
+    different things.  What is left to check is that the reading had one
+    answer to take: a nonterminal a form is built from must have exactly one
+    production, or the derivation quietly takes the first alternative and the
+    rest are never parsed.  ``derive_forms`` refuses that outright, so this
+    only reports it where a report is wanted rather than an exception.
     """
     found: list[str] = []
-    for name, steps in PARSER.forms.items():
-        if form_sentence(steps) not in GSL_GRAMMAR.get(name, ()):
-            found.append(f"no production admits the form {name!r}")
-    reachable = set(PARSER.statements.values())
-    alternatives = {alternative[0] for alternative in GSL_GRAMMAR["statement"]}
-    if reachable != alternatives:
-        found.append(
-            f"statements reach {sorted(reachable)} where the productions "
-            f"list {sorted(alternatives)}"
-        )
+    for name in FORM_BUILDS:
+        alternatives = GSL_GRAMMAR.get(name, ())
+        if len(alternatives) != 1:
+            found.append(f"{name!r} has {len(alternatives)} production(s), not one")
+    for alternative in GSL_GRAMMAR["statement"]:
+        if alternative[0] not in FORM_BUILDS:
+            found.append(f"the statement {alternative[0]!r} builds nothing")
     return tuple(found)
-
 
 
 class RecursiveDescentParser:
@@ -2373,7 +2371,7 @@ class RecursiveDescentParser:
         """Runs one form, and answers the node its last step builds."""
         taken: list[Any] = []
         position: SourcePosition | None = None
-        for code, *arguments in PARSER.forms[form]:
+        for code, *arguments in FORMS[form]:
             token: Token | None = None
             if code == "kw":
                 token = self._stream.expect(TokenKind.KEYWORD, arguments[0])
@@ -2411,7 +2409,7 @@ class RecursiveDescentParser:
     def _parse_statement(self) -> AstNode:
         token = self._stream.peek()
         form = (
-            PARSER.statements.get(token.lexeme)
+            STATEMENT_FORMS.get(token.lexeme)
             if token.kind is TokenKind.KEYWORD
             else None
         )
@@ -4657,6 +4655,27 @@ class MinimalMotif(Motif):
     term = applied("C", "L", "E", ROOT)
 
 
+# The two entries no operator relates, so the only seed written out in full.
+SLANT: Final[Any] = applied(
+    "L",
+    applied("R", "d", applied("U", "O"), "O", applied("N", applied("N", "O"))),
+    applied(
+        "L",
+        applied("R", "a", applied("N", applied("N", "O")), "O",
+                applied("N", applied("N", "O"))),
+        "E",
+    ),
+)
+
+
+class StatedMotif(Motif):
+    """Two entries neither of which follows from the other."""
+
+    __registry_key__ = "stated"
+    description = "two entries stated rather than derived, one of each remaining orientation"
+    term = SLANT
+
+
 class FoldedMotif(Motif):
     """The primary term under a group of twice the cardinality."""
 
@@ -5017,9 +5036,9 @@ class AssuranceSuite:
     def _forms_answer_to_grammar(artifacts: CompilationArtifacts) -> CheckResult:
         disagreements = grammar_disagreements()
         return CheckResult(
-            "forms answer to the grammar",
+            "the grammar answers for every form",
             not disagreements,
-            f"{len(PARSER.forms)} form(s), and the statements they reach"
+            f"{len(FORMS)} form(s), each with one production to read"
             if not disagreements
             else "; ".join(disagreements),
         )
