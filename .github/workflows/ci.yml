@@ -142,7 +142,16 @@ jobs:
       - name: the firmware loads the application and prints the same figure
         run: |
           python ouroboros.py --emit-efi glyph.efi
-          file glyph.efi | grep -q "EFI (application)"
+          python -c "
+          import pathlib
+          image = pathlib.Path('glyph.efi').read_bytes()
+          assert image[:2] == b'MZ', 'not an image'
+          pe = int.from_bytes(image[0x3c:0x40], 'little')
+          assert image[pe:pe+4] == b'PE\\x00\\x00', 'no PE signature'
+          assert int.from_bytes(image[pe+4:pe+6], 'little') == 0x8664, 'not x86-64'
+          assert int.from_bytes(image[pe+92:pe+94], 'little') == 10, 'not an application'
+          print('PE32+, x86-64, subsystem 10')
+          "
           python -c "
           import pathlib, ouroboros
           wanted = ouroboros.synthesize(7).unwrap_or_raise().rendering

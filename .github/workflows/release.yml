@@ -87,7 +87,16 @@ jobs:
           file "dist/glyph-$safe-linux-aarch64" | grep -q aarch64
           file "dist/glyph-$safe-linux-riscv64" | grep -q RISC-V
           file "dist/glyph-$safe.img" | grep -q "boot sector"
-          file "dist/glyph-$safe.efi" | grep -q "EFI (application)"
+          python - "dist/glyph-$safe.efi" <<'EOF'
+          import pathlib, sys
+          image = pathlib.Path(sys.argv[1]).read_bytes()
+          assert image[:2] == b"MZ", "not an image"
+          pe = int.from_bytes(image[0x3c:0x40], "little")
+          assert image[pe:pe + 4] == b"PE\x00\x00", "no PE signature"
+          assert int.from_bytes(image[pe + 4:pe + 6], "little") == 0x8664, "not x86-64"
+          assert int.from_bytes(image[pe + 92:pe + 94], "little") == 10, "not an application"
+          print("PE32+, x86-64, subsystem 10")
+          EOF
 
           # The same again for the one that asks for no Linux, through the
           # five lines of host the file carries.
