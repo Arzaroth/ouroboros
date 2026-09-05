@@ -13331,24 +13331,43 @@ def boot_image(module: ObjectModule) -> bytes:
     return boot_sector(sectors) + payload.ljust(sectors * SECTOR, b"\x00")
 
 
-FIRMWARE_CANDIDATES: Final[tuple[str, ...]] = (
-    "/usr/share/OVMF/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE_4M.fd",
-    "/usr/share/ovmf/OVMF.fd",
-    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-    "/usr/share/edk2-ovmf/OVMF_CODE.fd",
-    "/usr/share/qemu/edk2-x86_64-code.fd",
+FIRMWARE_CANDIDATES: Final[tuple[tuple[str, str], ...]] = (
+    ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+    ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+    ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+    ("/usr/share/edk2-ovmf/OVMF_CODE.fd", "/usr/share/edk2-ovmf/OVMF_VARS.fd"),
+    ("/usr/share/qemu/edk2-x86_64-code.fd", "/usr/share/qemu/edk2-i386-vars.fd"),
+    ("/usr/share/ovmf/OVMF.fd", ""),
+    ("/usr/share/qemu/OVMF.fd", ""),
 )
 
 ESCAPES: Final[Any] = re.compile(r"\x1b\[[0-9;=?]*[a-zA-Z]")
 
 
-def firmware() -> Path | None:
-    """Firmware to hand an image to, if any is installed."""
-    for candidate in FIRMWARE_CANDIDATES:
-        path = Path(candidate)
-        if path.exists():
-            return path
+def complaint(machine: "subprocess.Popen[bytes]") -> str:
+    """What a machine that stopped early said on its way out."""
+    said = machine.stderr.read().decode(errors="replace") if machine.stderr else ""
+    spoken = " ".join(said.split())
+    return spoken or f"exit status {machine.returncode}"
+
+
+def firmware() -> tuple[Path, Path | None] | None:
+    """Firmware to hand an image to, if any is installed.
+
+    Distributions ship it two ways: as one image, or as a pair whose halves
+    are the read-only half and the writable one.  Half a pair is not an
+    image and the emulator will not take it as one, so a pair is only
+    answered whole.
+    """
+    for code, store in FIRMWARE_CANDIDATES:
+        instructions = Path(code)
+        if not instructions.exists():
+            continue
+        if not store:
+            return instructions, None
+        variables = Path(store)
+        if variables.exists():
+            return instructions, variables
     return None
 
 
@@ -13364,18 +13383,29 @@ def run_efi(image: bytes, lines: int, patience: float = 40.0) -> str:
     installed = firmware()
     if emulator is None or installed is None:
         raise MachineCodeError("there is no firmware here to hand an image to")
+    instructions, variables = installed
     with tempfile.TemporaryDirectory(prefix="ouroboros-efi-") as scratch:
         volume = Path(scratch) / "esp" / "EFI" / "BOOT"
         volume.mkdir(parents=True)
         (volume / "BOOTX64.EFI").write_bytes(image)
         capture = Path(scratch) / "serial"
+        if variables is None:
+            seated = ["-bios", str(instructions)]
+        else:
+            writable = Path(scratch) / variables.name
+            shutil.copy(variables, writable)
+            seated = [
+                "-drive",
+                f"if=pflash,format=raw,unit=0,readonly=on,file={instructions}",
+                "-drive", f"if=pflash,format=raw,unit=1,file={writable}",
+            ]
         machine = subprocess.Popen(
             [
-                emulator, "-bios", str(installed),
+                emulator, *seated,
                 "-drive", f"file=fat:rw:{volume.parents[1]},format=raw",
                 "-display", "none", "-serial", f"file:{capture}", "-no-reboot",
             ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
             previous: list[str] | None = None
@@ -13388,8 +13418,15 @@ def run_efi(image: bytes, lines: int, patience: float = 40.0) -> str:
                     if len(settled) >= lines and settled == previous:
                         return "\n".join(settled[-lines:])
                     previous = settled
+                if machine.poll() is not None:
+                    raise MachineCodeError(
+                        f"the machine stopped of its own accord: "
+                        f"{complaint(machine)}"
+                    )
                 time.sleep(0.25)
-            raise MachineCodeError("the firmware printed no figure in time")
+            raise MachineCodeError(
+                f"the firmware printed no figure in {patience:g}s"
+            )
         finally:
             machine.kill()
             machine.wait()
@@ -13418,7 +13455,7 @@ def run_boot(image: Path, lines: int, patience: float = 20.0) -> str:
                 emulator, "-drive", f"format=raw,file={image}",
                 "-display", "none", "-serial", f"file:{capture}", "-no-reboot",
             ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
             deadline = time.monotonic() + patience
@@ -13427,6 +13464,11 @@ def run_boot(image: Path, lines: int, patience: float = 20.0) -> str:
                     written = capture.read_text(errors="replace")
                     if written.count("\n") >= lines:
                         return written
+                if machine.poll() is not None:
+                    raise MachineCodeError(
+                        f"the machine stopped of its own accord: "
+                        f"{complaint(machine)}"
+                    )
                 time.sleep(0.05)
             raise MachineCodeError(f"no {lines} lines left the machine in time")
         finally:
