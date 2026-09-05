@@ -73,6 +73,7 @@ jobs:
           python ouroboros.py --machine riscv64 --emit-elf "dist/glyph-$safe-linux-riscv64" > /dev/null
           python ouroboros.py --emit-wasm "dist/glyph-$safe.wasm" > /dev/null
           python ouroboros.py --emit-boot "dist/glyph-$safe.img" > /dev/null
+          python ouroboros.py --emit-efi "dist/glyph-$safe.efi" > /dev/null
           python ouroboros.py --emit-llvm > "dist/glyph-$safe.ll"
           python ouroboros.py --emit-gsl2 glyphc > "dist/glyphc-$safe.gsl2"
 
@@ -86,6 +87,7 @@ jobs:
           file "dist/glyph-$safe-linux-aarch64" | grep -q aarch64
           file "dist/glyph-$safe-linux-riscv64" | grep -q RISC-V
           file "dist/glyph-$safe.img" | grep -q "boot sector"
+          file "dist/glyph-$safe.efi" | grep -q "EFI (application)"
 
           # The same again for the one that asks for no Linux, through the
           # five lines of host the file carries.

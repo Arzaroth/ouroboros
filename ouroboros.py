@@ -93,6 +93,7 @@
     python3 ouroboros.py --machine aarch64 --emit-elf PATH   for the other one
     python3 ouroboros.py --emit-wasm PATH write a wasm reactor, no toolchain
     python3 ouroboros.py --emit-boot PATH write a disk that needs no kernel
+    python3 ouroboros.py --emit-efi PATH  the same text, for UEFI firmware
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
@@ -11533,6 +11534,19 @@ class X86Assembler:
     def halt(self) -> None:
         self._emit(0xF4)
 
+    def address_of_label(self, destination: Register, name: str) -> None:
+        """lea rd, [rip + disp32]: an address the loader chose, not this."""
+        self._emit(
+            0x48 | ((destination >> 3) & 1) << 2,
+            0x8D,
+            ((destination & 7) << 3) | 0x05,
+        )
+        self._displacement(name)
+
+    def call_indirect(self, through: MemoryOperand) -> None:
+        """call [mem]: the only way to reach a routine somebody else wrote."""
+        self._quad((0xFF,), 2, through)
+
     def out(self) -> None:
         """out dx, al: the one way out of a machine with no kernel."""
         self._emit(0xEE)
@@ -13317,6 +13331,70 @@ def boot_image(module: ObjectModule) -> bytes:
     return boot_sector(sectors) + payload.ljust(sectors * SECTOR, b"\x00")
 
 
+FIRMWARE_CANDIDATES: Final[tuple[str, ...]] = (
+    "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.fd",
+    "/usr/share/ovmf/OVMF.fd",
+    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+    "/usr/share/edk2-ovmf/OVMF_CODE.fd",
+    "/usr/share/qemu/edk2-x86_64-code.fd",
+)
+
+ESCAPES: Final[Any] = re.compile(r"\x1b\[[0-9;=?]*[a-zA-Z]")
+
+
+def firmware() -> Path | None:
+    """Firmware to hand an image to, if any is installed."""
+    for candidate in FIRMWARE_CANDIDATES:
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def run_efi(image: bytes, lines: int, patience: float = 40.0) -> str:
+    """Hands the image to firmware and answers the last lines it printed.
+
+    The firmware says a good deal before ours runs and dresses it in escapes,
+    so what comes back is the tail rather than the whole: as many lines as
+    the lattice has rows, once two readings a moment apart agree that nothing
+    more is coming.
+    """
+    emulator = shutil.which("qemu-system-x86_64")
+    installed = firmware()
+    if emulator is None or installed is None:
+        raise MachineCodeError("there is no firmware here to hand an image to")
+    with tempfile.TemporaryDirectory(prefix="ouroboros-efi-") as scratch:
+        volume = Path(scratch) / "esp" / "EFI" / "BOOT"
+        volume.mkdir(parents=True)
+        (volume / "BOOTX64.EFI").write_bytes(image)
+        capture = Path(scratch) / "serial"
+        machine = subprocess.Popen(
+            [
+                emulator, "-bios", str(installed),
+                "-drive", f"file=fat:rw:{volume.parents[1]},format=raw",
+                "-display", "none", "-serial", f"file:{capture}", "-no-reboot",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            previous: list[str] | None = None
+            deadline = time.monotonic() + patience
+            while time.monotonic() < deadline:
+                if capture.exists():
+                    settled = ESCAPES.sub(
+                        "", capture.read_text(errors="replace")
+                    ).splitlines()
+                    if len(settled) >= lines and settled == previous:
+                        return "\n".join(settled[-lines:])
+                    previous = settled
+                time.sleep(0.25)
+            raise MachineCodeError("the firmware printed no figure in time")
+        finally:
+            machine.kill()
+            machine.wait()
+
+
 def boot_runnable() -> bool:
     """Whether anything here can be asked to start a machine."""
     return shutil.which("qemu-system-x86_64") is not None
@@ -13354,6 +13432,160 @@ def run_boot(image: Path, lines: int, patience: float = 20.0) -> str:
         finally:
             machine.kill()
             machine.wait()
+
+
+# ----------------------------------------------------------------------
+# The same text again, for firmware that has already done the walking
+# ----------------------------------------------------------------------
+#
+# A machine whose firmware speaks UEFI is in long mode before anything of
+# ours runs, with memory mapped and a table of routines to call, so the
+# sector of real mode has nothing left to do and there is none.  What is
+# needed instead is a container the firmware will load and a way to reach
+# the one routine that prints.
+#
+# Where the data goes is the firmware's business rather than ours, so the
+# prologue asks where it was put: the image is loaded wherever the loader
+# liked and the region beyond the text is addressed from the instruction
+# pointer, which is the one thing that knows.
+
+EFI_SUBSYSTEM: Final[int] = 10
+EFI_CONSOLE_OUT: Final[int] = 64      # into the system table
+EFI_OUTPUT_STRING: Final[int] = 8     # into the protocol
+EFI_SECTION_ALIGN: Final[int] = 0x1000
+EFI_FILE_ALIGN: Final[int] = 0x200
+EFI_HEADER_SPAN: Final[int] = 0x200
+SYSTEM_TABLE: Final[Register] = Register.RBX
+SAVED_STACK: Final[Register] = Register.RBP
+
+
+class EfiCodeBackend(NativeCodeBackend):
+    """The same text as layer 18, for firmware that boots it directly.
+
+    The instruction stream and the runtime are untouched again.  What differs
+    is that nothing here chooses an address - the loader did - and that the
+    octets leave through a routine the firmware owns, reached through two
+    pointers and called the way a caller from another language must call it,
+    with a shadow of the stack reserved and the stack aligned.
+    """
+
+    def __init__(self, module: ObjectModule) -> None:
+        super().__init__(module)
+        span = 2 * self._cells + self._order + 16
+        self.wide = self._layout.size
+        self.reserve = self._layout.size + 4 * span + 8
+
+    def _prologue(self, text: X86Assembler) -> None:
+        text.load(SYSTEM_TABLE, Register.RDX)
+        text.address_of_label(DATA_REGISTER, "reserved")
+        text.arithmetic("xor", Register.RCX, Register.RCX)
+        text.label("wipe.head")
+        text.arithmetic_immediate("cmp", Register.RCX, self.reserve)
+        text.jump_if("ge", "wipe.done")
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RCX, 1, 0), 0
+        )
+        text.increment(Register.RCX)
+        text.jump("wipe.head")
+        text.label("wipe.done")
+
+    def _epilogue(self, text: X86Assembler) -> None:
+        text.label("stop")
+        text.halt()
+        text.jump("stop")
+
+    def _flush(self, text: X86Assembler) -> None:
+        text.call("utter")
+
+    def _appendix(self, text: X86Assembler) -> None:
+        """utter: widen the buffer, and hand it to the routine that prints.
+
+        Nothing here writes to the port directly.  The firmware owns the
+        console and will put the octets wherever it has been told to; going
+        round it would only mean saying everything twice.
+        """
+        text.label("utter")
+        text.arithmetic("xor", Register.RSI, Register.RSI)
+        text.arithmetic("xor", Register.RDI, Register.RDI)
+        text.label("utter.head")
+        text.arithmetic("cmp", Register.RSI, Register.R14)
+        text.jump_if("ge", "utter.tail")
+        text.arithmetic("xor", Register.RAX, Register.RAX)
+        text.load_octet(
+            Register.RAX,
+            MemoryOperand(DATA_REGISTER, Register.RSI, 1, self._layout.output),
+        )
+        text.arithmetic_immediate("cmp", Register.RAX, ord("\n"))
+        text.jump_if("ne", "utter.plain")
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RDI, 1, self.wide), 0x0D
+        )
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RDI, 1, self.wide + 1), 0
+        )
+        text.arithmetic_immediate("add", Register.RDI, 2)
+        text.label("utter.plain")
+        text.store_octet(
+            MemoryOperand(DATA_REGISTER, Register.RDI, 1, self.wide), Register.RAX
+        )
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RDI, 1, self.wide + 1), 0
+        )
+        text.arithmetic_immediate("add", Register.RDI, 2)
+        text.increment(Register.RSI)
+        text.jump("utter.head")
+        text.label("utter.tail")
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RDI, 1, self.wide), 0
+        )
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RDI, 1, self.wide + 1), 0
+        )
+        # the caller of a routine from another language keeps its rules
+        text.load(SAVED_STACK, Register.RSP)
+        text.arithmetic_immediate("and", Register.RSP, -16)
+        text.arithmetic_immediate("sub", Register.RSP, 32)
+        text.load(
+            Register.RCX, MemoryOperand(SYSTEM_TABLE, None, 1, EFI_CONSOLE_OUT)
+        )
+        text.load(Register.RDX, DATA_REGISTER)
+        text.arithmetic_immediate("add", Register.RDX, self.wide)
+        text.call_indirect(MemoryOperand(Register.RCX, None, 1, EFI_OUTPUT_STRING))
+        text.load(Register.RSP, SAVED_STACK)
+        text.ret()
+        text.label("reserved")
+
+
+def efi_image(module: ObjectModule) -> bytes:
+    """The text wrapped in the container UEFI firmware will load."""
+    backend = EfiCodeBackend(module)
+    text = backend.encode()
+    raw = _align_up(len(text), EFI_FILE_ALIGN)
+    virtual = len(text) + backend.reserve
+    mapped = _align_up(virtual, EFI_SECTION_ALIGN)
+
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 240, 0x0222)
+    optional = struct.pack(
+        "<HBBIIIIIQ", 0x20B, 0, 0, raw, 0, backend.reserve,
+        EFI_SECTION_ALIGN, EFI_SECTION_ALIGN, 0,
+    ) + struct.pack(
+        "<IIHHHHHHIIIIHHQQQQII",
+        EFI_SECTION_ALIGN, EFI_FILE_ALIGN, 0, 0, 0, 0, 0, 0, 0,
+        EFI_SECTION_ALIGN + mapped, EFI_HEADER_SPAN, 0, EFI_SUBSYSTEM, 0,
+        0x10000, 0x10000, 0x10000, 0x10000, 0, 16,
+    ) + bytes(16 * 8)
+    section = struct.pack(
+        "<8sIIIIIIHHI", b".text", virtual, EFI_SECTION_ALIGN, raw,
+        EFI_HEADER_SPAN, 0, 0, 0, 0, 0x60000020,
+    )
+    headers = (
+        b"MZ" + bytes(58) + struct.pack("<I", 64)
+        + b"PE\x00\x00" + coff + optional + section
+    )
+    if len(headers) > EFI_HEADER_SPAN:
+        raise MachineCodeError(f"the headers want {len(headers)} octets")
+    return headers.ljust(EFI_HEADER_SPAN, b"\x00") + text.ljust(raw, b"\x00")
+
 
 
 # ======================================================================
@@ -14641,6 +14873,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     machine.add_argument("--emit-boot", metavar="PATH",
                          help="write a disk image that needs no kernel either")
+    machine.add_argument("--emit-efi", metavar="PATH",
+                         help="write the same text as a UEFI application")
 
     wasm = parser.add_argument_group("tier 6: WebAssembly, no host but an engine")
     wasm.add_argument("--emit-wasm", metavar="PATH", help="write a reactor module")
@@ -14838,6 +15072,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         written = _write_octets(namespace.emit_elf, blob, executable=True)
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
+    if namespace.emit_efi:
+        blob = efi_image(artifacts.module)
+        written = _write_octets(namespace.emit_efi, blob)
+        print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
+
     if namespace.emit_boot:
         blob = boot_image(artifacts.module)
         written = _write_octets(namespace.emit_boot, blob)
@@ -14861,7 +15100,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if backend_requested:
         return _run_backend(namespace, artifacts)
 
-    if STREAM not in (namespace.emit_elf, namespace.emit_wasm, namespace.emit_boot):
+    if STREAM not in (
+        namespace.emit_elf, namespace.emit_wasm, namespace.emit_boot, namespace.emit_efi
+    ):
         sys.stdout.write(artifacts.rendering + "\n")
     return 0
 

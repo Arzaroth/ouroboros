@@ -114,6 +114,43 @@ jobs:
           python ouroboros.py --machine riscv64 --emit-elf other-riscv64
           file other-riscv64 | grep -q RISC-V
 
+  machine:
+    name: a machine with nothing under it, and one with firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: an emulator to start, and firmware to start it with
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+
+      - name: the disk boots and the figure comes out of the serial port
+        run: |
+          python ouroboros.py --emit-boot glyph.img
+          python -c "
+          import pathlib, ouroboros
+          wanted = ouroboros.synthesize(7).unwrap_or_raise().rendering
+          got = ouroboros.run_boot(pathlib.Path('glyph.img'), 7).removesuffix('\n')
+          assert got == wanted, got
+          print('the disk booted, and printed it')
+          "
+
+      - name: the firmware loads the application and prints the same figure
+        run: |
+          python ouroboros.py --emit-efi glyph.efi
+          file glyph.efi | grep -q "EFI (application)"
+          python -c "
+          import pathlib, ouroboros
+          wanted = ouroboros.synthesize(7).unwrap_or_raise().rendering
+          got = ouroboros.run_efi(pathlib.Path('glyph.efi').read_bytes(), 7)
+          assert got == wanted, got
+          print('the firmware ran it, and printed it')
+          "
+
   toolchain:
     name: llvm, the bootstrap and the closed loop
     runs-on: ubuntu-latest
