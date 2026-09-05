@@ -72,6 +72,17 @@
           back and runs it here, so the file executes its own output and the
           tier stops needing an engine at all.
 
+  tier 7  no kernel             layer 22 asks for nothing underneath at all.
+          The instruction stream and the whole runtime are layer 18's,
+          unchanged; only the three things a kernel was being asked for
+          differ - who zeroes the data, what a finished program does, and
+          where the octets go when there is no descriptor to write them to.
+          In front sits one sector of sixteen-bit real mode walking the
+          machine up to the sixty-four the encoder emits: a page table, a
+          descriptor table, and three bits in three registers.  The figure
+          arrives in the text buffer and out of the serial port, and the
+          program halts rather than exits, there being nothing to exit to.
+
     python3 ouroboros.py                 render via the virtual machine
     python3 ouroboros.py --emit-llvm     lower the program to LLVM IR
     python3 ouroboros.py --jit           JIT-execute that IR
@@ -81,6 +92,7 @@
     python3 ouroboros.py --emit-elf PATH  write a static executable, no toolchain
     python3 ouroboros.py --machine aarch64 --emit-elf PATH   for the other one
     python3 ouroboros.py --emit-wasm PATH write a wasm reactor, no toolchain
+    python3 ouroboros.py --emit-boot PATH write a disk that needs no kernel
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
@@ -11518,6 +11530,13 @@ class X86Assembler:
     def syscall(self) -> None:
         self._emit(0x0F, 0x05)
 
+    def halt(self) -> None:
+        self._emit(0xF4)
+
+    def out(self) -> None:
+        """out dx, al: the one way out of a machine with no kernel."""
+        self._emit(0xEE)
+
 
 IMAGE_BASE: Final[int] = 0x400000
 DATA_BASE: Final[int] = 0x600000
@@ -11601,20 +11620,19 @@ class NativeCodeBackend:
         with TRACER.span("encode", order=self._order):
             text = X86Assembler()
             text.label("_start")
-            text.immediate(DATA_REGISTER, DATA_BASE)
+            self._prologue(text)
             for address, instruction in enumerate(self._module.instructions):
                 text.label(f"A{address}")
                 self._instruction(text, instruction, address)
             text.label("exit")
             text.call("render")
-            text.immediate(Register.RAX, SYS_EXIT_GROUP)
-            text.arithmetic("xor", Register.RDI, Register.RDI)
-            text.syscall()
+            self._epilogue(text)
             self._paint(text)
             self._emit_run(text)
             self._snapshot_routine(text)
             self._apply(text)
             self._render(text)
+            self._appendix(text)
             METRICS.increment("machine.instructions", len(self._module.instructions))
             return text.link()
 
@@ -11719,6 +11737,31 @@ class NativeCodeBackend:
         text.decrement(Register.RAX)
         text.label(floored)
         text.push(Register.RAX)
+
+    # -- what a kernel underneath is asked for -----------------------------
+
+    DATA_ORIGIN: ClassVar[int] = DATA_BASE
+
+    def _prologue(self, text: X86Assembler) -> None:
+        """Where .bss is; the loader has already zeroed it."""
+        text.immediate(DATA_REGISTER, self.DATA_ORIGIN)
+
+    def _epilogue(self, text: X86Assembler) -> None:
+        text.immediate(Register.RAX, SYS_EXIT_GROUP)
+        text.arithmetic("xor", Register.RDI, Register.RDI)
+        text.syscall()
+
+    def _flush(self, text: X86Assembler) -> None:
+        text.immediate(Register.RAX, SYS_WRITE)
+        text.immediate(Register.RDI, 1)
+        text.address_of(
+            Register.RSI, MemoryOperand(DATA_REGISTER, None, 1, self._layout.output)
+        )
+        text.load(Register.RDX, Register.R14)
+        text.syscall()
+
+    def _appendix(self, text: X86Assembler) -> None:
+        """Routines a platform needs and this one does not."""
 
     # -- the runtime the instruction stream calls into ---------------------
 
@@ -11887,13 +11930,7 @@ class NativeCodeBackend:
         text.increment(Register.R12)
         text.jump("render.row")
         text.label("render.flush")
-        text.immediate(Register.RAX, SYS_WRITE)
-        text.immediate(Register.RDI, 1)
-        text.address_of(
-            Register.RSI, MemoryOperand(DATA_REGISTER, None, 1, self._layout.output)
-        )
-        text.load(Register.RDX, Register.R14)
-        text.syscall()
+        self._flush(text)
         text.ret()
 
 
@@ -13090,6 +13127,235 @@ def runnable_machines() -> tuple[str, ...]:
     return tuple(name for name in MACHINES if machine_code_runnable(name))
 
 
+
+# ======================================================================
+# Tier 7: no kernel either
+# ======================================================================
+#
+# Layer 22 asks for nothing underneath at all.  The instruction stream and
+# the whole runtime are the ones layer 18 already writes - the same encoder,
+# the same operand stack, the same .bss - and only the three things a kernel
+# was being asked for change: where the data lives and who zeroes it, what a
+# finished program does, and where the octets go when there is no descriptor
+# to write them to.
+#
+# What that costs is the sector in front: sixteen bits of real mode, which is
+# where a machine begins, walking up to the sixty-four the encoder emits.
+
+BOOT_BASE: Final[int] = 0x7C00
+PAYLOAD_BASE: Final[int] = 0x8000
+BOOT_DATA_BASE: Final[int] = 0x100000
+VGA_TEXT_BASE: Final[int] = 0xB8000
+VGA_ROW_OCTETS: Final[int] = 160
+VGA_CELLS: Final[int] = 80 * 25
+SERIAL_PORT: Final[int] = 0x3F8
+SECTOR: Final[int] = 512
+PAGE_TABLE_BASE: Final[int] = 0x1000
+
+# null, then a sixty-four bit code segment, then data.
+BOOT_GDT: Final[bytes] = struct.pack(
+    "<QQQ", 0, 0x00209A0000000000, 0x0000920000000000
+)
+
+
+class BootCodeBackend(NativeCodeBackend):
+    """The same text as layer 18, for a machine with nothing underneath it.
+
+    Three answers differ.  Nobody has zeroed .bss, so the prologue does it.
+    There is nowhere to exit to, so the epilogue halts.  And there is no
+    descriptor to write to, so the octets go to the text buffer the firmware
+    leaves mapped and out of the serial port besides, which is the one of the
+    two that can be read back by a machine rather than a person.
+    """
+
+    DATA_ORIGIN: ClassVar[int] = BOOT_DATA_BASE
+
+    def _prologue(self, text: X86Assembler) -> None:
+        text.immediate(DATA_REGISTER, self.DATA_ORIGIN)
+        text.arithmetic("xor", Register.RCX, Register.RCX)
+        text.label("wipe.head")
+        text.arithmetic_immediate("cmp", Register.RCX, self._layout.size)
+        text.jump_if("ge", "wipe.done")
+        text.store_octet_immediate(
+            MemoryOperand(DATA_REGISTER, Register.RCX, 1, 0), 0
+        )
+        text.increment(Register.RCX)
+        text.jump("wipe.head")
+        text.label("wipe.done")
+
+    def _epilogue(self, text: X86Assembler) -> None:
+        text.label("stop")
+        text.halt()
+        text.jump("stop")
+
+    def _flush(self, text: X86Assembler) -> None:
+        text.call("blit")
+
+    def _appendix(self, text: X86Assembler) -> None:
+        """blit: the output buffer to the text cells, and out of the port."""
+        text.label("blit")
+        text.immediate(Register.R11, VGA_TEXT_BASE)
+        text.arithmetic("xor", Register.RCX, Register.RCX)
+        text.label("blit.clear")
+        text.arithmetic_immediate("cmp", Register.RCX, VGA_CELLS)
+        text.jump_if("ge", "blit.cleared")
+        text.store_octet_immediate(
+            MemoryOperand(Register.R11, Register.RCX, 2, 0), ord(" ")
+        )
+        text.store_octet_immediate(
+            MemoryOperand(Register.R11, Register.RCX, 2, 1), 0x07
+        )
+        text.increment(Register.RCX)
+        text.jump("blit.clear")
+        text.label("blit.cleared")
+        text.arithmetic("xor", Register.R8, Register.R8)
+        text.arithmetic("xor", Register.R9, Register.R9)
+        text.arithmetic("xor", Register.R10, Register.R10)
+        text.immediate(Register.R11, VGA_TEXT_BASE)
+        text.label("blit.head")
+        text.arithmetic("cmp", Register.R8, Register.R14)
+        text.jump_if("ge", "blit.done")
+        text.arithmetic("xor", Register.RAX, Register.RAX)
+        text.load_octet(
+            Register.RAX,
+            MemoryOperand(DATA_REGISTER, Register.R8, 1, self._layout.output),
+        )
+        text.immediate(Register.RDX, SERIAL_PORT)
+        text.out()
+        text.arithmetic_immediate("cmp", Register.RAX, ord("\n"))
+        text.jump_if("e", "blit.newline")
+        text.multiply_immediate(Register.RCX, Register.R9, VGA_ROW_OCTETS)
+        text.arithmetic("add", Register.RCX, Register.R11)
+        text.store_octet(MemoryOperand(Register.RCX, Register.R10, 2, 0), Register.RAX)
+        text.store_octet_immediate(
+            MemoryOperand(Register.RCX, Register.R10, 2, 1), 0x07
+        )
+        text.increment(Register.R10)
+        text.jump("blit.step")
+        text.label("blit.newline")
+        text.increment(Register.R9)
+        text.arithmetic("xor", Register.R10, Register.R10)
+        text.label("blit.step")
+        text.increment(Register.R8)
+        text.jump("blit.head")
+        text.label("blit.done")
+        text.ret()
+
+
+def boot_sector(payload_sectors: int) -> bytes:
+    """Sixteen bits of real mode, walking up to sixty-four.
+
+    Written out rather than encoded, because none of it recurs: segments and
+    a stack, the payload off the disk the firmware booted from, the gate at
+    port ninety-two, a page table that maps the first two megaoctets onto
+    themselves, a descriptor table, and the three bits in three registers
+    that put the machine in long mode.
+    """
+    code = bytearray()
+
+    def emit(*octets: int) -> None:
+        code.extend(octets)
+
+    def assemble(pointer_at: int) -> None:
+        code.clear()
+        emit(0xFA)                                        # cli
+        emit(0x31, 0xC0)                                  # xor ax, ax
+        emit(0x8E, 0xD8), emit(0x8E, 0xC0), emit(0x8E, 0xD0)
+        emit(0xBC, BOOT_BASE & 0xFF, BOOT_BASE >> 8)      # mov sp, 0x7c00
+        emit(0xB8, payload_sectors & 0xFF, 0x02)          # mov ax, 0x02<sectors>
+        emit(0xB9, 0x02, 0x00)                            # mov cx, cylinder 0 sector 2
+        emit(0xB6, 0x00)                                  # mov dh, 0; dl is the drive
+        emit(0xBB, PAYLOAD_BASE & 0xFF, PAYLOAD_BASE >> 8)
+        emit(0xCD, 0x13)                                  # int 0x13
+        emit(0xE4, 0x92), emit(0x0C, 0x02), emit(0xE6, 0x92)
+        emit(0xBF, PAGE_TABLE_BASE & 0xFF, PAGE_TABLE_BASE >> 8)
+        emit(0xB9, 0x00, 0x18)                            # 0x1800 words
+        emit(0x31, 0xC0)
+        emit(0xFC)                                        # cld
+        emit(0xF3, 0xAB)                                  # rep stosw
+        for where, entry in (
+            (PAGE_TABLE_BASE, 0x2003),
+            (PAGE_TABLE_BASE + 0x1000, 0x3003),
+            (PAGE_TABLE_BASE + 0x2000, 0x0083),
+        ):
+            emit(0x66, 0xC7, 0x06, where & 0xFF, where >> 8, *struct.pack("<I", entry))
+        emit(0x66, 0x0F, 0x01, 0x16, pointer_at & 0xFF, pointer_at >> 8)
+        emit(0x0F, 0x20, 0xE0)
+        emit(0x66, 0x0D, *struct.pack("<I", 1 << 5))      # cr4.pae
+        emit(0x0F, 0x22, 0xE0)
+        emit(0x66, 0xB9, *struct.pack("<I", 0xC0000080))
+        emit(0x0F, 0x32)                                  # rdmsr
+        emit(0x66, 0x0D, *struct.pack("<I", 1 << 8))      # efer.lme
+        emit(0x0F, 0x30)                                  # wrmsr
+        emit(0x66, 0xB8, *struct.pack("<I", PAGE_TABLE_BASE))
+        emit(0x0F, 0x22, 0xD8)                            # cr3
+        emit(0x0F, 0x20, 0xC0)
+        emit(0x66, 0x0D, *struct.pack("<I", 0x80000001))  # cr0.pg | cr0.pe
+        emit(0x0F, 0x22, 0xC0)
+        target = len(code) + 8
+        emit(0x66, 0xEA, *struct.pack("<I", BOOT_BASE + target), 0x08, 0x00)
+        emit(0x66, 0xB8, 0x10, 0x00)                      # mov ax, 0x10
+        emit(0x8E, 0xD8), emit(0x8E, 0xC0), emit(0x8E, 0xD0)
+        emit(0xBC, *struct.pack("<I", BOOT_BASE - 0xC00))
+        emit(0xB8, *struct.pack("<I", PAYLOAD_BASE))
+        emit(0xFF, 0xE0)                                  # jmp rax
+
+    assemble(0)
+    pointer_at = BOOT_BASE + len(code)
+    assemble(pointer_at)
+    descriptor = struct.pack("<HI", len(BOOT_GDT) - 1, pointer_at + 6)
+    sector = bytes(code) + descriptor + BOOT_GDT
+    if len(sector) > SECTOR - 2:
+        raise MachineCodeError(f"the first sector wants {len(sector)} octets")
+    return sector.ljust(SECTOR - 2, b"\x00") + b"\x55\xaa"
+
+
+def boot_image(module: ObjectModule) -> bytes:
+    """A disk whose first sector is a machine walking up to its own width."""
+    payload = BootCodeBackend(module).encode()
+    sectors = -(-len(payload) // SECTOR)
+    return boot_sector(sectors) + payload.ljust(sectors * SECTOR, b"\x00")
+
+
+def boot_runnable() -> bool:
+    """Whether anything here can be asked to start a machine."""
+    return shutil.which("qemu-system-x86_64") is not None
+
+
+def run_boot(image: Path, lines: int, patience: float = 20.0) -> str:
+    """Starts a machine on ``image`` and answers what left the serial port.
+
+    A program with nothing underneath it halts rather than exits, which makes
+    waiting for the machine to finish pointless.  So the wait is for the
+    octets instead - as many lines as the lattice has rows - and the machine
+    is stopped from outside once they have arrived.
+    """
+    emulator = shutil.which("qemu-system-x86_64")
+    if emulator is None:
+        raise MachineCodeError("no system emulator is installed")
+    with tempfile.TemporaryDirectory(prefix="ouroboros-boot-") as scratch:
+        capture = Path(scratch) / "serial"
+        machine = subprocess.Popen(
+            [
+                emulator, "-drive", f"format=raw,file={image}",
+                "-display", "none", "-serial", f"file:{capture}", "-no-reboot",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + patience
+            while time.monotonic() < deadline:
+                if capture.exists():
+                    written = capture.read_text(errors="replace")
+                    if written.count("\n") >= lines:
+                        return written
+                time.sleep(0.05)
+            raise MachineCodeError(f"no {lines} lines left the machine in time")
+        finally:
+            machine.kill()
+            machine.wait()
+
+
 # ======================================================================
 # Tier 6: WebAssembly
 # ======================================================================
@@ -14245,6 +14511,15 @@ def _selftest(orders: Sequence[int]) -> int:
                     tiers.append((f"elf({architecture})", _run(binary, "").removesuffix("\n")))
             except (GlyphPlatformError, OSError) as exc:
                 print(f"  n={order:<3} elf({architecture}) skipped: {exc}", file=sys.stderr)
+        try:
+            if not boot_runnable():
+                raise OSError("no system emulator is installed")
+            with tempfile.TemporaryDirectory(prefix="ouroboros-") as scratch:
+                image = Path(scratch) / "glyph.img"
+                image.write_bytes(boot_image(artifacts.module))
+                tiers.append(("boot", run_boot(image, order).removesuffix("\n")))
+        except (GlyphPlatformError, OSError) as exc:
+            print(f"  n={order:<3} boot tier skipped: {exc}", file=sys.stderr)
         blob = wasm_module(artifacts.module)
         try:
             if wasm_host() is None:
@@ -14363,6 +14638,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     machine.add_argument("--emit-machine-code", action="store_true")
     machine.add_argument("--machine", choices=sorted(MACHINES), default=host_machine(),
                          help="which machine to write for (default: this one)")
+
+    machine.add_argument("--emit-boot", metavar="PATH",
+                         help="write a disk image that needs no kernel either")
 
     wasm = parser.add_argument_group("tier 6: WebAssembly, no host but an engine")
     wasm.add_argument("--emit-wasm", metavar="PATH", help="write a reactor module")
@@ -14560,6 +14838,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         written = _write_octets(namespace.emit_elf, blob, executable=True)
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
+    if namespace.emit_boot:
+        blob = boot_image(artifacts.module)
+        written = _write_octets(namespace.emit_boot, blob)
+        print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
+
     if namespace.emit_wasm:
         blob = wasm_module(artifacts.module)
         written = _write_octets(namespace.emit_wasm, blob)
@@ -14578,7 +14861,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if backend_requested:
         return _run_backend(namespace, artifacts)
 
-    if STREAM not in (namespace.emit_elf, namespace.emit_wasm):
+    if STREAM not in (namespace.emit_elf, namespace.emit_wasm, namespace.emit_boot):
         sys.stdout.write(artifacts.rendering + "\n")
     return 0
 

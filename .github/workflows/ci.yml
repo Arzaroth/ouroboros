@@ -56,6 +56,18 @@ jobs:
           python ouroboros.py --machine riscv64 --emit-elf glyph-riscv64
           file glyph-riscv64 | grep -q RISC-V
 
+      - name: a disk image for a machine with nothing underneath it
+        run: |
+          python ouroboros.py --emit-boot glyph.img
+          file glyph.img
+          python -c "
+          import pathlib
+          image = pathlib.Path('glyph.img').read_bytes()
+          assert image[510:512] == b'\x55\xaa', 'the sector is not bootable'
+          assert len(image) % 512 == 0, 'the image is not whole sectors'
+          print(f'{len(image)} octets, {len(image)//512} sectors, signed')
+          "
+
       - name: a wasm module, and the five lines of host it asks for
         run: |
           python ouroboros.py --emit-wasm glyph.wasm
