@@ -16684,9 +16684,9 @@ def build_front_ends(directory: Path, opt_level: int = 2) -> tuple[Path, str, Pa
 
 # The machines this one is not, each with the tail that writes for it and,
 # where there is one, the compiler that runs there.
-CROSSINGS: Final[tuple[tuple[str, str, str, str | None, str], ...]] = (
+CROSSINGS: Final[tuple[tuple[str, str, str, str, str], ...]] = (
     ("aarch64", "gslcarm", "glypharm", GSLCARM_GSL2, GLYPHARM_GSL2),
-    ("riscv64", "gslcrv", "glyphrv", None, GLYPHRV_GSL2),
+    ("riscv64", "gslcrv", "glyphrv", GSLCRV_GSL2, GLYPHRV_GSL2),
 )
 
 
@@ -16823,9 +16823,7 @@ def close_the_toolchain(
         native_front = 0
         native_program = False
         skipped = ""
-        if compiler_text is None:
-            skipped = "there is no compiler for it yet"
-        elif machine_code_runnable(name):
+        if machine_code_runnable(name):
             seeded_there = directory / f"seeded-{name}"
             seeded_there.write_bytes(gsl2_machine_code(compiler_text))
             seeded_there.chmod(0o755)
