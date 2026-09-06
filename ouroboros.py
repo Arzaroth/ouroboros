@@ -4960,6 +4960,7 @@ class AssuranceSuite:
                 self._rasterisers_agree,
                 self._event_replay,
                 self._lexer_covers_source,
+                self._every_octet_is_an_instruction,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
                 self._coordinate_immutable,
@@ -5038,6 +5039,26 @@ class AssuranceSuite:
             "event replay reconstructs the canvas",
             replayed.support == artifacts.support,
             f"{len(canvas.events)} event(s)",
+        )
+
+    @staticmethod
+    def _every_octet_is_an_instruction(
+        artifacts: CompilationArtifacts,
+    ) -> CheckResult:
+        """Whether the file can name everything its machine backend wrote.
+
+        A walk from the first octet that lands exactly on the last one, with
+        a name for each instruction on the way.  The encoder and the reader
+        agree about where an instruction ends or this does not finish.
+        """
+        try:
+            said = narrate_machine_code(machine_code(artifacts.module, "x86-64"))
+        except GlyphPlatformError as exc:
+            return CheckResult("every octet of the text is an instruction", False, str(exc))
+        return CheckResult(
+            "every octet of the text is an instruction",
+            True,
+            f"{len(said.splitlines())} of them, each one named",
         )
 
     @staticmethod
@@ -19228,6 +19249,163 @@ class MachineReader:
         return self._written.decode()
 
 
+REGISTER_NAMES: Final[tuple[str, ...]] = (
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+    "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+)
+
+
+class MachineNarrator:
+    """Says what the octets are, without running any of them.
+
+    A second pass over the same closed vocabulary the reader executes.  The
+    two have to agree about where every instruction ends or one of them is
+    wrong, and a linear walk that does not land exactly on the end of the text
+    says so.
+    """
+
+    def __init__(self, text: bytes, origin: int) -> None:
+        self._text = text
+        self._origin = origin
+        self._at = 0
+
+    def _octet(self) -> int:
+        value = self._text[self._at]
+        self._at += 1
+        return value
+
+    def _long(self) -> int:
+        value = int.from_bytes(self._text[self._at : self._at + 4], "little")
+        self._at += 4
+        return value - (1 << 32) if value >> 31 else value
+
+    def _quad(self) -> int:
+        value = int.from_bytes(self._text[self._at : self._at + 8], "little")
+        self._at += 8
+        return value - (1 << 64) if value >> 63 else value
+
+    def _place(self, rex: int) -> tuple[int, str]:
+        modrm = self._octet()
+        reg = ((modrm >> 3) & 7) | (8 if rex & 0x4 else 0)
+        if modrm >> 6 == 3:
+            return reg, REGISTER_NAMES[(modrm & 7) | (8 if rex & 0x1 else 0)]
+        sib = self._octet()
+        base = REGISTER_NAMES[(sib & 7) | (8 if rex & 0x1 else 0)]
+        index = (sib >> 3) & 7
+        scale = 1 << (sib >> 6)
+        displacement = self._long()
+        inside = base
+        if index != 0b100:
+            inside += f" + {REGISTER_NAMES[index | (8 if rex & 0x2 else 0)]}"
+            if scale != 1:
+                inside += f" * {scale}"
+        if displacement:
+            inside += f" {'-' if displacement < 0 else '+'} {abs(displacement):#x}"
+        return reg, f"[{inside}]"
+
+    def _one(self) -> str:
+        rex = 0
+        octet = self._octet()
+        if 0x40 <= octet <= 0x4F:
+            rex = octet & 0xF
+            octet = self._octet()
+        if octet == 0x0F:
+            second = self._octet()
+            if second == 0x05:
+                return "syscall"
+            if second == 0xB6:
+                reg, place = self._place(rex)
+                return f"movzx {REGISTER_NAMES[reg]}, {place}"
+            if second == 0xAF:
+                reg, place = self._place(rex)
+                return f"imul {REGISTER_NAMES[reg]}, {place}"
+            if 0x90 <= second <= 0x9F:
+                _, place = self._place(rex)
+                return f"set{CONDITION_NAMES[second & 0xF]} {place}"
+            if 0x80 <= second <= 0x8F:
+                return (
+                    f"j{CONDITION_NAMES[second & 0xF]} "
+                    f"{self._origin + self._at + 4 + self._long():#x}"
+                )
+            raise MachineDecodeError(f"two-octet {second:#04x}")
+        if 0x50 <= octet <= 0x57:
+            return f"push {REGISTER_NAMES[(octet & 7) | (8 if rex & 1 else 0)]}"
+        if 0x58 <= octet <= 0x5F:
+            return f"pop {REGISTER_NAMES[(octet & 7) | (8 if rex & 1 else 0)]}"
+        if 0xB8 <= octet <= 0xBF:
+            where = REGISTER_NAMES[(octet & 7) | (8 if rex & 1 else 0)]
+            return f"movabs {where}, {self._quad():#x}"
+        if octet in MachineReader.ARITHMETIC:
+            reg, place = self._place(rex)
+            return (
+                f"{MachineReader.ARITHMETIC[octet]} {REGISTER_NAMES[reg]}, {place}"
+            )
+        if octet == 0x81:
+            reg, place = self._place(rex)
+            return f"{MachineReader.EXTENSIONS[reg & 7]} {place}, {self._long():#x}"
+        if octet == 0x80:
+            _, place = self._place(rex)
+            return f"cmp octet {place}, {self._octet():#x}"
+        if octet in (0x8B, 0x89, 0x8D, 0x8A, 0x88):
+            reg, place = self._place(rex)
+            name = {0x8B: "mov", 0x89: "mov", 0x8D: "lea",
+                    0x8A: "mov octet", 0x88: "mov octet"}[octet]
+            if octet in (0x89, 0x88):
+                return f"{name} {place}, {REGISTER_NAMES[reg]}"
+            return f"{name} {REGISTER_NAMES[reg]}, {place}"
+        if octet == 0xC6:
+            _, place = self._place(rex)
+            return f"mov octet {place}, {self._octet():#x}"
+        if octet == 0x69:
+            reg, place = self._place(rex)
+            return f"imul {REGISTER_NAMES[reg]}, {place}, {self._long():#x}"
+        if octet == 0xF7:
+            reg, place = self._place(rex)
+            return f"{'neg' if reg & 7 == 3 else 'idiv'} {place}"
+        if octet == 0xFF:
+            reg, place = self._place(rex)
+            return f"{'inc' if reg & 7 == 0 else 'dec'} {place}"
+        if octet == 0x85:
+            reg, place = self._place(rex)
+            return f"test {REGISTER_NAMES[reg]}, {place}"
+        if octet == 0x99:
+            return "cqo"
+        if octet in (0xE9, 0xE8):
+            name = "jmp" if octet == 0xE9 else "call"
+            return f"{name} {self._origin + self._at + 4 + self._long():#x}"
+        if octet == 0xC3:
+            return "ret"
+        raise MachineDecodeError(f"octet {octet:#04x}")
+
+    def narrate(self) -> Iterator[tuple[int, bytes, str]]:
+        while self._at < len(self._text):
+            start = self._at
+            try:
+                said = self._one()
+            except IndexError:
+                raise MachineDecodeError(
+                    f"the text ends in the middle of an instruction at {start:#x}"
+                ) from None
+            yield self._origin + start, self._text[start : self._at], said
+
+
+def narrate_machine_code(image: bytes) -> str:
+    """Every instruction in an executable this file wrote, in order and named.
+
+    A linear walk, because layer 18 writes one run of instructions and every
+    branch in it carries its own displacement.  Landing anywhere but exactly
+    on the end of the text would mean the reader and this disagree about
+    where an instruction stops, so it says so rather than trimming.
+    """
+    prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
+    origin = struct.unpack_from("<Q", image, 24)[0]
+    text = image[prologue:]
+    lines = []
+    for address, octets, said in MachineNarrator(text, origin).narrate():
+        lines.append(f"  {address:#010x}  {octets.hex(' '):<32}  {said}")
+    return "\n".join(lines) + "\n"
+
+
 def execute_machine_code(image: bytes) -> str:
     """Runs an executable this file wrote, on no processor of that kind."""
     return MachineReader(image).run()
@@ -19509,6 +19687,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     machine = parser.add_argument_group("tier 5: machine code, no toolchain")
     machine.add_argument("--emit-elf", metavar="PATH", help="write a static ELF64 executable")
     machine.add_argument("--emit-machine-code", action="store_true")
+    machine.add_argument("--explain", action="store_true",
+                         help="say what every instruction of the text is")
     machine.add_argument("--machine", choices=sorted(MACHINES), default=host_machine(),
                          help="which machine to write for (default: this one)")
 
@@ -19844,6 +20024,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.verbose:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
+    if namespace.explain:
+        sys.stdout.write(
+            narrate_machine_code(machine_code(artifacts.module, namespace.machine))
+            if namespace.machine == "x86-64"
+            else "this file can only say what it writes for x86-64\n"
+        )
+
     if namespace.emit_elf:
         blob = machine_code(artifacts.module, namespace.machine)
         written = _write_octets(namespace.emit_elf, blob, executable=True)
@@ -19894,6 +20081,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if backend_requested:
         return _run_backend(namespace, artifacts)
 
+    if namespace.explain:
+        return 0
     if STREAM not in (
         namespace.emit_elf, namespace.emit_wasm, namespace.emit_boot,
         namespace.emit_efi, namespace.emit_kernel,
