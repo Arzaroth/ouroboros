@@ -13208,6 +13208,665 @@ fn main() {
 }
 '''
 
+GSL2_RV_ADDRESSES_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# the back end that writes for the third machine
+# ----------------------------------------------------------------------
+#
+# The same compiler and a different tail.  What changes is not the language
+# and not the reader, only what comes out at the end and where it is kept
+# while it is being made.
+
+var IMAGE_AT = 990000;
+var TEXT = 990176;
+var LBLOFF = 1330000;
+var FIXAT = 1360000;
+var FIXID = 1390000;
+var FNSTART = 1450000;
+var FNLEN = 1455000;
+var GLBINIT = 1460000;
+
+var TEXT_LIMIT = 339824;
+var LABEL_LIMIT = 30000;
+var FIX_LIMIT = 30000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var ELF_ALIGN = 4096;
+var ELF_MACHINE = 243;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+# On this machine too the number of what is being asked for goes in its own
+# register, and the answer comes back in the first.
+var SYS_READ = 63;
+var SYS_WRITE = 64;
+var SYS_EXIT_GROUP = 93;
+var SYS_BECOME = 666;
+var SYSCALL_REG = 17;
+
+var ZERO = 0;
+var RETURN = 1;
+var STACK = 2;
+var SCRATCH = 31;
+var FRAME_BASE = 20;
+var FRAME_POINTER = 21;
+var A0 = 10;
+var A1 = 11;
+var A2 = 12;
+var T0 = 5;
+var T1 = 6;
+var T2 = 7;
+var T3 = 28;
+var T4 = 29;
+var S2 = 18;
+var S3 = 19;
+var S6 = 22;
+
+var CC_EQ = 0;
+var CC_NE = 1;
+var CC_LT = 2;
+var CC_GE = 3;
+var CC_GT = 4;
+var CC_LE = 5;
+
+var MAXFN = 4096;
+var MOST_VALUES = 3000;
+
+var L_START = 0;
+var L_PUTCHAR = 1;
+var L_PUTCHAR_DONE = 2;
+var L_FLUSH = 3;
+var L_FLUSH_DONE = 4;
+var L_GETCHAR = 5;
+var L_GETCHAR_FILL = 6;
+var L_GETCHAR_TAKE = 7;
+var L_GETCHAR_ENDED = 8;
+var L_GETCHAR_DONE = 9;
+var L_QUIT = 10;
+var L_COPY = 11;
+var L_COPY_DONE = 12;
+var L_STRDATA = 13;
+var L_MAIN = 14;
+var L_INIT = 15;
+var L_DELIVER = 16;
+var L_DELIVER_PACK = 17;
+var L_DELIVER_PACKED = 18;
+var L_DELIVER_DONE = 19;
+var L_FN = 32;
+var L_BLOCK = 4128;
+
+var MEMORY_AT = 6291456;
+var MEMORY_BYTES = 16000000;
+var GLOBALS_AT = 22291456;
+var OUT_AT = 22293504;
+var OUT_SPAN = 65536;
+var OUT_USED_AT = 22359040;
+var IN_AT = 22359048;
+var IN_SPAN = 65536;
+var IN_TAKEN_AT = 22424584;
+var IN_HELD_AT = 22424592;
+var HAND_AT = 22424600;
+var HAND_SPAN = 1048576;
+var BSS_SPAN = 17181720;
+
+var textlen = 0;
+var nfix = 0;
+var nfn = 0;
+var nblock = 0;
+var framesite = 0;
+'''
+
+
+GSL2_RV_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# what a value is, and where it lives
+# ----------------------------------------------------------------------
+#
+# A virtual register becomes a slot in the frame here too.  What differs is
+# that an offset on this machine is twelve signed bits and nothing more, and
+# a frame of three thousand values is far past that.  The register kept
+# pointing at the frame points two thousand octets into it, so that both
+# signs of the offset are spent on slots, and only the ones past the reach of
+# an offset have their address worked out into a register of their own.
+
+fn slot_at(slot) {
+  return slot * 8 - 2048;
+}
+
+fn value_at(r) {
+  return (FRAME + r) * 8 - 2048;
+}
+
+fn take(reg, r) {
+  var at = value_at(r);
+  if (at >= 0 - 2048 && at < 2048) {
+    return ld(reg, FRAME_BASE, at);
+  }
+  alu_imm(T2, FRAME_BASE, at);
+  return ld(reg, T2, 0);
+}
+
+fn give(r, reg) {
+  var at = value_at(r);
+  if (at >= 0 - 2048 && at < 2048) {
+    return st(reg, FRAME_BASE, at);
+  }
+  alu_imm(T2, FRAME_BASE, at);
+  return st(reg, T2, 0);
+}
+
+# One instruction carries twenty bits and another twelve, so a number wider
+# than the two of them together is reached by halves: the half is put down,
+# doubled, and the odd one added back.
+fn imm_wide(d, v) {
+  if (v >= 0 - 2147483648 && v < 2147483648) {
+    return imm(d, v);
+  }
+  var half = v / 2;
+  var rest = v - half * 2;
+  imm_wide(d, half);
+  alu(0, d, d, d);
+  if (rest != 0) {
+    return form_i(rest, d, 0, d, 19);
+  }
+  return 0;
+}
+
+fn new_reg() {
+  regcnt = regcnt + 1;
+  if (regcnt >= MOST_VALUES) {
+    fail("too many values at once in one function");
+  }
+  return regcnt - 1;
+}
+
+fn new_label() {
+  nblock = nblock + 1;
+  return L_BLOCK + nblock - 1;
+}
+
+fn fn_id(start, length) {
+  var i = 0;
+  while (i < nfn) {
+    if (mem[FNLEN + i] == length) {
+      var k = 0;
+      var same = 1;
+      while (k < length) {
+        if (mem[SRC + mem[FNSTART + i] + k] != mem[SRC + start + k]) {
+          same = 0;
+        }
+        k = k + 1;
+      }
+      if (same == 1) {
+        return L_FN + i;
+      }
+    }
+    i = i + 1;
+  }
+  if (nfn >= MAXFN) {
+    fail("too many functions");
+  }
+  mem[FNSTART + nfn] = start;
+  mem[FNLEN + nfn] = length;
+  nfn = nfn + 1;
+  return L_FN + nfn - 1;
+}
+
+# There is no answer-of-a-comparison instruction here, only a less-than; the
+# other five are that one with its operands turned round, or its answer
+# turned over, or a subtraction asked whether it came out zero.
+fn set_when(cc, d, l, r) {
+  if (cc == CC_LT) {
+    return alu(3, d, l, r);
+  }
+  if (cc == CC_GT) {
+    return alu(3, d, r, l);
+  }
+  if (cc == CC_GE) {
+    alu(3, d, l, r);
+    return xor_imm(d, d, 1);
+  }
+  if (cc == CC_LE) {
+    alu(3, d, r, l);
+    return xor_imm(d, d, 1);
+  }
+  alu(1, d, l, r);
+  if (cc == CC_EQ) {
+    return form_i(1, d, 3, d, 19);
+  }
+  return form_r(0, d, ZERO, 3, d, 51);
+}
+
+# ----------------------------------------------------------------------
+# the interface the reader above calls
+# ----------------------------------------------------------------------
+
+fn emit_label(l) {
+  return lab(l);
+}
+
+fn emit_br(l) {
+  return go(l);
+}
+
+fn emit_cond_br(r, a, b) {
+  take(A0, r);
+  go_when(CC_NE, A0, ZERO, a);
+  go(b);
+  return 0;
+}
+
+fn gen_const(v) {
+  var r = new_reg();
+  imm_wide(A0, v);
+  give(r, A0);
+  return r;
+}
+
+fn gen_slot_addr(slot) {
+  var r = new_reg();
+  alu_imm(A0, FRAME_BASE, slot_at(slot));
+  give(r, A0);
+  return r;
+}
+
+fn gen_mem_addr(index_reg) {
+  var r = new_reg();
+  take(A0, index_reg);
+  imm(A1, 8);
+  alu(4, A0, A0, A1);
+  imm(A1, MEMORY_AT);
+  alu(0, A0, A0, A1);
+  give(r, A0);
+  return r;
+}
+
+fn gen_load(addr_reg) {
+  var r = new_reg();
+  take(A0, addr_reg);
+  ld(A0, A0, 0);
+  give(r, A0);
+  return r;
+}
+
+fn gen_store(value_reg, addr_reg) {
+  take(A0, value_reg);
+  take(A1, addr_reg);
+  st(A0, A1, 0);
+  return 0;
+}
+
+fn gen_store_const(value, addr_reg) {
+  imm_wide(A0, value);
+  take(A1, addr_reg);
+  st(A0, A1, 0);
+  return 0;
+}
+
+fn gen_global_load(start, length) {
+  var r = new_reg();
+  imm(A1, GLOBALS_AT + find_global(start, length) * 8);
+  ld(A0, A1, 0);
+  give(r, A0);
+  return r;
+}
+
+fn gen_global_store(value_reg, start, length) {
+  take(A0, value_reg);
+  imm(A1, GLOBALS_AT + find_global(start, length) * 8);
+  st(A0, A1, 0);
+  return 0;
+}
+
+fn gen_binary(op, a, b) {
+  var r = new_reg();
+  take(A0, a);
+  take(A1, b);
+  if (op == T_PLUS) {
+    alu(0, A0, A0, A1);
+  }
+  if (op == T_MINUS) {
+    alu(1, A0, A0, A1);
+  }
+  if (op == T_STAR) {
+    alu(4, A0, A0, A1);
+  }
+  if (op == T_SLASH) {
+    alu(5, A0, A0, A1);
+  }
+  if (op == T_PERCENT) {
+    alu(6, A0, A0, A1);
+  }
+  give(r, A0);
+  return r;
+}
+
+fn condition_of(op) {
+  if (op == T_EQ) { return CC_EQ; }
+  if (op == T_NE) { return CC_NE; }
+  if (op == T_LT) { return CC_LT; }
+  if (op == T_LE) { return CC_LE; }
+  if (op == T_GT) { return CC_GT; }
+  return CC_GE;
+}
+
+fn gen_compare(op, a, b) {
+  var r = new_reg();
+  take(A0, a);
+  take(A1, b);
+  set_when(condition_of(op), A0, A0, A1);
+  give(r, A0);
+  return r;
+}
+
+fn gen_return(r) {
+  take(A0, r);
+  move(STACK, FRAME_POINTER);
+  pop_reg(RETURN);
+  pop_reg(FRAME_BASE);
+  pop_reg(FRAME_POINTER);
+  ret_now();
+  return 0;
+}
+
+# The convention is this program's own here too, and a push on this machine
+# moves the stack sixteen octets whether eight would have done or not.
+fn gen_call(start, length, base, nargs) {
+  var i = nargs;
+  while (i > 0) {
+    i = i - 1;
+    take(A0, mem[ARGS + base + i]);
+    push_reg(A0);
+  }
+  call_to(fn_id(start, length));
+  if (nargs > 0) {
+    alu_imm(STACK, STACK, 16 * nargs);
+  }
+  var r = new_reg();
+  give(r, A0);
+  return r;
+}
+
+# The frame is reserved by three words rather than one: the two that carry a
+# number of any width between them, and the subtraction that spends it.  The
+# first two are written again once the count of values is known.
+fn write_reserve(site, bytes) {
+  var low = bytes % 4096;
+  if (low >= 2048) {
+    low = low - 4096;
+  }
+  var upper = (bytes - low) / 4096;
+  write_word(site, bits_of(upper, 20) * 4096 + SCRATCH * 128 + 55);
+  write_word(site + 4, bits_of(low, 12) * 1048576 + SCRATCH * 32768
+                       + SCRATCH * 128 + 19);
+  return 0;
+}
+
+fn gen_function_open(start, length, nparams) {
+  var name = fn_id(start, length);
+  lab(name);
+  if (kw_is(start, length, "main") == 1) {
+    lab(L_MAIN);
+  }
+  push_reg(FRAME_POINTER);
+  push_reg(FRAME_BASE);
+  push_reg(RETURN);
+  move(FRAME_POINTER, STACK);
+  framesite = textlen;
+  word(0);
+  word(0);
+  alu(1, STACK, STACK, SCRATCH);
+  alu_imm(FRAME_BASE, STACK, 2048);
+  var i = 0;
+  while (i < nparams) {
+    ld(A0, FRAME_POINTER, 48 + 16 * i);
+    st(A0, FRAME_BASE, slot_at(i));
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn gen_function_close() {
+  imm(A0, 0);
+  move(STACK, FRAME_POINTER);
+  pop_reg(RETURN);
+  pop_reg(FRAME_BASE);
+  pop_reg(FRAME_POINTER);
+  ret_now();
+  write_reserve(framesite, align_up((FRAME + regcnt) * 8, 4096));
+  return 0;
+}
+
+fn gen_global_decl(start, length, v, neg) {
+  if (neg == 1) {
+    v = 0 - v;
+  }
+  mem[GLBINIT + find_global(start, length)] = v;
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the three routines a program in this language asks the world for
+# ----------------------------------------------------------------------
+#
+# The same three as on the other two machines, and the same buffering,
+# because an octet that leaves on its own costs a call on the world and there
+# are fifty thousand of them in a compilation.
+
+fn runtime_putchar() {
+  lab(L_PUTCHAR);
+  push_reg(RETURN);
+  imm(T0, OUT_USED_AT);
+  ld(T1, T0, 0);
+  imm(T3, OUT_AT);
+  alu(0, T3, T3, T1);
+  st_octet(A0, T3, 0);
+  alu_imm(T1, T1, 1);
+  st(T1, T0, 0);
+  go_when_imm(CC_LT, T1, OUT_SPAN, L_PUTCHAR_DONE);
+  call_to(L_FLUSH);
+  lab(L_PUTCHAR_DONE);
+  pop_reg(RETURN);
+  ret_now();
+  return 0;
+}
+
+fn runtime_flush() {
+  lab(L_FLUSH);
+  imm(T0, OUT_USED_AT);
+  ld(T1, T0, 0);
+  go_when(CC_EQ, T1, ZERO, L_FLUSH_DONE);
+  move(A2, T1);
+  imm(SYSCALL_REG, SYS_WRITE);
+  imm(A0, 1);
+  imm(A1, OUT_AT);
+  ask_the_world();
+  imm(T0, OUT_USED_AT);
+  st(ZERO, T0, 0);
+  lab(L_FLUSH_DONE);
+  ret_now();
+  return 0;
+}
+
+fn runtime_getchar() {
+  lab(L_GETCHAR);
+  imm(T0, IN_TAKEN_AT);
+  ld(T1, T0, 0);
+  imm(T3, IN_HELD_AT);
+  ld(T4, T3, 0);
+  go_when(CC_LT, T1, T4, L_GETCHAR_TAKE);
+  lab(L_GETCHAR_FILL);
+  imm(SYSCALL_REG, SYS_READ);
+  imm(A0, 0);
+  imm(A1, IN_AT);
+  imm(A2, IN_SPAN);
+  ask_the_world();
+  go_when(CC_LE, A0, ZERO, L_GETCHAR_ENDED);
+  imm(T3, IN_HELD_AT);
+  st(A0, T3, 0);
+  imm(T0, IN_TAKEN_AT);
+  st(ZERO, T0, 0);
+  imm(T1, 0);
+  lab(L_GETCHAR_TAKE);
+  imm(T3, IN_AT);
+  alu(0, T3, T3, T1);
+  ld_octet(A0, T3, 0);
+  alu_imm(T1, T1, 1);
+  imm(T0, IN_TAKEN_AT);
+  st(T1, T0, 0);
+  go(L_GETCHAR_DONE);
+  lab(L_GETCHAR_ENDED);
+  imm(A0, 0 - 1);
+  lab(L_GETCHAR_DONE);
+  ret_now();
+  return 0;
+}
+
+fn runtime_quit() {
+  lab(L_QUIT);
+  move(S2, A0);
+  call_to(L_FLUSH);
+  move(A0, S2);
+  imm(SYSCALL_REG, SYS_EXIT_GROUP);
+  ask_the_world();
+  return 0;
+}
+
+# Hand octets over: to whatever is underneath if it will take them, and out
+# if it will not.  Nothing that runs on somebody else's kernel will take a
+# program and become it, and this is how it says so.
+fn runtime_deliver() {
+  lab(L_DELIVER);
+  push_reg(RETURN);
+  push_reg(A0);
+  push_reg(A1);
+  call_to(L_FLUSH);
+  pop_reg(A1);
+  pop_reg(A0);
+  move(S2, A0);
+  move(S3, A1);
+  imm(S6, 0);
+  lab(L_DELIVER_PACK);
+  go_when(CC_GE, S6, S3, L_DELIVER_PACKED);
+  alu(0, T0, S2, S6);
+  imm(T1, 8);
+  alu(4, T0, T0, T1);
+  imm(T1, MEMORY_AT);
+  alu(0, T0, T0, T1);
+  ld_octet(T1, T0, 0);
+  imm(T0, HAND_AT);
+  alu(0, T0, T0, S6);
+  st_octet(T1, T0, 0);
+  alu_imm(S6, S6, 1);
+  go(L_DELIVER_PACK);
+  lab(L_DELIVER_PACKED);
+  imm(SYSCALL_REG, SYS_BECOME);
+  imm(A0, HAND_AT);
+  move(A1, S3);
+  ask_the_world();
+  go_when(CC_GE, A0, ZERO, L_DELIVER_DONE);
+  imm(SYSCALL_REG, SYS_WRITE);
+  imm(A0, 1);
+  imm(A1, HAND_AT);
+  move(A2, S3);
+  ask_the_world();
+  lab(L_DELIVER_DONE);
+  pop_reg(RETURN);
+  ret_now();
+  return 0;
+}
+
+fn gen_deliver(where, count) {
+  take(A0, where);
+  take(A1, count);
+  call_to(L_DELIVER);
+  return gen_const(0);
+}
+
+fn parse_call_builtin(kind, first_arg) {
+  if (kind == 1) {
+    take(A0, first_arg);
+    call_to(L_PUTCHAR);
+    var r = new_reg();
+    give(r, A0);
+    return r;
+  }
+  if (kind == 2) {
+    call_to(L_GETCHAR);
+    var r2 = new_reg();
+    give(r2, A0);
+    return r2;
+  }
+  take(A0, first_arg);
+  call_to(L_QUIT);
+  return gen_const(0);
+}
+
+# ----------------------------------------------------------------------
+# the two ends of the file
+# ----------------------------------------------------------------------
+
+fn emit_header() {
+  lab(L_START);
+  imm(FRAME_POINTER, 0);
+  imm(FRAME_BASE, 0);
+  call_to(L_INIT);
+  call_to(L_MAIN);
+  call_to(L_FLUSH);
+  imm(SYSCALL_REG, SYS_EXIT_GROUP);
+  imm(A0, 0);
+  ask_the_world();
+  runtime_putchar();
+  runtime_flush();
+  runtime_getchar();
+  runtime_quit();
+  runtime_deliver();
+  return 0;
+}
+
+# The strings are put down before the loop that copies them, so that the
+# loop can name where they are.  The first machine reads that address off its
+# own instruction pointer; here it is written out, which a program that is
+# never moved is entitled to do.
+fn emit_trailer() {
+  lab(L_STRDATA);
+  var strdata_at = textlen;
+  var i = 0;
+  while (i < strtop) {
+    emit_wide(mem[STRBUF + i], 8);
+    i = i + 1;
+  }
+
+  lab(L_INIT);
+  i = 0;
+  while (i < nglobals) {
+    imm(T0, GLOBALS_AT + i * 8);
+    imm_wide(T1, mem[GLBINIT + i]);
+    st(T1, T0, 0);
+    i = i + 1;
+  }
+  imm(T0, IMAGE_BASE + ELF_HEADER + SEGMENT_HEADER * SEGMENTS + strdata_at);
+  imm(T1, MEMORY_AT + STRBASE * 8);
+  imm(T3, strtop);
+  lab(L_COPY);
+  go_when(CC_EQ, T3, ZERO, L_COPY_DONE);
+  ld(T4, T0, 0);
+  st(T4, T1, 0);
+  alu_imm(T0, T0, 8);
+  alu_imm(T1, T1, 8);
+  alu_imm(T3, T3, 0 - 1);
+  go(L_COPY);
+  lab(L_COPY_DONE);
+  ret_now();
+  link_text();
+  native_image(BSS_SPAN);
+  return 0;
+}
+'''
+
+
 GLYPH_RV_ADDRESSES_GSL2: Final[str] = r'''
 # ----------------------------------------------------------------------
 # the third machine, and where its octets are kept
@@ -13990,6 +14649,10 @@ GLYPHARM_GSL2: Final[str] = (
 GLYPHRV_GSL2: Final[str] = (
     GSL_FRONT_END_GSL2 + GLYPH_RV_ADDRESSES_GSL2 + RV_ENCODER_GSL2
     + ELF_WRITER_GSL2 + GLYPH_RV_TAIL_GSL2
+)
+GSLCRV_GSL2: Final[str] = (
+    GSL2_LANGUAGE_GSL2 + GSL2_RV_ADDRESSES_GSL2 + RV_ENCODER_GSL2
+    + ELF_WRITER_GSL2 + GSL2_RV_TAIL_GSL2
 )
 GSLCARM_GSL2: Final[str] = (
     GSL2_LANGUAGE_GSL2 + GSL2_ARM_ADDRESSES_GSL2 + ARM_ENCODER_GSL2
@@ -22539,7 +23202,7 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot.add_argument("--workdir", metavar="DIR")
     boot.add_argument("--emit-gsl2",
                       choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf",
-                               "glypharm", "gslcarm", "glyphrv"))
+                               "glypharm", "gslcarm", "glyphrv", "gslcrv"))
     boot.add_argument("--close-the-toolchain", action="store_true",
                       help="build the compiler with itself, and nothing else")
     boot.add_argument("--boot-the-compiler", action="store_true",
@@ -22673,6 +23336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "glypharm": GLYPHARM_GSL2,
                 "gslcarm": GSLCARM_GSL2,
                 "glyphrv": GLYPHRV_GSL2,
+                "gslcrv": GSLCRV_GSL2,
             }[namespace.emit_gsl2]
         )
         return 0
