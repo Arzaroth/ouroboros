@@ -18007,6 +18007,13 @@ class Aarch64Assembler:
     def _word(self, value: int) -> None:
         self._code.extend(struct.pack("<I", value & 0xFFFFFFFF))
 
+    WIDE_MOVES: ClassVar[Mapping[str, int]] = {
+        "movn": 0x92800000, "movz": 0xD2800000, "movk": 0xF2800000,
+    }
+
+    def _wide_move(self, kind: str, destination: int, half: int, index: int) -> None:
+        self._word(self.WIDE_MOVES[kind] | (index << 21) | (half << 5) | destination)
+
     def _branch_site(self, word: int, name: str, kind: str) -> None:
         self._fixups.append((len(self._code), name, kind))
         self._word(word)
@@ -18026,20 +18033,19 @@ class Aarch64Assembler:
             # common small negative.
             inverted = [half ^ 0xFFFF for half in halfwords]
             first = next((i for i, half in enumerate(inverted) if half), 0)
-            self._word(0x92800000 | (first << 21) | (inverted[first] << 5) | destination)
+            self._wide_move("movn", destination, inverted[first], first)
             for index, half in enumerate(halfwords):
                 if index != first and half != 0xFFFF:
-                    self._word(0xF2800000 | (index << 21) | (half << 5) | destination)
+                    self._wide_move("movk", destination, half, index)
             return
         if not unsigned:
-            self._word(0xD2800000 | destination)
+            self._wide_move("movz", destination, 0, 0)
             return
         written = False
         for index, half in enumerate(halfwords):
             if half:
-                self._word(
-                    (0xF2800000 if written else 0xD2800000)
-                    | (index << 21) | (half << 5) | destination
+                self._wide_move(
+                    "movk" if written else "movz", destination, half, index
                 )
                 written = True
 
@@ -18594,6 +18600,12 @@ class Riscv64Assembler:
             | (funct3 << 12) | ((value & 0x1F) << 7) | opcode
         )
 
+    def _u(self, value: int, rd: int) -> None:
+        self._word(((value & 0xFFFFF) << 12) | (rd << 7) | 0b0110111)
+
+    def _j(self, offset: int, rd: int) -> None:
+        self._word(self._jtype(offset) | (rd << 7) | 0b1101111)
+
     def _b(self, offset: int, rs2: int, rs1: int, funct3: int) -> None:
         self._word(
             ((offset >> 12 & 1) << 31) | ((offset >> 5 & 0x3F) << 25) | (rs2 << 20)
@@ -18619,7 +18631,7 @@ class Riscv64Assembler:
         if not -(1 << 31) <= value < (1 << 31):
             raise MachineCodeError(f"{value} is wider than the container can carry")
         low = ((value & 0xFFF) ^ 0x800) - 0x800
-        self._word((((value - low) >> 12 & 0xFFFFF) << 12) | (destination << 7) | 0b0110111)
+        self._u((value - low) >> 12, destination)
         if low:
             self._i(low, destination, 0b000, destination, 0b0010011)
 
@@ -18679,11 +18691,11 @@ class Riscv64Assembler:
 
     def jump(self, name: str) -> None:
         self._fixups.append((len(self._code), name))
-        self._word(0b1101111)
+        self._j(0, RISCV_ZERO)
 
     def call(self, name: str) -> None:
         self._fixups.append((len(self._code), name))
-        self._word((RISCV_RETURN << 7) | 0b1101111)
+        self._j(0, RISCV_RETURN)
 
     def branch(self, condition: str, left: int, right: int, name: str) -> None:
         funct3, swapped = RISCV_INVERTED[condition]
