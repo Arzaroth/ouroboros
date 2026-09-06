@@ -13208,6 +13208,777 @@ fn main() {
 }
 '''
 
+GLYPH_RV_ADDRESSES_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# the third machine, and where its octets are kept
+# ----------------------------------------------------------------------
+
+var IMAGE_AT = 1330000;
+var TEXT = 1330176;
+var LBLOFF = 1730000;
+var FIXAT = 1800000;
+var FIXID = 1870000;
+
+var TEXT_LIMIT = 399824;
+var LABEL_LIMIT = 70000;
+var FIX_LIMIT = 70000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var ELF_ALIGN = 4096;
+var ELF_MACHINE = 243;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+var SYS_WRITE = 64;
+var SYS_EXIT_GROUP = 93;
+
+var ZERO = 0;
+var RETURN = 1;
+var STACK = 2;
+var DATA = 18;
+var LINK_SAVE = 19;
+var SCRATCH = 31;
+var SYSCALL_REG = 17;
+
+var A0 = 10;
+var A1 = 11;
+var A2 = 12;
+var A3 = 13;
+var T0 = 5;
+var T1 = 6;
+var T2 = 7;
+var T3 = 28;
+var S4 = 20;
+var S5 = 21;
+var S6 = 22;
+var S7 = 23;
+var S8 = 24;
+var S9 = 25;
+var S10 = 26;
+var S11 = 27;
+
+var CC_EQ = 0;
+var CC_NE = 1;
+var CC_LT = 2;
+var CC_GE = 3;
+var CC_GT = 4;
+var CC_LE = 5;
+
+var L_EXIT = 0;
+var L_ZERO_DIVIDE = 1;
+var L_PAINT = 2;
+var L_PAINT_DONE = 3;
+var L_RUN = 4;
+var L_RUN_HEAD = 5;
+var L_RUN_COLUMN = 6;
+var L_RUN_DIAGONAL = 7;
+var L_RUN_ANTI = 8;
+var L_RUN_PAINT = 9;
+var L_RUN_DONE = 10;
+var L_SNAP = 11;
+var L_SNAP_HEAD = 12;
+var L_SNAP_DONE = 13;
+var L_APPLY = 14;
+var L_APPLY_ROW = 15;
+var L_APPLY_COLUMN = 16;
+var L_APPLY_COLUMN_STEP = 17;
+var L_APPLY_ROW_STEP = 18;
+var L_APPLY_DONE = 19;
+var L_RENDER = 20;
+var L_RENDER_ROW = 21;
+var L_RENDER_SCAN = 22;
+var L_RENDER_SCAN_STEP = 23;
+var L_RENDER_PRINT = 24;
+var L_RENDER_CELL = 25;
+var L_RENDER_INK = 26;
+var L_RENDER_BLANK = 27;
+var L_RENDER_ADVANCE = 28;
+var L_RENDER_NEWLINE = 29;
+var L_RENDER_FLUSH = 30;
+var L_CODE = 32;
+
+var textlen = 0;
+var nfix = 0;
+var spare = 0;
+
+var lay_canvas = 0;
+var lay_snapshot = 0;
+var lay_frame = 0;
+var lay_output = 0;
+var lay_size = 0;
+'''
+
+
+RV_ENCODER_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# a riscv64 encoder, and the octets it makes
+# ----------------------------------------------------------------------
+#
+# Fixed width like the other one, so a field is still a multiplication and a
+# word is still an addition.  What differs is that the offset of a branch or
+# a jump is scattered through the word rather than lying in one place, so
+# every one of them is taken apart before it is put in.
+#
+# The branch this machine has reaches four kilooctets and an instruction
+# stream can be longer than that, so a branch is written as its own opposite
+# jumped over an unconditional jump, which reaches a megaoctet.
+
+fn octet_of(v) {
+  var r = v % 256;
+  if (r < 0) {
+    r = r + 256;
+  }
+  return r;
+}
+
+fn shift_octet(v) {
+  if (v < 0) {
+    return (v - 255) / 256;
+  }
+  return v / 256;
+}
+
+# A signed number as the unsigned field of `width` bits that carries it.
+fn bits_of(v, width) {
+  var span = 1;
+  var i = 0;
+  while (i < width) {
+    span = span * 2;
+    i = i + 1;
+  }
+  var r = v % span;
+  if (r < 0) {
+    r = r + span;
+  }
+  return r;
+}
+
+fn emit_wide(v, count) {
+  var i = 0;
+  while (i < count) {
+    if (textlen >= TEXT_LIMIT) {
+      fail("the program is longer than there is room to build it in");
+    }
+    mem[TEXT + textlen] = octet_of(v);
+    textlen = textlen + 1;
+    v = shift_octet(v);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn word(v) {
+  return emit_wide(v, 4);
+}
+
+fn lab(id) {
+  if (id >= LABEL_LIMIT) {
+    fail("more places to jump to than there is room for");
+  }
+  mem[LBLOFF + id] = textlen;
+  return 0;
+}
+
+fn read_word(at) {
+  return mem[TEXT + at]
+       + mem[TEXT + at + 1] * 256
+       + mem[TEXT + at + 2] * 65536
+       + mem[TEXT + at + 3] * 16777216;
+}
+
+fn write_word(at, v) {
+  var k = 0;
+  while (k < 4) {
+    mem[TEXT + at + k] = octet_of(v);
+    v = shift_octet(v);
+    k = k + 1;
+  }
+  return 0;
+}
+
+# The offset of an unconditional jump, in the four places it is kept.
+fn jump_bits(offset) {
+  var u = bits_of(offset, 21);
+  var b20 = u / 1048576;
+  var b1 = (u / 2) % 1024;
+  var b11 = (u / 2048) % 2;
+  var b12 = (u / 4096) % 256;
+  return b20 * 2147483648 + b1 * 2097152 + b11 * 1048576 + b12 * 4096;
+}
+
+fn jump_site(w, id) {
+  if (nfix >= FIX_LIMIT) {
+    fail("more jumps than there is room to remember");
+  }
+  if (id >= LABEL_LIMIT) {
+    fail("more places to jump to than there is room for");
+  }
+  mem[FIXAT + nfix] = textlen;
+  mem[FIXID + nfix] = id;
+  nfix = nfix + 1;
+  word(w);
+  return 0;
+}
+
+fn link_text() {
+  var i = 0;
+  while (i < nfix) {
+    var site = mem[FIXAT + i];
+    var offset = mem[LBLOFF + mem[FIXID + i]] - site;
+    if (offset >= 1048576 || offset < 0 - 1048576) {
+      fail("a jump is further than a jump reaches");
+    }
+    write_word(site, read_word(site) + jump_bits(offset));
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the five shapes an instruction comes in
+# ----------------------------------------------------------------------
+
+fn form_r(funct7, rs2, rs1, funct3, rd, opcode) {
+  return word(funct7 * 33554432 + rs2 * 1048576 + rs1 * 32768
+              + funct3 * 4096 + rd * 128 + opcode);
+}
+
+fn form_i(value, rs1, funct3, rd, opcode) {
+  if (value < 0 - 2048 || value >= 2048) {
+    fail("a number in this program does not fit where it has to go");
+  }
+  return word(bits_of(value, 12) * 1048576 + rs1 * 32768
+              + funct3 * 4096 + rd * 128 + opcode);
+}
+
+fn form_s(value, rs2, rs1, funct3, opcode) {
+  if (value < 0 - 2048 || value >= 2048) {
+    fail("a number in this program does not fit where it has to go");
+  }
+  var u = bits_of(value, 12);
+  return word((u / 32) * 33554432 + rs2 * 1048576 + rs1 * 32768
+              + funct3 * 4096 + (u % 32) * 128 + opcode);
+}
+
+fn form_b(offset, rs2, rs1, funct3) {
+  var u = bits_of(offset, 13);
+  return word((u / 4096) * 2147483648 + ((u / 32) % 64) * 33554432
+              + rs2 * 1048576 + rs1 * 32768 + funct3 * 4096
+              + ((u / 2) % 16) * 256 + ((u / 2048) % 2) * 128 + 99);
+}
+
+# ----------------------------------------------------------------------
+# the instructions the backend asks for, and no more
+# ----------------------------------------------------------------------
+
+fn move(d, s) {
+  return form_i(0, s, 0, d, 19);
+}
+
+# One instruction where the number is small enough, and two where it is not.
+fn imm(d, v) {
+  if (v >= 0 - 2048 && v < 2048) {
+    return form_i(v, ZERO, 0, d, 19);
+  }
+  if (v < 0 - 2147483648 || v >= 2147483648) {
+    fail("a number in this program is wider than the container can carry");
+  }
+  var low = v % 4096;
+  if (low < 0) {
+    low = low + 4096;
+  }
+  if (low >= 2048) {
+    low = low - 4096;
+  }
+  var upper = (v - low) / 4096;
+  word(bits_of(upper, 20) * 4096 + d * 128 + 55);
+  if (low != 0) {
+    form_i(low, d, 0, d, 19);
+  }
+  return 0;
+}
+
+# add 0/0, sub 32/0, xor 0/4, slt 0/2, mul 1/0, div 1/4, rem 1/6.
+fn alu(op, d, l, r) {
+  if (op == 0) { return form_r(0, r, l, 0, d, 51); }
+  if (op == 1) { return form_r(32, r, l, 0, d, 51); }
+  if (op == 2) { return form_r(0, r, l, 4, d, 51); }
+  if (op == 3) { return form_r(0, r, l, 2, d, 51); }
+  if (op == 4) { return form_r(1, r, l, 0, d, 51); }
+  if (op == 5) { return form_r(1, r, l, 4, d, 51); }
+  return form_r(1, r, l, 6, d, 51);
+}
+
+fn alu_imm(d, l, v) {
+  if (v >= 0 - 2048 && v < 2048) {
+    return form_i(v, l, 0, d, 19);
+  }
+  imm(SCRATCH, v);
+  return alu(0, d, l, SCRATCH);
+}
+
+fn xor_imm(d, s, v) {
+  return form_i(v, s, 4, d, 19);
+}
+
+fn negate(d, s) {
+  return alu(1, d, ZERO, s);
+}
+
+fn ld(d, base, offset) {
+  return form_i(offset, base, 3, d, 3);
+}
+
+fn st(s, base, offset) {
+  return form_s(offset, s, base, 3, 35);
+}
+
+fn ld_octet(d, base, offset) {
+  return form_i(offset, base, 4, d, 3);
+}
+
+fn st_octet(s, base, offset) {
+  return form_s(offset, s, base, 0, 35);
+}
+
+fn push_reg(r) {
+  form_i(0 - 16, STACK, 0, STACK, 19);
+  return st(r, STACK, 0);
+}
+
+fn pop_reg(r) {
+  ld(r, STACK, 0);
+  return form_i(16, STACK, 0, STACK, 19);
+}
+
+fn go(id) {
+  return jump_site(111, id);
+}
+
+fn call_to(id) {
+  return jump_site(RETURN * 128 + 111, id);
+}
+
+# The condition wanted, written as its opposite jumped over the jump: eq
+# becomes bne, ne beq, lt bge, ge blt, and the two that read their operands
+# the other way round are gt and le.
+fn go_when(cc, l, r, id) {
+  var funct3 = 1;
+  var swapped = 0;
+  if (cc == 1) { funct3 = 0; }
+  if (cc == 2) { funct3 = 5; }
+  if (cc == 3) { funct3 = 4; }
+  if (cc == 4) { funct3 = 5; swapped = 1; }
+  if (cc == 5) { funct3 = 4; swapped = 1; }
+  var first = l;
+  var second = r;
+  if (swapped == 1) {
+    first = r;
+    second = l;
+  }
+  form_b(8, second, first, funct3);
+  return go(id);
+}
+
+fn go_when_imm(cc, l, v, id) {
+  if (v == 0) {
+    return go_when(cc, l, ZERO, id);
+  }
+  imm(SCRATCH, v);
+  return go_when(cc, l, SCRATCH, id);
+}
+
+fn ret_now() {
+  return form_i(0, RETURN, 0, ZERO, 103);
+}
+
+fn trap_now() {
+  return word(1048691);
+}
+
+fn ask_the_world() {
+  return word(115);
+}
+
+fn align_up(value, boundary) {
+  return ((value + boundary - 1) / boundary) * boundary;
+}
+'''
+
+
+GLYPH_RV_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# layer 18 once more, for the third machine
+# ----------------------------------------------------------------------
+
+fn next_label() {
+  spare = spare + 1;
+  return spare - 1;
+}
+
+fn layout_build() {
+  var cells = ORDER * ORDER;
+  var slots = frame;
+  if (slots < 1) {
+    slots = 1;
+  }
+  lay_canvas = 0;
+  lay_snapshot = cells;
+  lay_frame = align_up(2 * cells, 8);
+  lay_output = lay_frame + slots * 8;
+  lay_size = lay_output + 2 * cells + ORDER + 16;
+  return 0;
+}
+
+fn native_intrinsic(index) {
+  if (index == 0) { return 0; }
+  if (index == 1) { return APOTHEM; }
+  if (index == 2) { return EXTREMUM; }
+  return ORDER;
+}
+
+# destination = the base of the data, plus a region's offset, plus an index.
+fn at_data(d, index, offset) {
+  alu(0, d, DATA, index);
+  if (offset != 0) {
+    alu_imm(d, d, offset);
+  }
+  return 0;
+}
+
+fn native_divide(address) {
+  var floored = next_label();
+  pop_reg(A1);
+  pop_reg(A0);
+  go_when(CC_EQ, A1, ZERO, L_ZERO_DIVIDE);
+  alu(5, A2, A0, A1);
+  alu(6, A3, A0, A1);
+  go_when(CC_EQ, A3, ZERO, floored);
+  alu(2, A3, A3, A1);
+  go_when(CC_GE, A3, ZERO, floored);
+  alu_imm(A2, A2, 0 - 1);
+  lab(floored);
+  push_reg(A2);
+  return 0;
+}
+
+fn native_close() {
+  call_to(L_SNAP);
+  var i = 0;
+  while (i < ngroup) {
+    imm(A0, mem[GRPA + i]);
+    imm(A1, mem[GRPB + i]);
+    imm(A2, mem[GRPC + i]);
+    imm(A3, mem[GRPD + i]);
+    call_to(L_APPLY);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn native_instruction(address) {
+  var kind = mem[CODEK + address];
+  var argument = mem[CODEA + address];
+  if (kind == OP_HALT) {
+    go(L_EXIT);
+  }
+  if (kind == OP_JMP) {
+    go(L_CODE + argument);
+  }
+  if (kind == OP_JF) {
+    pop_reg(A0);
+    go_when(CC_EQ, A0, ZERO, L_CODE + argument);
+  }
+  if (kind == OP_PUSH) {
+    imm(A0, argument);
+    push_reg(A0);
+  }
+  if (kind == OP_INTR) {
+    imm(A0, native_intrinsic(argument));
+    push_reg(A0);
+  }
+  if (kind == OP_LOADL) {
+    at_data(T0, ZERO, lay_frame + argument * 8);
+    ld(A0, T0, 0);
+    push_reg(A0);
+  }
+  if (kind == OP_STOREL) {
+    pop_reg(A0);
+    at_data(T0, ZERO, lay_frame + argument * 8);
+    st(A0, T0, 0);
+  }
+  if (kind == OP_ADD) {
+    pop_reg(A1);
+    pop_reg(A0);
+    alu(0, A0, A0, A1);
+    push_reg(A0);
+  }
+  if (kind == OP_SUB) {
+    pop_reg(A1);
+    pop_reg(A0);
+    alu(1, A0, A0, A1);
+    push_reg(A0);
+  }
+  if (kind == OP_MUL) {
+    pop_reg(A1);
+    pop_reg(A0);
+    alu(4, A0, A0, A1);
+    push_reg(A0);
+  }
+  if (kind == OP_DIV) {
+    native_divide(address);
+  }
+  if (kind == OP_NEG) {
+    pop_reg(A0);
+    negate(A0, A0);
+    push_reg(A0);
+  }
+  if (kind == OP_CMPLE) {
+    pop_reg(A1);
+    pop_reg(A0);
+    alu(3, A0, A1, A0);
+    xor_imm(A0, A0, 1);
+    push_reg(A0);
+  }
+  if (kind == OP_EMIT) {
+    pop_reg(A3);
+    pop_reg(A2);
+    pop_reg(A1);
+    imm(A0, argument);
+    call_to(L_RUN);
+  }
+  if (kind == OP_CLOSE) {
+    native_close();
+  }
+  return 0;
+}
+
+fn native_paint() {
+  lab(L_PAINT);
+  go_when(CC_LT, A0, ZERO, L_PAINT_DONE);
+  go_when_imm(CC_GE, A0, ORDER, L_PAINT_DONE);
+  go_when(CC_LT, A1, ZERO, L_PAINT_DONE);
+  go_when_imm(CC_GE, A1, ORDER, L_PAINT_DONE);
+  imm(T0, ORDER);
+  alu(4, T0, A0, T0);
+  alu(0, T0, T0, A1);
+  at_data(T0, T0, lay_canvas);
+  imm(T1, 1);
+  st_octet(T1, T0, 0);
+  lab(L_PAINT_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_run() {
+  lab(L_RUN);
+  move(LINK_SAVE, RETURN);
+  move(S4, A0);
+  move(S5, A1);
+  move(S6, A2);
+  move(S7, A3);
+  lab(L_RUN_HEAD);
+  go_when(CC_GT, S6, S7, L_RUN_DONE);
+  go_when_imm(CC_EQ, S4, 1, L_RUN_COLUMN);
+  go_when_imm(CC_EQ, S4, 2, L_RUN_DIAGONAL);
+  go_when_imm(CC_EQ, S4, 3, L_RUN_ANTI);
+  move(A0, S5);
+  move(A1, S6);
+  go(L_RUN_PAINT);
+  lab(L_RUN_COLUMN);
+  move(A0, S6);
+  move(A1, S5);
+  go(L_RUN_PAINT);
+  lab(L_RUN_DIAGONAL);
+  move(A0, S6);
+  alu(0, A1, S6, S5);
+  go(L_RUN_PAINT);
+  lab(L_RUN_ANTI);
+  move(A0, S6);
+  alu(1, A1, S5, S6);
+  lab(L_RUN_PAINT);
+  call_to(L_PAINT);
+  alu_imm(S6, S6, 1);
+  go(L_RUN_HEAD);
+  lab(L_RUN_DONE);
+  move(RETURN, LINK_SAVE);
+  ret_now();
+  return 0;
+}
+
+fn native_snapshot() {
+  lab(L_SNAP);
+  at_data(S4, ZERO, lay_canvas);
+  at_data(S5, ZERO, lay_snapshot);
+  imm(T0, 0);
+  lab(L_SNAP_HEAD);
+  go_when_imm(CC_GE, T0, ORDER * ORDER, L_SNAP_DONE);
+  alu(0, T1, S4, T0);
+  ld_octet(T2, T1, 0);
+  alu(0, T1, S5, T0);
+  st_octet(T2, T1, 0);
+  alu_imm(T0, T0, 1);
+  go(L_SNAP_HEAD);
+  lab(L_SNAP_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_apply() {
+  lab(L_APPLY);
+  move(LINK_SAVE, RETURN);
+  move(S4, A0);
+  move(S5, A1);
+  move(S6, A2);
+  move(S7, A3);
+  at_data(S8, ZERO, lay_snapshot);
+  imm(S9, 0);
+  lab(L_APPLY_ROW);
+  go_when_imm(CC_GE, S9, ORDER, L_APPLY_DONE);
+  imm(S10, 0);
+  lab(L_APPLY_COLUMN);
+  go_when_imm(CC_GE, S10, ORDER, L_APPLY_ROW_STEP);
+  imm(T0, ORDER);
+  alu(4, T0, S9, T0);
+  alu(0, T0, T0, S10);
+  alu(0, T0, S8, T0);
+  ld_octet(T1, T0, 0);
+  go_when(CC_EQ, T1, ZERO, L_APPLY_COLUMN_STEP);
+  alu_imm(S11, S9, 0 - APOTHEM);
+  alu_imm(T3, S10, 0 - APOTHEM);
+  alu(4, T0, S4, S11);
+  alu(4, T1, S5, T3);
+  alu(0, T0, T0, T1);
+  alu_imm(A0, T0, APOTHEM);
+  alu(4, T0, S6, S11);
+  alu(4, T1, S7, T3);
+  alu(0, T0, T0, T1);
+  alu_imm(A1, T0, APOTHEM);
+  call_to(L_PAINT);
+  lab(L_APPLY_COLUMN_STEP);
+  alu_imm(S10, S10, 1);
+  go(L_APPLY_COLUMN);
+  lab(L_APPLY_ROW_STEP);
+  alu_imm(S9, S9, 1);
+  go(L_APPLY_ROW);
+  lab(L_APPLY_DONE);
+  move(RETURN, LINK_SAVE);
+  ret_now();
+  return 0;
+}
+
+fn native_render() {
+  lab(L_RENDER);
+  at_data(S4, ZERO, lay_canvas);
+  at_data(S5, ZERO, lay_output);
+  imm(S6, 0);
+  imm(S7, 0);
+  lab(L_RENDER_ROW);
+  go_when_imm(CC_GE, S6, ORDER, L_RENDER_FLUSH);
+  imm(S9, 0 - 1);
+  imm(S8, 0);
+  lab(L_RENDER_SCAN);
+  go_when_imm(CC_GE, S8, ORDER, L_RENDER_PRINT);
+  imm(T0, ORDER);
+  alu(4, T0, S6, T0);
+  alu(0, T0, T0, S8);
+  alu(0, T0, S4, T0);
+  ld_octet(T1, T0, 0);
+  go_when(CC_EQ, T1, ZERO, L_RENDER_SCAN_STEP);
+  move(S9, S8);
+  lab(L_RENDER_SCAN_STEP);
+  alu_imm(S8, S8, 1);
+  go(L_RENDER_SCAN);
+  lab(L_RENDER_PRINT);
+  imm(S8, 0);
+  lab(L_RENDER_CELL);
+  go_when(CC_GT, S8, S9, L_RENDER_NEWLINE);
+  go_when(CC_LE, S8, ZERO, L_RENDER_INK);
+  imm(T2, 32);
+  alu(0, T1, S5, S7);
+  st_octet(T2, T1, 0);
+  alu_imm(S7, S7, 1);
+  lab(L_RENDER_INK);
+  imm(T0, ORDER);
+  alu(4, T0, S6, T0);
+  alu(0, T0, T0, S8);
+  alu(0, T0, S4, T0);
+  ld_octet(T1, T0, 0);
+  go_when(CC_EQ, T1, ZERO, L_RENDER_BLANK);
+  imm(T2, 42);
+  go(L_RENDER_ADVANCE);
+  lab(L_RENDER_BLANK);
+  imm(T2, 32);
+  lab(L_RENDER_ADVANCE);
+  alu(0, T1, S5, S7);
+  st_octet(T2, T1, 0);
+  alu_imm(S7, S7, 1);
+  alu_imm(S8, S8, 1);
+  go(L_RENDER_CELL);
+  lab(L_RENDER_NEWLINE);
+  imm(T2, 10);
+  alu(0, T1, S5, S7);
+  st_octet(T2, T1, 0);
+  alu_imm(S7, S7, 1);
+  alu_imm(S6, S6, 1);
+  go(L_RENDER_ROW);
+  lab(L_RENDER_FLUSH);
+  imm(SYSCALL_REG, SYS_WRITE);
+  imm(A0, 1);
+  at_data(A1, ZERO, lay_output);
+  move(A2, S7);
+  ask_the_world();
+  ret_now();
+  return 0;
+}
+
+fn native_encode() {
+  layout_build();
+  spare = L_CODE + ncode;
+  imm(DATA, DATA_BASE);
+  var i = 0;
+  while (i < ncode) {
+    lab(L_CODE + i);
+    native_instruction(i);
+    i = i + 1;
+  }
+  lab(L_EXIT);
+  call_to(L_RENDER);
+  imm(SYSCALL_REG, SYS_EXIT_GROUP);
+  imm(A0, 0);
+  ask_the_world();
+  lab(L_ZERO_DIVIDE);
+  trap_now();
+  native_paint();
+  native_run();
+  native_snapshot();
+  native_apply();
+  native_render();
+  link_text();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the driver
+# ----------------------------------------------------------------------
+
+fn main() {
+  read_stdin();
+  preprocess();
+  tokenize();
+  parse_program();
+  optimise();
+  assemble();
+  group_build();
+  native_encode();
+  native_image(lay_size);
+  return 0;
+}
+'''
+
+
 GLYPHELF_GSL2: Final[str] = (
     GSL_FRONT_END_GSL2 + GLYPH_NATIVE_ADDRESSES_GSL2 + X86_ENCODER_GSL2
     + ELF_WRITER_GSL2 + GLYPH_NATIVE_TAIL_GSL2
@@ -13215,6 +13986,10 @@ GLYPHELF_GSL2: Final[str] = (
 GLYPHARM_GSL2: Final[str] = (
     GSL_FRONT_END_GSL2 + GLYPH_ARM_ADDRESSES_GSL2 + ARM_ENCODER_GSL2
     + ELF_WRITER_GSL2 + GLYPH_ARM_TAIL_GSL2
+)
+GLYPHRV_GSL2: Final[str] = (
+    GSL_FRONT_END_GSL2 + GLYPH_RV_ADDRESSES_GSL2 + RV_ENCODER_GSL2
+    + ELF_WRITER_GSL2 + GLYPH_RV_TAIL_GSL2
 )
 GSLCARM_GSL2: Final[str] = (
     GSL2_LANGUAGE_GSL2 + GSL2_ARM_ADDRESSES_GSL2 + ARM_ENCODER_GSL2
@@ -15246,8 +16021,9 @@ def build_front_ends(directory: Path, opt_level: int = 2) -> tuple[Path, str, Pa
 
 # The machines this one is not, each with the tail that writes for it and,
 # where there is one, the compiler that runs there.
-CROSSINGS: Final[tuple[tuple[str, str, str, str, str], ...]] = (
+CROSSINGS: Final[tuple[tuple[str, str, str, str | None, str], ...]] = (
     ("aarch64", "gslcarm", "glypharm", GSLCARM_GSL2, GLYPHARM_GSL2),
+    ("riscv64", "gslcrv", "glyphrv", None, GLYPHRV_GSL2),
 )
 
 
@@ -15384,7 +16160,9 @@ def close_the_toolchain(
         native_front = 0
         native_program = False
         skipped = ""
-        if machine_code_runnable(name):
+        if compiler_text is None:
+            skipped = "there is no compiler for it yet"
+        elif machine_code_runnable(name):
             seeded_there = directory / f"seeded-{name}"
             seeded_there.write_bytes(gsl2_machine_code(compiler_text))
             seeded_there.chmod(0o755)
@@ -21761,7 +22539,7 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot.add_argument("--workdir", metavar="DIR")
     boot.add_argument("--emit-gsl2",
                       choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf",
-                               "glypharm", "gslcarm"))
+                               "glypharm", "gslcarm", "glyphrv"))
     boot.add_argument("--close-the-toolchain", action="store_true",
                       help="build the compiler with itself, and nothing else")
     boot.add_argument("--boot-the-compiler", action="store_true",
@@ -21894,6 +22672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "glyphelf": GLYPHELF_GSL2,
                 "glypharm": GLYPHARM_GSL2,
                 "gslcarm": GSLCARM_GSL2,
+                "glyphrv": GLYPHRV_GSL2,
             }[namespace.emit_gsl2]
         )
         return 0
