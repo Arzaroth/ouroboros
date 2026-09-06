@@ -4964,6 +4964,7 @@ class AssuranceSuite:
                 self._lexer_covers_source,
                 self._every_octet_is_an_instruction,
                 self._every_step_is_named,
+                self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
                 self._coordinate_immutable,
@@ -5097,6 +5098,27 @@ class AssuranceSuite:
             "every step it runs is one it can name",
             True,
             f"{steps} step(s) across {len(MACHINES)} machines",
+        )
+
+    @staticmethod
+    def _every_emitter_is_reached(artifacts: CompilationArtifacts) -> CheckResult:
+        """Whether anything this file builds asks for every instruction it writes.
+
+        The vocabulary being closed is checked by the readers, which refuse an
+        octet none of the encoders writes.  This is the other half: an emitter
+        nothing emits is checked by nothing, so it can rot or disagree with the
+        reader that would have to read it and no run would say so.
+        """
+        try:
+            idle = unreached_emitters()
+        except GlyphPlatformError as exc:
+            return CheckResult("every instruction it can write is written", False, str(exc))
+        written = sum(len(_emitters(name)) for name in ASSEMBLERS)
+        return CheckResult(
+            "every instruction it can write is written",
+            not idle,
+            f"{written - len(idle)} of {written}"
+            + (f", never: {' '.join(idle)}" if idle else ""),
         )
 
     @staticmethod
@@ -17487,9 +17509,6 @@ class X86Assembler:
     def write_msr(self) -> None:
         self._emit(0x0F, 0x30)
 
-    def jump_register(self, target: Register) -> None:
-        self._quad((0xFF,), 4, target)
-
     def leave(self) -> None:
         """The frame back the way it came, in one octet."""
         self._emit(0xC9)
@@ -22859,6 +22878,8 @@ class MachineNarrator:
             return f"{'neg' if reg & 7 == 3 else 'idiv'} {place}"
         if octet == 0xFF:
             reg, place = self._place(rex)
+            if reg & 7 > 1:
+                raise MachineDecodeError(f"group five with extension {reg & 7}")
             return f"{'inc' if reg & 7 == 0 else 'dec'} {place}"
         if octet == 0x85:
             reg, place = self._place(rex)
@@ -23098,6 +23119,85 @@ def _machine_flags(reader: object) -> tuple[tuple[str, bool], ...]:
         (name.lstrip("_"), getattr(reader, name))
         for name in MACHINE_FLAG_NAMES
         if hasattr(reader, name)
+    )
+
+
+# What the four encoders can write, one entry per thing they know how to
+# emit.  The vocabulary being closed is checked already: an octet none of
+# them writes is refused by the readers.  This is the other half of it.
+ASSEMBLERS: Final[tuple[str, ...]] = (
+    "X86Assembler", "Aarch64Assembler", "Riscv64Assembler", "WasmAssembler",
+)
+
+# A program that divides and negates, which are the two pieces of arithmetic
+# the catalogue never asks for.  Division costs the most instructions of
+# anything on every machine, so it is also where the most of them hide.
+DIVIDING_SOURCE: Final[str] = """#pragma gsl 2
+lattice order 7 ;
+symmetry cyclic 4 about centroid ;
+let u = apothem ;
+let v = ( ( u * 3 ) / 2 ) ;
+let w = ( - v + u ) ;
+stroke s0 = column at u span zero .. ( u * 2 ) ;
+stroke s1 = row at v span zero .. ( u + w ) ;
+emit s0 ;
+emit s1 ;
+"""
+
+
+def _emitters(name: str) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            method for method, value in vars(globals()[name]).items()
+            if not method.startswith("_") and callable(value)
+        )
+    )
+
+
+def unreached_emitters() -> tuple[str, ...]:
+    """Everything the encoders can write that nothing this file builds asks for.
+
+    An encoder is checked by what it emits, so an emitter nothing emits is
+    checked by nothing: it can rot, or disagree with the reader that would
+    have to read it, and no run would say so.  This builds one of everything
+    and answers what was never reached.
+    """
+    reached: set[tuple[str, str]] = set()
+    restore: list[tuple[type, str, Any]] = []
+    for name in ASSEMBLERS:
+        assembler = globals()[name]
+        for method in _emitters(name):
+            original = getattr(assembler, method)
+            restore.append((assembler, method, original))
+
+            def watched(self, *arguments, _seen=(name, method), _was=original, **named):
+                reached.add(_seen)
+                return _was(self, *arguments, **named)
+
+            setattr(assembler, method, watched)
+    try:
+        figure = synthesize(7).unwrap_or_raise().module
+        dividing = synthesize_source(DIVIDING_SOURCE).unwrap_or_raise().module
+        for module in (figure, dividing):
+            for architecture in MACHINES:
+                machine_code(module, architecture)
+            wasm_module(module)
+        boot_image(figure)
+        kernel_image(figure)
+        efi_image(figure)
+        arm_boot_image(figure)
+        riscv_boot_image(figure)
+        gsl2_machine_code(
+            "fn main() { var i = 7; putchar('0' + i / 2); return 0; }"
+        )
+    finally:
+        for assembler, method, original in restore:
+            setattr(assembler, method, original)
+    return tuple(
+        f"{name}.{method}"
+        for name in ASSEMBLERS
+        for method in _emitters(name)
+        if (name, method) not in reached
     )
 
 
