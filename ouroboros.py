@@ -4964,6 +4964,7 @@ class AssuranceSuite:
                 self._lexer_covers_source,
                 self._every_octet_is_an_instruction,
                 self._every_step_is_named,
+                self._narration_writes_it_again,
                 self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
@@ -5098,6 +5099,37 @@ class AssuranceSuite:
             "every step it runs is one it can name",
             True,
             f"{steps} step(s) across {len(MACHINES)} machines",
+        )
+
+    @staticmethod
+    def _narration_writes_it_again(artifacts: CompilationArtifacts) -> CheckResult:
+        """Whether what the file says the octets are will write them again.
+
+        The two checks above ask that the narrator walks the text and stops
+        where the text stops, which is a claim about lengths and not about
+        names.  This is the claim about names: every field it took apart is
+        handed back to the encoder that put it together, and the octets come
+        back the same or one of the two has a field wrong.
+        """
+        prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
+        octets = 0
+        try:
+            for architecture in sorted(MACHINES):
+                image = machine_code(artifacts.module, architecture)
+                if reassemble_machine_code(image, architecture) != image[prologue:]:
+                    return CheckResult(
+                        "what it says the octets are writes them again", False,
+                        f"the {architecture} text came back different",
+                    )
+                octets += len(image) - prologue
+        except GlyphPlatformError as exc:
+            return CheckResult(
+                "what it says the octets are writes them again", False, str(exc)
+            )
+        return CheckResult(
+            "what it says the octets are writes them again",
+            True,
+            f"{octets} octets across {len(MACHINES)} machines",
         )
 
     @staticmethod
@@ -22810,111 +22842,173 @@ class MachineNarrator:
         self._at += 8
         return value - (1 << 64) if value >> 63 else value
 
-    def _place(self, rex: int) -> tuple[int, str]:
+    @staticmethod
+    def _show(operand: "Register | MemoryOperand") -> str:
+        if isinstance(operand, Register):
+            return REGISTER_NAMES[operand]
+        inside = REGISTER_NAMES[operand.base]
+        if operand.index is not None:
+            inside += f" + {REGISTER_NAMES[operand.index]}"
+            if operand.scale != 1:
+                inside += f" * {operand.scale}"
+        if operand.displacement:
+            step = operand.displacement
+            inside += f" {'-' if step < 0 else '+'} {abs(step):#x}"
+        return f"[{inside}]"
+
+    def _place(self, rex: int) -> tuple[int, "Register | MemoryOperand"]:
+        """The ModRM octet, and what it names, as the encoder would take it."""
         modrm = self._octet()
         reg = ((modrm >> 3) & 7) | (8 if rex & 0x4 else 0)
         if modrm >> 6 == 3:
-            return reg, REGISTER_NAMES[(modrm & 7) | (8 if rex & 0x1 else 0)]
+            return reg, Register((modrm & 7) | (8 if rex & 0x1 else 0))
         sib = self._octet()
-        base = REGISTER_NAMES[(sib & 7) | (8 if rex & 0x1 else 0)]
+        base = Register((sib & 7) | (8 if rex & 0x1 else 0))
         index = (sib >> 3) & 7
-        scale = 1 << (sib >> 6)
-        displacement = self._long()
-        inside = base
-        if index != 0b100:
-            inside += f" + {REGISTER_NAMES[index | (8 if rex & 0x2 else 0)]}"
-            if scale != 1:
-                inside += f" * {scale}"
-        if displacement:
-            inside += f" {'-' if displacement < 0 else '+'} {abs(displacement):#x}"
-        return reg, f"[{inside}]"
+        return reg, MemoryOperand(
+            base,
+            None if index == 0b100 else Register(index | (8 if rex & 0x2 else 0)),
+            1 << (sib >> 6),
+            self._long(),
+        )
 
-    def _one(self) -> str:
+    def _one(self) -> tuple[str, Redo]:
+        show = self._show
         rex = 0
         octet = self._octet()
         if 0x40 <= octet <= 0x4F:
             rex = octet & 0xF
             octet = self._octet()
+        wide = bool(rex & 0x8)
         if octet == 0x0F:
             second = self._octet()
             if second == 0x05:
-                return "syscall"
+                return "syscall", lambda text, _: text.syscall()
             if second == 0xB6:
                 reg, place = self._place(rex)
-                return f"movzx {REGISTER_NAMES[reg]}, {place}"
+                return (f"movzx {REGISTER_NAMES[reg]}, {show(place)}",
+                        lambda text, _: text.widen_octet(Register(reg), place))
+            if second == 0xB7:
+                reg, place = self._place(rex)
+                return (f"movzx {REGISTER_NAMES[reg]}, word {show(place)}",
+                        lambda text, _: text.widen_word(Register(reg), place))
             if second == 0xAF:
                 reg, place = self._place(rex)
-                return f"imul {REGISTER_NAMES[reg]}, {place}"
+                return (f"imul {REGISTER_NAMES[reg]}, {show(place)}",
+                        lambda text, _: text.multiply(Register(reg), place))
             if 0x90 <= second <= 0x9F:
+                condition = CONDITION_NAMES[second & 0xF]
                 _, place = self._place(rex)
-                return f"set{CONDITION_NAMES[second & 0xF]} {place}"
+                return (f"set{condition} {show(place)}",
+                        lambda text, _: text.set_if(condition, place))
             if 0x80 <= second <= 0x8F:
-                return (
-                    f"j{CONDITION_NAMES[second & 0xF]} "
-                    f"{self._origin + self._at + 4 + self._long():#x}"
-                )
+                condition = CONDITION_NAMES[second & 0xF]
+                target = self._origin + self._at + 4 + self._long()
+                return (f"j{condition} {target:#x}",
+                        lambda text, label: text.jump_if(condition, label(target)))
             raise MachineDecodeError(f"two-octet {second:#04x}")
         if 0x50 <= octet <= 0x57:
-            return f"push {REGISTER_NAMES[(octet & 7) | (8 if rex & 1 else 0)]}"
+            which = Register((octet & 7) | (8 if rex & 1 else 0))
+            return (f"push {REGISTER_NAMES[which]}",
+                    lambda text, _: text.push(which))
         if 0x58 <= octet <= 0x5F:
-            return f"pop {REGISTER_NAMES[(octet & 7) | (8 if rex & 1 else 0)]}"
+            which = Register((octet & 7) | (8 if rex & 1 else 0))
+            return (f"pop {REGISTER_NAMES[which]}",
+                    lambda text, _: text.pop(which))
         if 0xB8 <= octet <= 0xBF:
-            where = REGISTER_NAMES[(octet & 7) | (8 if rex & 1 else 0)]
-            return f"movabs {where}, {self._quad():#x}"
+            which = Register((octet & 7) | (8 if rex & 1 else 0))
+            value = self._quad()
+            return (f"movabs {REGISTER_NAMES[which]}, {value:#x}",
+                    lambda text, _: text.immediate(which, value))
         if octet in MachineReader.ARITHMETIC:
+            name = MachineReader.ARITHMETIC[octet]
             reg, place = self._place(rex)
-            return (
-                f"{MachineReader.ARITHMETIC[octet]} {REGISTER_NAMES[reg]}, {place}"
-            )
+            return (f"{name} {REGISTER_NAMES[reg]}, {show(place)}",
+                    lambda text, _: text.arithmetic(name, Register(reg), place))
         if octet == 0x81:
             reg, place = self._place(rex)
-            return f"{MachineReader.EXTENSIONS[reg & 7]} {place}, {self._long():#x}"
+            name = MachineReader.EXTENSIONS[reg & 7]
+            value = self._long()
+            return (f"{name} {show(place)}, {value:#x}",
+                    lambda text, _: text.arithmetic_immediate(name, place, value))
         if octet == 0x80:
             _, place = self._place(rex)
-            return f"cmp octet {place}, {self._octet():#x}"
+            value = self._octet()
+            return (f"cmp octet {show(place)}, {value:#x}",
+                    lambda text, _: text.compare_octet_immediate(place, value))
         if octet in (0x8B, 0x89, 0x8D, 0x8A, 0x88):
             reg, place = self._place(rex)
-            name = {0x8B: "mov", 0x89: "mov", 0x8D: "lea",
+            name = {0x8B: "mov" if wide else "mov long", 0x89: "mov", 0x8D: "lea",
                     0x8A: "mov octet", 0x88: "mov octet"}[octet]
+            doers = {
+                0x8B: (lambda text, _: text.load(Register(reg), place)) if wide
+                      else (lambda text, _: text.widen_long(Register(reg), place)),
+                0x89: lambda text, _: text.store(place, Register(reg)),
+                0x8D: lambda text, _: text.address_of(Register(reg), place),
+                0x8A: lambda text, _: text.load_octet(Register(reg), place),
+                0x88: lambda text, _: text.store_octet(place, Register(reg)),
+            }
             if octet in (0x89, 0x88):
-                return f"{name} {place}, {REGISTER_NAMES[reg]}"
-            return f"{name} {REGISTER_NAMES[reg]}, {place}"
+                return f"{name} {show(place)}, {REGISTER_NAMES[reg]}", doers[octet]
+            return f"{name} {REGISTER_NAMES[reg]}, {show(place)}", doers[octet]
         if octet == 0xC6:
             _, place = self._place(rex)
-            return f"mov octet {place}, {self._octet():#x}"
+            value = self._octet()
+            return (f"mov octet {show(place)}, {value:#x}",
+                    lambda text, _: text.store_octet_immediate(place, value))
         if octet == 0x69:
             reg, place = self._place(rex)
-            return f"imul {REGISTER_NAMES[reg]}, {place}, {self._long():#x}"
+            value = self._long()
+            return (f"imul {REGISTER_NAMES[reg]}, {show(place)}, {value:#x}",
+                    lambda text, _: text.multiply_immediate(
+                        Register(reg), place, value
+                    ))
         if octet == 0xF7:
             reg, place = self._place(rex)
-            return f"{'neg' if reg & 7 == 3 else 'idiv'} {place}"
+            if reg & 7 == 3:
+                return f"neg {show(place)}", lambda text, _: text.negate(place)
+            return f"idiv {show(place)}", lambda text, _: text.divide(place)
         if octet == 0xFF:
             reg, place = self._place(rex)
             if reg & 7 > 1:
                 raise MachineDecodeError(f"group five with extension {reg & 7}")
-            return f"{'inc' if reg & 7 == 0 else 'dec'} {place}"
+            if reg & 7 == 0:
+                return f"inc {show(place)}", lambda text, _: text.increment(place)
+            return f"dec {show(place)}", lambda text, _: text.decrement(place)
         if octet == 0x85:
             reg, place = self._place(rex)
-            return f"test {REGISTER_NAMES[reg]}, {place}"
+            return (f"test {REGISTER_NAMES[reg]}, {show(place)}",
+                    lambda text, _: text.test(Register(reg), place))
         if octet == 0x99:
-            return "cqo"
+            return "cqo", lambda text, _: text.sign_extend()
         if octet in (0xE9, 0xE8):
             name = "jmp" if octet == 0xE9 else "call"
-            return f"{name} {self._origin + self._at + 4 + self._long():#x}"
+            target = self._origin + self._at + 4 + self._long()
+            return (f"{name} {target:#x}",
+                    lambda text, label: (text.jump if octet == 0xE9 else text.call)(
+                        label(target)
+                    ))
         if octet == 0xC3:
-            return "ret"
+            return "ret", lambda text, _: text.ret()
         raise MachineDecodeError(f"octet {octet:#04x}")
 
-    def narrate(self) -> Iterator[tuple[int, bytes, str]]:
+    def narrate(self) -> Iterator[tuple[int, bytes, str, Redo]]:
         while self._at < len(self._text):
             start = self._at
             try:
-                said = self._one()
+                said, redo = self._one()
             except IndexError:
                 raise MachineDecodeError(
                     f"the text ends in the middle of an instruction at {start:#x}"
                 ) from None
-            yield self._origin + start, self._text[start : self._at], said
+            yield self._origin + start, self._text[start : self._at], said, redo
+
+
+# What a narrator hands back besides the name: the way to write the same
+# instruction again, through the encoder that wrote it the first time.  The
+# second argument names a label for an address, since a branch is the one
+# thing whose octets are not decided until everything around it is.
+Redo = Callable[[Any, Callable[[int], str]], None]
 
 
 class WordNarrator:
@@ -22929,10 +23023,10 @@ class WordNarrator:
         self._text = text
         self._origin = origin
 
-    def _one(self, word: int, at: int) -> str:
+    def _one(self, word: int, at: int) -> tuple[str, Redo]:
         raise NotImplementedError
 
-    def narrate(self) -> Iterator[tuple[int, bytes, str]]:
+    def narrate(self) -> Iterator[tuple[int, bytes, str, Redo]]:
         if len(self._text) % 4:
             raise MachineDecodeError(
                 f"the text is {len(self._text)} octets, which is not whole words"
@@ -22940,7 +23034,8 @@ class WordNarrator:
         for step in range(0, len(self._text), 4):
             octets = self._text[step : step + 4]
             at = self._origin + step
-            yield at, octets, self._one(int.from_bytes(octets, "little"), at)
+            said, redo = self._one(int.from_bytes(octets, "little"), at)
+            yield at, octets, said, redo
 
 
 ARM_CONDITION_NAMES: Final[Mapping[int, str]] = {
@@ -22964,69 +23059,101 @@ class Aarch64Narrator(WordNarrator):
     def _address(field: int) -> str:
         return "sp" if field == 31 else f"x{field}"
 
-    def _one(self, word: int, at: int) -> str:
+    def _one(self, word: int, at: int) -> tuple[str, Redo]:
         rd, rn, rm = word & 0x1F, (word >> 5) & 0x1F, (word >> 16) & 0x1F
         value, place = self._value, self._address
         if word == 0xD65F03C0:
-            return "ret"
+            return "ret", lambda text, _: text.ret()
         if word == 0xD4000001:
-            return "svc 0"
+            return "svc 0", lambda text, _: text.syscall()
         if word == 0xD4200000:
-            return "brk 0"
+            return "brk 0", lambda text, _: text.trap()
         if word & 0xFFE0FFE0 == 0xAA0003E0:
-            return f"mov {value(rd)}, {value(rm)}"
+            return (f"mov {value(rd)}, {value(rm)}",
+                    lambda text, _: text.move(rd, rm))
         head = word & 0xFF800000
         if head in (0xD2800000, 0xF2800000, 0x92800000):
-            shift = ((word >> 21) & 3) * 16
+            index = (word >> 21) & 3
+            half = (word >> 5) & 0xFFFF
             name = {0xD2800000: "movz", 0x92800000: "movn", 0xF2800000: "movk"}[head]
-            said = f"{name} {value(rd)}, {(word >> 5) & 0xFFFF:#x}"
-            return said + (f", lsl {shift}" if shift else "")
+            said = f"{name} {value(rd)}, {half:#x}"
+            return (said + (f", lsl {index * 16}" if index else ""),
+                    lambda text, _: text._wide_move(name, rd, half, index))
         shifted = word & 0xFFE0FC00
         if shifted in (0x8B000000, 0xCB000000, 0xCA000000, 0xEB000000):
             name = {0x8B000000: "add", 0xCB000000: "sub",
                     0xCA000000: "eor", 0xEB000000: "subs"}[shifted]
-            return f"{name} {value(rd)}, {value(rn)}, {value(rm)}"
+            if name == "subs" and rd == 31:
+                return (f"cmp {value(rn)}, {value(rm)}",
+                        lambda text, _: text.compare(rn, rm))
+            return (f"{name} {value(rd)}, {value(rn)}, {value(rm)}",
+                    lambda text, _: text.arithmetic(name, rd, rn, rm))
         if head in (0x91000000, 0xD1000000, 0xF1000000):
             amount = (word >> 10) & 0xFFF
+            shift = bool(word & (1 << 22))
             name = {0x91000000: "add", 0xD1000000: "sub", 0xF1000000: "subs"}[head]
             said = (f"{name} {place(rd)}, {place(rn)}, {amount:#x}"
                     if head == 0x91000000
                     else f"{name} {value(rd)}, {value(rn)}, {amount:#x}")
-            return said + (", lsl 12" if word & (1 << 22) else "")
+            total = amount << 12 if shift else amount
+            if name == "subs" and rd == 31:
+                return (f"cmp {value(rn)}, {total:#x}",
+                        lambda text, _: text.compare_immediate(rn, total))
+            return (said + (", lsl 12" if shift else ""),
+                    lambda text, _: text.arithmetic_immediate(name, rd, rn, total))
         if shifted == 0x9B007C00:
-            return f"mul {value(rd)}, {value(rn)}, {value(rm)}"
+            return (f"mul {value(rd)}, {value(rn)}, {value(rm)}",
+                    lambda text, _: text.multiply(rd, rn, rm))
         if shifted == 0x9AC00C00:
-            return f"sdiv {value(rd)}, {value(rn)}, {value(rm)}"
+            return (f"sdiv {value(rd)}, {value(rn)}, {value(rm)}",
+                    lambda text, _: text.divide(rd, rn, rm))
         if word & 0xFFE08000 == 0x9B008000:
-            minuend = value((word >> 10) & 0x1F)
-            return f"msub {value(rd)}, {value(rn)}, {value(rm)}, {minuend}"
+            ra = (word >> 10) & 0x1F
+            return (f"msub {value(rd)}, {value(rn)}, {value(rm)}, {value(ra)}",
+                    lambda text, _: text.multiply_subtract(rd, rn, rm, ra))
         if word & 0xFFFF0FE0 == 0x9A9F07E0:
-            said = ARM_CONDITION_NAMES[((word >> 12) & 0xF) ^ 1]
-            return f"cset {value(rd)}, {said}"
+            condition = ARM_CONDITION_NAMES[((word >> 12) & 0xF) ^ 1]
+            return (f"cset {value(rd)}, {condition}",
+                    lambda text, _: text.set_if(condition, rd))
         scaled = word & 0xFFC00000
         if scaled in (0xF9400000, 0xF9000000):
+            offset = ((word >> 10) & 0xFFF) * 8
             name = "ldr" if scaled == 0xF9400000 else "str"
-            return f"{name} {value(rd)}, [{place(rn)}, {((word >> 10) & 0xFFF) * 8:#x}]"
+            return (f"{name} {value(rd)}, [{place(rn)}, {offset:#x}]",
+                    lambda text, _: (text.load if name == "ldr" else text.store)(
+                        rd, rn, offset
+                    ))
         if shifted in (0x38606800, 0x38206800):
             name = "ldrb" if shifted == 0x38606800 else "strb"
-            return f"{name} w{rd}, [{place(rn)}, {value(rm)}]"
+            return (f"{name} w{rd}, [{place(rn)}, {value(rm)}]",
+                    lambda text, _: (
+                        text.load_octet if name == "ldrb" else text.store_octet
+                    )(rd, rn, rm))
         stepped = word & 0xFFE00C00
         if stepped in (0xF8000C00, 0xF8400400):
             step = WordReader._signed((word >> 12) & 0x1FF, 9)
             if stepped == 0xF8000C00:
-                return f"str {value(rd)}, [{place(rn)}, {step:#x}]!"
-            return f"ldr {value(rd)}, [{place(rn)}], {step:#x}"
+                return (f"str {value(rd)}, [{place(rn)}, {step:#x}]!",
+                        lambda text, _: text.push(rd))
+            return (f"ldr {value(rd)}, [{place(rn)}], {step:#x}",
+                    lambda text, _: text.pop(rd))
         wide = word & 0xFC000000
         if wide in (0x14000000, 0x94000000):
             name = "b" if wide == 0x14000000 else "bl"
             step = WordReader._signed(word & 0x3FFFFFF, 26) * 4
-            return f"{name} {at + step:#x}"
+            return (f"{name} {at + step:#x}",
+                    lambda text, label: (text.jump if name == "b" else text.call)(
+                        label(at + step)
+                    ))
         if word & 0xFF000010 == 0x54000000:
             step = WordReader._signed((word >> 5) & 0x7FFFF, 19) * 4
-            return f"b.{ARM_CONDITION_NAMES[word & 0xF]} {at + step:#x}"
+            condition = ARM_CONDITION_NAMES[word & 0xF]
+            return (f"b.{condition} {at + step:#x}",
+                    lambda text, label: text.jump_if(condition, label(at + step)))
         if word & 0xFF000000 == 0xB4000000:
             step = WordReader._signed((word >> 5) & 0x7FFFF, 19) * 4
-            return f"cbz {value(rd)}, {at + step:#x}"
+            return (f"cbz {value(rd)}, {at + step:#x}",
+                    lambda text, label: text.jump_if_zero(rd, label(at + step)))
         raise MachineDecodeError(f"the word {word:#010x} is not one this file writes")
 
 
@@ -23038,52 +23165,63 @@ class Riscv64Narrator(WordNarrator):
     puts it together before jumping to it.
     """
 
-    def _one(self, word: int, at: int) -> str:
+    def _one(self, word: int, at: int) -> tuple[str, Redo]:
         opcode = word & 0x7F
         rd, rs1, rs2 = (word >> 7) & 0x1F, (word >> 15) & 0x1F, (word >> 20) & 0x1F
-        funct3 = (word >> 12) & 7
+        funct3, funct7 = (word >> 12) & 7, word >> 25
         if word == 0x00000073:
-            return "ecall"
+            return "ecall", lambda text, _: text.syscall()
         if word == 0x00100073:
-            return "ebreak"
+            return "ebreak", lambda text, _: text.trap()
         if opcode == 0b0110111:
-            return f"lui x{rd}, {(word >> 12) & 0xFFFFF:#x}"
+            half = (word >> 12) & 0xFFFFF
+            return (f"lui x{rd}, {half:#x}",
+                    lambda text, _: text._u(half, rd))
         if opcode == 0b0010011:
             value = WordReader._signed(word >> 20, 12)
             name = {0b000: "addi", 0b100: "xori"}.get(funct3)
             if name is None:
                 raise MachineDecodeError(f"an immediate form with funct3 {funct3}")
-            return f"{name} x{rd}, x{rs1}, {value:#x}"
+            return (f"{name} x{rd}, x{rs1}, {value:#x}",
+                    lambda text, _: text._i(value, rs1, funct3, rd, 0b0010011))
         if opcode == 0b0110011:
             name = {
                 (0b0000000, 0b000): "add", (0b0100000, 0b000): "sub",
                 (0b0000000, 0b100): "xor", (0b0000000, 0b010): "slt",
                 (0b0000001, 0b000): "mul", (0b0000001, 0b100): "div",
                 (0b0000001, 0b110): "rem",
-            }.get((word >> 25, funct3))
+            }.get((funct7, funct3))
             if name is None:
                 raise MachineDecodeError(
-                    f"an operation with {word >> 25:07b}/{funct3:03b}"
+                    f"an operation with {funct7:07b}/{funct3:03b}"
                 )
-            return f"{name} x{rd}, x{rs1}, x{rs2}"
+            return (f"{name} x{rd}, x{rs1}, x{rs2}",
+                    lambda text, _: text._r(funct7, rs2, rs1, funct3, rd, 0b0110011))
         if opcode == 0b0000011:
+            value = WordReader._signed(word >> 20, 12)
             name = {0b011: "ld", 0b100: "lbu"}.get(funct3)
             if name is None:
                 raise MachineDecodeError(f"a load with funct3 {funct3}")
-            return f"{name} x{rd}, {WordReader._signed(word >> 20, 12):#x}(x{rs1})"
+            return (f"{name} x{rd}, {value:#x}(x{rs1})",
+                    lambda text, _: text._i(value, rs1, funct3, rd, 0b0000011))
         if opcode == 0b0100011:
             value = WordReader._signed(((word >> 25) << 5) | ((word >> 7) & 0x1F), 12)
             name = "sd" if funct3 == 0b011 else "sb"
-            return f"{name} x{rs2}, {value:#x}(x{rs1})"
+            return (f"{name} x{rs2}, {value:#x}(x{rs1})",
+                    lambda text, _: text._s(value, rs2, rs1, funct3, 0b0100011))
         if opcode == 0b1100011:
             name = {0b000: "beq", 0b001: "bne", 0b100: "blt", 0b101: "bge"}[funct3]
             step = Riscv64Reader._branch_offset(word)
-            return f"{name} x{rs1}, x{rs2}, {at + step:#x}"
+            return (f"{name} x{rs1}, x{rs2}, {at + step:#x}",
+                    lambda text, _: text._b(step, rs2, rs1, funct3))
         if opcode == 0b1101111:
-            return f"jal x{rd}, {at + Riscv64Reader._jump_offset(word):#x}"
+            step = Riscv64Reader._jump_offset(word)
+            return (f"jal x{rd}, {at + step:#x}",
+                    lambda text, name: (text.call if rd else text.jump)(name(at + step)))
         if opcode == 0b1100111:
             value = WordReader._signed(word >> 20, 12)
-            return f"jalr x{rd}, {value:#x}(x{rs1})"
+            return (f"jalr x{rd}, {value:#x}(x{rs1})",
+                    lambda text, _: text._i(value, rs1, 0b000, rd, 0b1100111))
         raise MachineDecodeError(f"the word {word:#010x} is not one this file writes")
 
 
@@ -23106,9 +23244,52 @@ def narrate_machine_code(image: bytes, architecture: str = "x86-64") -> str:
     origin = struct.unpack_from("<Q", image, 24)[0]
     text = image[prologue:]
     lines = []
-    for address, octets, said in MACHINE_NARRATORS[architecture](text, origin).narrate():
+    for address, octets, said, _ in MACHINE_NARRATORS[architecture](
+        text, origin
+    ).narrate():
         lines.append(f"  {address:#010x}  {octets.hex(' '):<32}  {said}")
     return "\n".join(lines) + "\n"
+
+
+MACHINE_ASSEMBLERS: Final[Mapping[str, type]] = {
+    "x86-64": X86Assembler,
+    "aarch64": Aarch64Assembler,
+    "riscv64": Riscv64Assembler,
+}
+
+
+def reassemble_machine_code(image: bytes, architecture: str = "x86-64") -> bytes:
+    """Writes the text again from what the narrator says it is.
+
+    The narrator names an instruction by taking its fields apart; this hands
+    those fields straight back to the encoder that put them together.  If the
+    two are inverses the octets come back identical, and if they are not, the
+    place where they stop matching is the field one of them has wrong.
+
+    A branch is the one thing whose octets are not settled until everything
+    around it is, so the walk puts a label at every address anything branches
+    to and lets the encoder work the displacements out again.
+    """
+    prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
+    origin = struct.unpack_from("<Q", image, 24)[0]
+    narrator = MACHINE_NARRATORS[architecture]
+    said = list(narrator(image[prologue:], origin).narrate())
+
+    wanted: set[int] = set()
+
+    def name(address: int) -> str:
+        wanted.add(address)
+        return f"L{address:x}"
+
+    for _, _, _, redo in said:
+        redo(MACHINE_ASSEMBLERS[architecture](), name)
+
+    text = MACHINE_ASSEMBLERS[architecture]()
+    for address, _, _, redo in said:
+        if address in wanted:
+            text.label(name(address))
+        redo(text, name)
+    return text.link()
 
 
 # The names a trace calls the registers by.  The first machine has sixteen
@@ -23237,7 +23418,7 @@ def trace_machine_code(
     origin = struct.unpack_from("<Q", image, 24)[0]
     known = {
         address: (octets, said)
-        for address, octets, said
+        for address, octets, said, _
         in MACHINE_NARRATORS[architecture](image[prologue:], origin).narrate()
     }
     wide = architecture == "x86-64"
