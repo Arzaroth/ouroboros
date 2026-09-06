@@ -77,6 +77,7 @@ jobs:
           python ouroboros.py --emit-efi "dist/glyph-$safe.efi" > /dev/null
           python ouroboros.py --emit-llvm > "dist/glyph-$safe.ll"
           python ouroboros.py --emit-gsl2 glyphc > "dist/glyphc-$safe.gsl2"
+          python ouroboros.py --emit-gsl2 glyphelf > "dist/glyphelf-$safe.gsl2"
 
           # The asset itself, not a sibling build, is what gets checked.
           diff <("./dist/glyph-$safe-linux-x86_64") <(python ouroboros.py)

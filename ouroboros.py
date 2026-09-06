@@ -7567,7 +7567,10 @@ fn main() {
 # same compiler: for any program either accepts, both emit the same bytes.
 
 
-GLYPHC_GSL2: Final[str] = r'''# glyphc.gsl2 - the GSL front end, written in GSL-2.
+# The front end is shared: the same preprocessor, transducer, parser,
+# analyser, emitter, pass manager and assembler serve both backends, and
+# what differs is only what they are asked to write at the end of it.
+GSL_FRONT_END_GSL2: Final[str] = r'''# glyphc.gsl2 - the GSL front end, written in GSL-2.
 #
 # Reads a GSL program on stdin, writes LLVM IR on stdout.  Byte-identical to
 # what layer 16 emits for the same program: the whole of tier 1 - preprocessor,
@@ -9137,7 +9140,9 @@ fn group_build() {
   }
   return 0;
 }
+'''
 
+GLYPHC_TAIL_GSL2: Final[str] = r'''
 # ----------------------------------------------------------------------
 # the runtime the lowered machine calls into, emitted verbatim
 # ----------------------------------------------------------------------
@@ -9940,6 +9945,866 @@ fn main() {
   return 0;
 }
 '''
+
+GLYPHELF_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# layer 18: the machine, without a toolchain under it either
+# ----------------------------------------------------------------------
+#
+# The same encoder layer 18 is, in the language the front end above is
+# written in.  The operand stack is the hardware stack, so a push is a push;
+# the runtime is reached by call; and the canvas, the snapshot, the frame and
+# the output buffer live at a fixed address the prologue puts in r15, so the
+# text needs no relocation beyond its own branches.
+#
+# GSL-2 has no bitwise operators.  It does not need any: every field in a
+# prefix, a ModRM or a SIB octet is disjoint from its neighbours, so the
+# additions below are the same octets the shifts and ors would have made.
+
+var TEXT = 1330000;
+var LBLOFF = 1730000;
+var FIXAT = 1800000;
+var FIXID = 1870000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var PAGE_SIZE = 4096;
+var EM_X86_64 = 62;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+var SYS_WRITE = 1;
+var SYS_EXIT_GROUP = 231;
+
+var RAX = 0;
+var RCX = 1;
+var RDX = 2;
+var RBX = 3;
+var RSI = 6;
+var RDI = 7;
+var R8 = 8;
+var R9 = 9;
+var R10 = 10;
+var R11 = 11;
+var R12 = 12;
+var R13 = 13;
+var R14 = 14;
+var R15 = 15;
+
+# The conditions the backend asks for, by their place in the opcode.
+var CC_E = 4;
+var CC_NE = 5;
+var CC_L = 12;
+var CC_GE = 13;
+var CC_LE = 14;
+var CC_G = 15;
+var CC_S = 8;
+var CC_NS = 9;
+
+# Names for the places a branch can land.  Everything below the first free
+# one is a routine or a step inside one; an instruction at address i is
+# L_CODE + i, and anything a lowering needs for itself is handed out from
+# the top by next_label.
+var L_EXIT = 0;
+var L_PAINT = 1;
+var L_PAINT_DONE = 2;
+var L_RUN = 3;
+var L_RUN_HEAD = 4;
+var L_RUN_COLUMN = 5;
+var L_RUN_DIAGONAL = 6;
+var L_RUN_ANTI = 7;
+var L_RUN_PAINT = 8;
+var L_RUN_DONE = 9;
+var L_SNAP = 10;
+var L_SNAP_HEAD = 11;
+var L_SNAP_DONE = 12;
+var L_APPLY = 13;
+var L_APPLY_ROW = 14;
+var L_APPLY_COLUMN = 15;
+var L_APPLY_COLUMN_STEP = 16;
+var L_APPLY_ROW_STEP = 17;
+var L_APPLY_DONE = 18;
+var L_RENDER = 19;
+var L_RENDER_ROW = 20;
+var L_RENDER_SCAN = 21;
+var L_RENDER_SCAN_STEP = 22;
+var L_RENDER_PRINT = 23;
+var L_RENDER_CELL = 24;
+var L_RENDER_INK = 25;
+var L_RENDER_BLANK = 26;
+var L_RENDER_ADVANCE = 27;
+var L_RENDER_NEWLINE = 28;
+var L_RENDER_FLUSH = 29;
+var L_CODE = 32;
+
+var textlen = 0;
+var nfix = 0;
+var spare = 0;
+
+var lay_canvas = 0;
+var lay_snapshot = 0;
+var lay_frame = 0;
+var lay_output = 0;
+var lay_size = 0;
+
+fn next_label() {
+  spare = spare + 1;
+  return spare - 1;
+}
+
+# ----------------------------------------------------------------------
+# octets
+# ----------------------------------------------------------------------
+
+fn octet_of(v) {
+  var r = v % 256;
+  if (r < 0) {
+    r = r + 256;
+  }
+  return r;
+}
+
+# Division towards zero is not division towards the floor, and the octets of
+# a negative number are the floor's.
+fn shift_octet(v) {
+  if (v < 0) {
+    return (v - 255) / 256;
+  }
+  return v / 256;
+}
+
+fn emit(b) {
+  mem[TEXT + textlen] = octet_of(b);
+  textlen = textlen + 1;
+  return 0;
+}
+
+fn emit_wide(v, count) {
+  var i = 0;
+  while (i < count) {
+    emit(octet_of(v));
+    v = shift_octet(v);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn lab(id) {
+  mem[LBLOFF + id] = textlen;
+  return 0;
+}
+
+fn where_to(id) {
+  mem[FIXAT + nfix] = textlen;
+  mem[FIXID + nfix] = id;
+  nfix = nfix + 1;
+  emit_wide(0, 4);
+  return 0;
+}
+
+fn link_text() {
+  var i = 0;
+  while (i < nfix) {
+    var site = mem[FIXAT + i];
+    var rel = mem[LBLOFF + mem[FIXID + i]] - (site + 4);
+    var k = 0;
+    while (k < 4) {
+      mem[TEXT + site + k] = octet_of(rel);
+      rel = shift_octet(rel);
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the shape of an operand
+# ----------------------------------------------------------------------
+#
+# An operand is a register when kept is zero, and base + index * scale +
+# displacement when it is one.  A register operand keeps its register in
+# base, which is what makes one pair of functions serve both.
+
+fn scale_bits(scale) {
+  if (scale == 1) {
+    return 0;
+  }
+  if (scale == 2) {
+    return 1;
+  }
+  if (scale == 4) {
+    return 2;
+  }
+  return 3;
+}
+
+fn rex_of(reg, kept, base, index) {
+  var rex = 0;
+  if (reg >= 8) {
+    rex = rex + 4;
+  }
+  if (base >= 8) {
+    rex = rex + 1;
+  }
+  if (kept == 1) {
+    if (index >= 8) {
+      rex = rex + 2;
+    }
+  }
+  return rex;
+}
+
+fn operand_tail(reg, kept, base, index, scale, disp) {
+  if (kept == 0) {
+    emit(192 + (reg % 8) * 8 + (base % 8));
+    return 0;
+  }
+  var slot = 4;
+  if (index >= 0) {
+    slot = index % 8;
+  }
+  emit(128 + (reg % 8) * 8 + 4);
+  emit(scale_bits(scale) * 64 + slot * 8 + (base % 8));
+  emit_wide(disp, 4);
+  return 0;
+}
+
+# A sixty-four bit operation: the wide prefix is always there.
+fn wide(op0, op1, reg, kept, base, index, scale, disp) {
+  emit(72 + rex_of(reg, kept, base, index));
+  emit(op0);
+  if (op1 >= 0) {
+    emit(op1);
+  }
+  operand_tail(reg, kept, base, index, scale, disp);
+  return 0;
+}
+
+# An eight bit one: a prefix only where an operand asks for it.
+fn narrow(op0, op1, reg, kept, base, index, scale, disp) {
+  var rex = rex_of(reg, kept, base, index);
+  if (rex != 0) {
+    emit(64 + rex);
+  }
+  emit(op0);
+  if (op1 >= 0) {
+    emit(op1);
+  }
+  operand_tail(reg, kept, base, index, scale, disp);
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the instructions the backend asks for, and no more
+# ----------------------------------------------------------------------
+
+fn ld(d, s) {
+  return wide(139, 0 - 1, d, 0, s, 0 - 1, 1, 0);
+}
+
+fn ld_at(d, base, index, scale, disp) {
+  return wide(139, 0 - 1, d, 1, base, index, scale, disp);
+}
+
+fn st_at(base, index, scale, disp, s) {
+  return wide(137, 0 - 1, s, 1, base, index, scale, disp);
+}
+
+fn lea_at(d, base, index, scale, disp) {
+  return wide(141, 0 - 1, d, 1, base, index, scale, disp);
+}
+
+fn imm(d, v) {
+  var rex = 72;
+  if (d >= 8) {
+    rex = 73;
+  }
+  emit(rex);
+  emit(184 + (d % 8));
+  emit_wide(v, 8);
+  return 0;
+}
+
+fn ld_octet(d, base, index, scale, disp) {
+  return narrow(138, 0 - 1, d, 1, base, index, scale, disp);
+}
+
+fn st_octet(base, index, scale, disp, s) {
+  return narrow(136, 0 - 1, s, 1, base, index, scale, disp);
+}
+
+fn st_octet_imm(base, index, scale, disp, v) {
+  narrow(198, 0 - 1, 0, 1, base, index, scale, disp);
+  emit(v);
+  return 0;
+}
+
+fn cmp_octet_imm(base, index, scale, disp, v) {
+  narrow(128, 0 - 1, 7, 1, base, index, scale, disp);
+  emit(v);
+  return 0;
+}
+
+fn widen(d, s) {
+  return wide(15, 182, d, 0, s, 0 - 1, 1, 0);
+}
+
+fn push_reg(r) {
+  if (r >= 8) {
+    emit(65);
+  }
+  emit(80 + (r % 8));
+  return 0;
+}
+
+fn pop_reg(r) {
+  if (r >= 8) {
+    emit(65);
+  }
+  emit(88 + (r % 8));
+  return 0;
+}
+
+# add 3, or 11, and 35, sub 43, xor 51, cmp 59 - the direct forms.
+fn alu(op, d, s) {
+  return wide(op, 0 - 1, d, 0, s, 0 - 1, 1, 0);
+}
+
+# add 0, or 1, and 4, sub 5, xor 6, cmp 7 - the extensions.
+fn alu_imm(ext, d, v) {
+  wide(129, 0 - 1, ext, 0, d, 0 - 1, 1, 0);
+  emit_wide(v, 4);
+  return 0;
+}
+
+fn mul(d, s) {
+  return wide(15, 175, d, 0, s, 0 - 1, 1, 0);
+}
+
+fn mul_imm(d, s, v) {
+  wide(105, 0 - 1, d, 0, s, 0 - 1, 1, 0);
+  emit_wide(v, 4);
+  return 0;
+}
+
+fn idiv(r) {
+  return wide(247, 0 - 1, 7, 0, r, 0 - 1, 1, 0);
+}
+
+fn widen_to_pair() {
+  emit(72);
+  emit(153);
+  return 0;
+}
+
+fn neg(r) {
+  return wide(247, 0 - 1, 3, 0, r, 0 - 1, 1, 0);
+}
+
+fn inc(r) {
+  return wide(255, 0 - 1, 0, 0, r, 0 - 1, 1, 0);
+}
+
+fn dec(r) {
+  return wide(255, 0 - 1, 1, 0, r, 0 - 1, 1, 0);
+}
+
+fn tst(a, b) {
+  return wide(133, 0 - 1, a, 0, b, 0 - 1, 1, 0);
+}
+
+fn set_when(cc, r) {
+  return narrow(15, 144 + cc, 0, 0, r, 0 - 1, 1, 0);
+}
+
+fn go(id) {
+  emit(233);
+  where_to(id);
+  return 0;
+}
+
+fn go_when(cc, id) {
+  emit(15);
+  emit(128 + cc);
+  where_to(id);
+  return 0;
+}
+
+fn call_to(id) {
+  emit(232);
+  where_to(id);
+  return 0;
+}
+
+fn ret_now() {
+  emit(195);
+  return 0;
+}
+
+fn ask_the_world() {
+  emit(15);
+  emit(5);
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# where everything sits inside the space the loader zeroes
+# ----------------------------------------------------------------------
+
+fn align_up(value, boundary) {
+  return ((value + boundary - 1) / boundary) * boundary;
+}
+
+fn layout_build() {
+  var cells = ORDER * ORDER;
+  var slots = frame;
+  if (slots < 1) {
+    slots = 1;
+  }
+  lay_canvas = 0;
+  lay_snapshot = cells;
+  lay_frame = align_up(2 * cells, 8);
+  lay_output = lay_frame + slots * 8;
+  lay_size = lay_output + 2 * cells + ORDER + 16;
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the instruction stream
+# ----------------------------------------------------------------------
+
+fn native_intrinsic(index) {
+  if (index == 0) {
+    return 0;
+  }
+  if (index == 1) {
+    return APOTHEM;
+  }
+  if (index == 2) {
+    return EXTREMUM;
+  }
+  return ORDER;
+}
+
+# Division towards zero is not division towards the floor here either: the
+# quotient comes down by one whenever the division was inexact and the
+# remainder and the divisor disagree about sign, which an exclusive or finds
+# in the sign bit.
+fn native_divide() {
+  var floored = next_label();
+  pop_reg(RCX);
+  pop_reg(RAX);
+  widen_to_pair();
+  idiv(RCX);
+  tst(RDX, RDX);
+  go_when(CC_E, floored);
+  alu(51, RDX, RCX);
+  go_when(CC_NS, floored);
+  dec(RAX);
+  lab(floored);
+  push_reg(RAX);
+  return 0;
+}
+
+fn native_close() {
+  call_to(L_SNAP);
+  var i = 0;
+  while (i < ngroup) {
+    imm(RDI, mem[GRPA + i]);
+    imm(RSI, mem[GRPB + i]);
+    imm(RDX, mem[GRPC + i]);
+    imm(RCX, mem[GRPD + i]);
+    call_to(L_APPLY);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn native_instruction(address) {
+  var kind = mem[CODEK + address];
+  var argument = mem[CODEA + address];
+  if (kind == OP_HALT) {
+    go(L_EXIT);
+  }
+  if (kind == OP_JMP) {
+    go(L_CODE + argument);
+  }
+  if (kind == OP_JF) {
+    pop_reg(RAX);
+    tst(RAX, RAX);
+    go_when(CC_E, L_CODE + argument);
+  }
+  if (kind == OP_PUSH) {
+    imm(RAX, argument);
+    push_reg(RAX);
+  }
+  if (kind == OP_INTR) {
+    imm(RAX, native_intrinsic(argument));
+    push_reg(RAX);
+  }
+  if (kind == OP_LOADL) {
+    ld_at(RAX, R15, 0 - 1, 1, lay_frame + argument * 8);
+    push_reg(RAX);
+  }
+  if (kind == OP_STOREL) {
+    pop_reg(RAX);
+    st_at(R15, 0 - 1, 1, lay_frame + argument * 8, RAX);
+  }
+  if (kind == OP_ADD) {
+    pop_reg(RCX);
+    pop_reg(RAX);
+    alu(3, RAX, RCX);
+    push_reg(RAX);
+  }
+  if (kind == OP_SUB) {
+    pop_reg(RCX);
+    pop_reg(RAX);
+    alu(43, RAX, RCX);
+    push_reg(RAX);
+  }
+  if (kind == OP_MUL) {
+    pop_reg(RCX);
+    pop_reg(RAX);
+    mul(RAX, RCX);
+    push_reg(RAX);
+  }
+  if (kind == OP_DIV) {
+    native_divide();
+  }
+  if (kind == OP_NEG) {
+    pop_reg(RAX);
+    neg(RAX);
+    push_reg(RAX);
+  }
+  if (kind == OP_CMPLE) {
+    pop_reg(RCX);
+    pop_reg(RAX);
+    alu(59, RAX, RCX);
+    set_when(CC_LE, RAX);
+    widen(RAX, RAX);
+    push_reg(RAX);
+  }
+  if (kind == OP_EMIT) {
+    pop_reg(RCX);
+    pop_reg(RDX);
+    pop_reg(RSI);
+    imm(RDI, argument);
+    call_to(L_RUN);
+  }
+  if (kind == OP_CLOSE) {
+    native_close();
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the runtime the instruction stream calls into
+# ----------------------------------------------------------------------
+
+fn native_paint() {
+  lab(L_PAINT);
+  alu_imm(7, RDI, 0);
+  go_when(CC_L, L_PAINT_DONE);
+  alu_imm(7, RDI, ORDER);
+  go_when(CC_GE, L_PAINT_DONE);
+  alu_imm(7, RSI, 0);
+  go_when(CC_L, L_PAINT_DONE);
+  alu_imm(7, RSI, ORDER);
+  go_when(CC_GE, L_PAINT_DONE);
+  mul_imm(RAX, RDI, ORDER);
+  alu(3, RAX, RSI);
+  st_octet_imm(R15, RAX, 1, lay_canvas, 1);
+  lab(L_PAINT_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_run() {
+  lab(L_RUN);
+  ld(R8, RDI);
+  ld(R9, RSI);
+  ld(R10, RDX);
+  ld(R11, RCX);
+  lab(L_RUN_HEAD);
+  alu(59, R10, R11);
+  go_when(CC_G, L_RUN_DONE);
+  alu_imm(7, R8, 1);
+  go_when(CC_E, L_RUN_COLUMN);
+  alu_imm(7, R8, 2);
+  go_when(CC_E, L_RUN_DIAGONAL);
+  alu_imm(7, R8, 3);
+  go_when(CC_E, L_RUN_ANTI);
+  ld(RDI, R9);
+  ld(RSI, R10);
+  go(L_RUN_PAINT);
+  lab(L_RUN_COLUMN);
+  ld(RDI, R10);
+  ld(RSI, R9);
+  go(L_RUN_PAINT);
+  lab(L_RUN_DIAGONAL);
+  ld(RDI, R10);
+  ld(RSI, R10);
+  alu(3, RSI, R9);
+  go(L_RUN_PAINT);
+  lab(L_RUN_ANTI);
+  ld(RDI, R10);
+  ld(RSI, R9);
+  alu(43, RSI, R10);
+  lab(L_RUN_PAINT);
+  call_to(L_PAINT);
+  inc(R10);
+  go(L_RUN_HEAD);
+  lab(L_RUN_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_snapshot() {
+  lab(L_SNAP);
+  alu(51, RAX, RAX);
+  lab(L_SNAP_HEAD);
+  alu_imm(7, RAX, ORDER * ORDER);
+  go_when(CC_GE, L_SNAP_DONE);
+  ld_octet(RCX, R15, RAX, 1, lay_canvas);
+  st_octet(R15, RAX, 1, lay_snapshot, RCX);
+  inc(RAX);
+  go(L_SNAP_HEAD);
+  lab(L_SNAP_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_apply() {
+  lab(L_APPLY);
+  ld(R8, RDI);
+  ld(R9, RSI);
+  ld(R10, RDX);
+  ld(R11, RCX);
+  alu(51, R12, R12);
+  lab(L_APPLY_ROW);
+  alu_imm(7, R12, ORDER);
+  go_when(CC_GE, L_APPLY_DONE);
+  alu(51, R13, R13);
+  lab(L_APPLY_COLUMN);
+  alu_imm(7, R13, ORDER);
+  go_when(CC_GE, L_APPLY_ROW_STEP);
+  mul_imm(RAX, R12, ORDER);
+  alu(3, RAX, R13);
+  cmp_octet_imm(R15, RAX, 1, lay_snapshot, 0);
+  go_when(CC_E, L_APPLY_COLUMN_STEP);
+  ld(RDI, R12);
+  alu_imm(5, RDI, APOTHEM);
+  ld(RSI, R13);
+  alu_imm(5, RSI, APOTHEM);
+  ld(RAX, R8);
+  mul(RAX, RDI);
+  ld(RDX, R9);
+  mul(RDX, RSI);
+  alu(3, RAX, RDX);
+  alu_imm(0, RAX, APOTHEM);
+  ld(RCX, R10);
+  mul(RCX, RDI);
+  ld(RDX, R11);
+  mul(RDX, RSI);
+  alu(3, RCX, RDX);
+  alu_imm(0, RCX, APOTHEM);
+  ld(RDI, RAX);
+  ld(RSI, RCX);
+  call_to(L_PAINT);
+  lab(L_APPLY_COLUMN_STEP);
+  inc(R13);
+  go(L_APPLY_COLUMN);
+  lab(L_APPLY_ROW_STEP);
+  inc(R12);
+  go(L_APPLY_ROW);
+  lab(L_APPLY_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_render() {
+  lab(L_RENDER);
+  alu(51, R12, R12);
+  alu(51, R14, R14);
+  lab(L_RENDER_ROW);
+  alu_imm(7, R12, ORDER);
+  go_when(CC_GE, L_RENDER_FLUSH);
+  imm(R10, 0 - 1);
+  alu(51, R13, R13);
+  lab(L_RENDER_SCAN);
+  alu_imm(7, R13, ORDER);
+  go_when(CC_GE, L_RENDER_PRINT);
+  mul_imm(RAX, R12, ORDER);
+  alu(3, RAX, R13);
+  cmp_octet_imm(R15, RAX, 1, lay_canvas, 0);
+  go_when(CC_E, L_RENDER_SCAN_STEP);
+  ld(R10, R13);
+  lab(L_RENDER_SCAN_STEP);
+  inc(R13);
+  go(L_RENDER_SCAN);
+  lab(L_RENDER_PRINT);
+  alu(51, R13, R13);
+  lab(L_RENDER_CELL);
+  alu(59, R13, R10);
+  go_when(CC_G, L_RENDER_NEWLINE);
+  alu_imm(7, R13, 0);
+  go_when(CC_LE, L_RENDER_INK);
+  st_octet_imm(R15, R14, 1, lay_output, 32);
+  inc(R14);
+  lab(L_RENDER_INK);
+  mul_imm(RAX, R12, ORDER);
+  alu(3, RAX, R13);
+  cmp_octet_imm(R15, RAX, 1, lay_canvas, 0);
+  go_when(CC_E, L_RENDER_BLANK);
+  st_octet_imm(R15, R14, 1, lay_output, 42);
+  go(L_RENDER_ADVANCE);
+  lab(L_RENDER_BLANK);
+  st_octet_imm(R15, R14, 1, lay_output, 32);
+  lab(L_RENDER_ADVANCE);
+  inc(R14);
+  inc(R13);
+  go(L_RENDER_CELL);
+  lab(L_RENDER_NEWLINE);
+  st_octet_imm(R15, R14, 1, lay_output, 10);
+  inc(R14);
+  inc(R12);
+  go(L_RENDER_ROW);
+  lab(L_RENDER_FLUSH);
+  imm(RAX, SYS_WRITE);
+  imm(RDI, 1);
+  lea_at(RSI, R15, 0 - 1, 1, lay_output);
+  ld(RDX, R14);
+  ask_the_world();
+  ret_now();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the whole text section
+# ----------------------------------------------------------------------
+
+fn native_encode() {
+  layout_build();
+  spare = L_CODE + ncode;
+  imm(R15, DATA_BASE);
+  var i = 0;
+  while (i < ncode) {
+    lab(L_CODE + i);
+    native_instruction(i);
+    i = i + 1;
+  }
+  lab(L_EXIT);
+  call_to(L_RENDER);
+  imm(RAX, SYS_EXIT_GROUP);
+  alu(51, RDI, RDI);
+  ask_the_world();
+  native_paint();
+  native_run();
+  native_snapshot();
+  native_apply();
+  native_render();
+  link_text();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the smallest static executable that will run that text
+# ----------------------------------------------------------------------
+#
+# Two loadable segments and nothing else: the headers and the text, mapped
+# read-execute at the image base, and an anonymous read-write span the loader
+# zeroes, which is the whole of the program's data.
+
+fn put(b) {
+  putchar(octet_of(b));
+  return 0;
+}
+
+fn put_wide(v, count) {
+  var i = 0;
+  while (i < count) {
+    put(octet_of(v));
+    v = shift_octet(v);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn native_image() {
+  var prologue = ELF_HEADER + SEGMENT_HEADER * SEGMENTS;
+  var loaded = prologue + textlen;
+  put(127);
+  put(69);
+  put(76);
+  put(70);
+  put(2);
+  put(1);
+  put(1);
+  put(0);
+  put(0);
+  put_wide(0, 7);
+  put_wide(2, 2);
+  put_wide(EM_X86_64, 2);
+  put_wide(1, 4);
+  put_wide(IMAGE_BASE + prologue, 8);
+  put_wide(ELF_HEADER, 8);
+  put_wide(0, 8);
+  put_wide(0, 4);
+  put_wide(ELF_HEADER, 2);
+  put_wide(SEGMENT_HEADER, 2);
+  put_wide(SEGMENTS, 2);
+  put_wide(64, 2);
+  put_wide(0, 2);
+  put_wide(0, 2);
+
+  put_wide(1, 4);
+  put_wide(5, 4);
+  put_wide(0, 8);
+  put_wide(IMAGE_BASE, 8);
+  put_wide(IMAGE_BASE, 8);
+  put_wide(loaded, 8);
+  put_wide(loaded, 8);
+  put_wide(PAGE_SIZE, 8);
+
+  put_wide(1, 4);
+  put_wide(6, 4);
+  put_wide(0, 8);
+  put_wide(DATA_BASE, 8);
+  put_wide(DATA_BASE, 8);
+  put_wide(0, 8);
+  put_wide(lay_size, 8);
+  put_wide(PAGE_SIZE, 8);
+
+  var i = 0;
+  while (i < textlen) {
+    put(mem[TEXT + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the driver
+# ----------------------------------------------------------------------
+
+fn main() {
+  read_stdin();
+  preprocess();
+  tokenize();
+  parse_program();
+  optimise();
+  assemble();
+  group_build();
+  native_encode();
+  native_image();
+  return 0;
+}
+'''
+
+GLYPHC_GSL2: Final[str] = GSL_FRONT_END_GSL2 + GLYPHC_TAIL_GSL2
+GLYPHELF_GSL2: Final[str] = GSL_FRONT_END_GSL2 + GLYPHELF_TAIL_GSL2
 
 _S0_OUT: list[str] = []
 _S0_SOURCE: str = ""
@@ -11110,13 +11975,18 @@ def link_executable(ir_text: str, exe_path: Path, opt_level: int = 2) -> Path:
 
 
 def _run(executable: Path, stdin_text: str) -> str:
+    return _run_octets(executable, stdin_text).decode()
+
+
+def _run_octets(executable: Path, stdin_text: str) -> bytes:
+    """The same, for a program whose answer is not meant to be read."""
     completed = subprocess.run(
         [str(executable)],
         input=stdin_text.encode(),
         stdout=subprocess.PIPE,
         check=True,
     )
-    return completed.stdout.decode()
+    return completed.stdout
 
 
 @dataclass(frozen=True, slots=True)
@@ -11190,6 +12060,7 @@ class LoopCase:
     motif: str
     order: int
     identical: bool
+    native: bool
     glyph: str
     expected: str
 
@@ -11199,7 +12070,7 @@ class LoopCase:
 
     @property
     def passed(self) -> bool:
-        return self.identical and self.renders
+        return self.identical and self.native and self.renders
 
 
 @dataclass(frozen=True, slots=True)
@@ -11222,9 +12093,21 @@ def build_front_end(directory: Path, opt_level: int = 2) -> tuple[Path, str]:
     where Python stops; and the compiler that comes out of it compiles the GSL
     front end.  Returns the front end and the IR it was built from.
     """
+    return build_front_ends(directory, opt_level)[:2]
+
+
+def build_front_ends(directory: Path, opt_level: int = 2) -> tuple[Path, str, Path]:
+    """The same, and the front end that writes an executable rather than IR.
+
+    Both share every layer above the last one, so the chain is turned once and
+    the compiler that comes out of it compiles each of them.  The third answer
+    is the one that needs nothing after it: what it writes is already a
+    program, so the linker's last turn is not taken.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "gslc.gsl2").write_text(GSLC_GSL2)
     (directory / "glyphc.gsl2").write_text(GLYPHC_GSL2)
+    (directory / "glyphelf.gsl2").write_text(GLYPHELF_GSL2)
 
     seeded = link_executable(gsl2_compile(GSLC_GSL2), directory / "stage1", opt_level)
     gslc_ir = _run(seeded, GSLC_GSL2)
@@ -11233,7 +12116,13 @@ def build_front_end(directory: Path, opt_level: int = 2) -> tuple[Path, str]:
 
     glyphc_ir = _run(gslc, GLYPHC_GSL2)
     (directory / "glyphc.ll").write_text(glyphc_ir)
-    return link_executable(glyphc_ir, directory / "glyphc", opt_level), glyphc_ir
+    glyphelf_ir = _run(gslc, GLYPHELF_GSL2)
+    (directory / "glyphelf.ll").write_text(glyphelf_ir)
+    return (
+        link_executable(glyphc_ir, directory / "glyphc", opt_level),
+        glyphc_ir,
+        link_executable(glyphelf_ir, directory / "glyphelf", opt_level),
+    )
 
 
 def close_the_loop(
@@ -11253,7 +12142,7 @@ def close_the_loop(
     machine renders.
     """
     directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-loop-"))
-    glyphc, glyphc_ir = build_front_end(directory, opt_level)
+    glyphc, glyphc_ir, glyphelf = build_front_ends(directory, opt_level)
 
     if program is not None:
         name, text = program
@@ -11274,12 +12163,19 @@ def close_the_loop(
         produced = _run(glyphc, source)
         (directory / f"{stem}.ll").write_text(produced)
         reference = LlvmLoweringBackend().lower(artifacts.module).text
-        binary = link_executable(produced, directory / stem, opt_level)
+
+        # The one that needs nothing after it: what comes out is already a
+        # program, so it is the one that is run.
+        emitted = _run_octets(glyphelf, source)
+        binary = directory / f"{stem}.elf"
+        binary.write_bytes(emitted)
+        binary.chmod(0o755)
         cases.append(
             LoopCase(
                 motif=label,
                 order=order,
                 identical=produced == reference,
+                native=emitted == machine_code(artifacts.module, "x86-64"),
                 glyph=_run(binary, "").removesuffix("\n"),
                 expected=artifacts.rendering,
             )
@@ -14307,6 +15203,31 @@ def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
     return allowed[0], allowed[1]
 
 
+def boot_what_it_wrote(
+    workdir: Path | None = None,
+    opt_level: int = 2,
+    order: int = DEFAULT_LATTICE_ORDER,
+    motif: str = DEFAULT_MOTIF,
+) -> tuple[str, str]:
+    """The self-hosted front end writes a program, and the kernel runs it.
+
+    Every octet that boots was put there by a compiler written in the language
+    it compiles.  No lowering of this file's, and no toolchain: what came out
+    of the front end was already a program, so nothing was linked, and what is
+    underneath it is the kernel and the sector in front of it.
+    """
+    directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-metal-"))
+    _, _, glyphelf = build_front_ends(directory, opt_level)
+    source = typing.cast(type, Motif.lookup(motif))().source(order)
+    program = _run_octets(glyphelf, source)
+    (directory / "written.elf").write_bytes(program)
+    with tempfile.TemporaryDirectory(prefix="ouroboros-metal-") as scratch:
+        disk = Path(scratch) / "glyph.img"
+        disk.write_bytes(kernel_carrying(program))
+        said = run_boot(disk, order).removesuffix("\n")
+    return said, synthesize_source(source).unwrap_or_raise().rendering
+
+
 def boot_runnable() -> bool:
     """Whether anything here can be asked to start a machine."""
     return shutil.which("qemu-system-x86_64") is not None
@@ -15744,13 +16665,17 @@ def _emit_loop_report(report: LoopReport) -> int:
     print("  gslc     ->  gslc      and from here the language compiles itself")
     print(f"  gslc     ->  glyphc    it compiles the GSL front end"
           f"   ({len(report.glyphc_ir.splitlines())} lines of IR)")
-    print("  glyphc   ->  glyph     and that front end compiles the glyph")
+    print("  gslc     ->  glyphelf  and the one that writes a program instead")
+    print("  glyphc   ->  glyph     and each of them compiles the glyph")
     print(rule)
-    print(f"  {'motif':<16}{'n':>4}   {'IR == layer 16':<16}glyph == tier 1")
+    print(f"  {'motif':<16}{'n':>4}   {'IR == layer 16':<16}"
+          f"{'ELF == layer 18':<17}glyph == tier 1")
     for case in report.cases:
         identical = "[ok]  " if case.identical else "[FAIL]"
+        native = "[ok]  " if case.native else "[FAIL]"
         renders = "[ok]  " if case.renders else "[FAIL]"
-        print(f"  {case.motif:<16}{case.order:>4}   {identical:<16}{renders}")
+        print(f"  {case.motif:<16}{case.order:>4}   {identical:<16}"
+              f"{native:<17}{renders}")
     print(rule)
     shown = next(
         (
@@ -15838,7 +16763,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
     boot.add_argument("--workdir", metavar="DIR")
-    boot.add_argument("--emit-gsl2", choices=("gslc", "glyph", "glyphc"))
+    boot.add_argument("--emit-gsl2",
+                      choices=("gslc", "glyph", "glyphc", "glyphelf"))
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
 
@@ -15941,9 +16867,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if namespace.emit_gsl2:
         sys.stdout.write(
-            {"gslc": GSLC_GSL2, "glyph": GLYPH_GSL2, "glyphc": GLYPHC_GSL2}[
-                namespace.emit_gsl2
-            ]
+            {
+                "gslc": GSLC_GSL2,
+                "glyph": GLYPH_GSL2,
+                "glyphc": GLYPHC_GSL2,
+                "glyphelf": GLYPHELF_GSL2,
+            }[namespace.emit_gsl2]
         )
         return 0
     if namespace.run_wasm:

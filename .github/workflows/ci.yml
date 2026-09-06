@@ -141,6 +141,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+          pip install llvmlite
 
       - name: the disk boots and the figure comes out of the serial port
         run: |
@@ -193,6 +194,16 @@ jobs:
           assert own, 'a program cannot write to a page it owns'
           assert not kernel, 'a program can write to the page the kernel is in'
           print('the store it may do was done, and the store it may not was refused')
+          "
+
+      - name: the front end writes a program, and the machine runs what it wrote
+        run: |
+          python -c "
+          import ouroboros
+          said, wanted = ouroboros.boot_what_it_wrote()
+          assert said == wanted, said
+          print('compiled by a compiler written in the language it compiles,')
+          print('linked by nothing, and run with only a kernel underneath it')
           "
 
       - name: the firmware loads the application and prints the same figure
