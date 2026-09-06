@@ -82,6 +82,25 @@ jobs:
           print(f'{len(image)} octets, and what it carries is the ELF beside it')
           "
 
+      - name: a corpus is kept, replayed, and what it finds is made small
+        run: |
+          mkdir -p corpus
+          python -c "
+          import pathlib, ouroboros, typing
+          out = pathlib.Path('corpus')
+          for motif in ouroboros.Motif.catalogue():
+              for order in (3, 7):
+                  text = typing.cast(type, ouroboros.Motif.lookup(motif))().source(order)
+                  (out / f'{motif}-{order}.gsl').write_text(text)
+          "
+          python ouroboros.py --fuzz 20 --fuzz-corpus corpus \
+            --fuzz-seed ${{ github.run_number }}
+
+      - name: 100 broken programs, and both front ends refuse each one
+        run: |
+          python ouroboros.py --fuzz-refusals 100 \
+            --fuzz-seed ${{ github.run_number }}
+
       - name: the compiler builds itself, and nothing here could have helped
         run: python ouroboros.py --close-the-toolchain
 

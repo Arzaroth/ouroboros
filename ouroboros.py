@@ -5924,6 +5924,64 @@ def _capture_native_stdout(action: Callable[[], Any]) -> str:
         return sink.read().decode()
 
 
+# A finding is worth what it costs to act on, and a program the generator
+# happened to make is as long as the generator happened to make it.  What
+# follows takes away everything that can be taken away while the program goes
+# on doing whatever made it interesting.
+
+
+def _statements(source: str) -> list[tuple[int, int]]:
+    """The spans of the top-level statements, with braces kept whole."""
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start: int | None = None
+    for index, letter in enumerate(source):
+        if start is None and not letter.isspace():
+            start = index
+        if letter == "{":
+            depth += 1
+        elif letter == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                spans.append((start, index + 1))
+                start = None
+        elif letter == ";" and depth == 0 and start is not None:
+            spans.append((start, index + 1))
+            start = None
+    return spans
+
+
+def _reductions(source: str) -> Iterator[str]:
+    """Every one-step smaller program, largest step first."""
+    for start, finish in reversed(_statements(source)):
+        yield source[:start] + source[finish:]
+    for match in reversed(list(re.finditer(r"\b\d+\b", source))):
+        for smaller in ("0", str(int(match.group()) // 2)):
+            if smaller != match.group():
+                yield source[:match.start()] + smaller + source[match.end():]
+
+
+def dwindle(
+    source: str, still: Callable[[str], bool], rounds: int = 40
+) -> str:
+    """The smallest program reachable from this one that ``still`` accepts.
+
+    Reduction is over whole statements rather than lines, because the
+    generator tracks scopes and half a `for` is not a program; and a candidate
+    that no longer compiles cannot be interesting, so the predicate refusing
+    it is the same as the reduction not helping.
+    """
+    best = source
+    for _ in range(rounds):
+        for candidate in _reductions(best):
+            if candidate != best and still(candidate):
+                best = candidate
+                break
+        else:
+            return best
+    return best
+
+
 @dataclass(frozen=True, slots=True)
 class FuzzFinding:
     """One generated program on which two tiers disagreed."""
@@ -5991,22 +6049,120 @@ class DifferentialFuzzer:
     """Cross-checks every execution tier against the plain interpreter."""
 
     def __init__(
-        self, seed: int = 0, native: bool = False, front_end: bool = False
+        self,
+        seed: int = 0,
+        native: bool = False,
+        front_end: bool = False,
+        corpus: Path | None = None,
     ) -> None:
         self._entropy = random.Random(seed)
         self._generator = GslProgramGenerator(self._entropy)
         self._native = native
         self._front_end = front_end
+        self._corpus = corpus
 
     def _render(self, source: str, order: int, **flags: Any) -> str:
         return synthesize_source(source, order, **flags).unwrap_or_raise().rendering
 
+    def _cases(
+        self, iterations: int, corpus: Path | None
+    ) -> Iterator[tuple[str, int]]:
+        """Everything kept from before, and then whatever is new.
+
+        A finding that has been shrunk and written down is worth more than the
+        run it came from, because the run number that made it is gone from the
+        log long before the program is uninteresting.
+        """
+        if corpus is not None and corpus.is_dir():
+            for kept in sorted(corpus.glob("*.gsl")):
+                text = kept.read_text()
+                yield text, synthesize_source(text).unwrap_or_raise().module.order
+        for _ in range(iterations):
+            yield self._generator.generate()
+
+    def _keep(self, source: str, corpus: Path | None) -> None:
+        """A program worth having found is a program worth keeping."""
+        if corpus is None:
+            return
+        corpus.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+        (corpus / f"{digest}.gsl").write_text(source)
+
+    def _dwindle(
+        self,
+        source: str,
+        order: int,
+        tier: str,
+        scratch: Path,
+        toolchain: "LlvmToolchainService | None",
+        machines: Sequence[str],
+        wasm: bool,
+    ) -> str:
+        """The smallest program this one reduces to that still disagrees."""
+
+        def still(candidate: str) -> bool:
+            try:
+                baseline = self._render(
+                    candidate, order,
+                    optimise="false", jit="false", roundtrip="false",
+                )
+                for label, produce in self._variants(
+                    candidate, order, scratch, toolchain, machines, wasm
+                ):
+                    if label == tier:
+                        return produce() != baseline
+            except (GlyphPlatformError, OSError, subprocess.CalledProcessError):
+                return False
+            return False
+
+        return dwindle(source, still)
+
+    def _variants(
+        self,
+        source: str,
+        order: int,
+        scratch: Path,
+        toolchain: "LlvmToolchainService | None",
+        machines: Sequence[str],
+        wasm: bool,
+    ) -> list[tuple[str, Callable[[], str]]]:
+        """Every way of running one program that ought to answer the same."""
+        variants: list[tuple[str, Callable[[], str]]] = [
+            ("threaded", lambda: self._render(
+                source, order, optimise="false", jit="true", roundtrip="false")),
+            ("optimised", lambda: self._render(
+                source, order, optimise="true", jit="false", roundtrip="false")),
+            ("round-tripped", lambda: self._render(
+                source, order, optimise="true", jit="true", roundtrip="true")),
+        ]
+        if toolchain is not None:
+            variants.append(("jit", lambda: self._through_llvm(source, order, toolchain)))
+            if self._native:
+                variants.append(("native", lambda: self._through_native(source, order)))
+        for architecture in machines:
+            variants.append(
+                (f"elf({architecture})", lambda a=architecture: self._through_machine(
+                    self._object_for(source, order), scratch, a))
+            )
+        if wasm:
+            variants.append(
+                ("wasm", lambda: self._through_wasm(
+                    self._object_for(source, order), scratch))
+            )
+        variants.append(
+            ("read-back", lambda: self._through_read_back(
+                self._object_for(source, order)))
+        )
+        return variants
+
     @woven
     def run(self, iterations: int = 100) -> FuzzReport:
         with tempfile.TemporaryDirectory(prefix="ouroboros-fuzz-") as scratch:
-            return self._sweep(iterations, Path(scratch))
+            return self._sweep(iterations, Path(scratch), self._corpus)
 
-    def _sweep(self, iterations: int, scratch: Path) -> FuzzReport:
+    def _sweep(
+        self, iterations: int, scratch: Path, corpus: Path | None
+    ) -> FuzzReport:
         findings: list[FuzzFinding] = []
         skipped: list[str] = []
         tiers = ["interpreter", "threaded", "optimised", "round-tripped"]
@@ -6057,37 +6213,15 @@ class DifferentialFuzzer:
 
         comparisons = 0
         executed = 0
-        for case in range(iterations):
-            source, order = self._generator.generate()
+        for case, (source, order) in enumerate(
+            self._cases(iterations, corpus)
+        ):
             baseline = self._render(
                 source, order, optimise="false", jit="false", roundtrip="false"
             )
             executed += 1
-            variants: list[tuple[str, Callable[[], str]]] = [
-                ("threaded", lambda: self._render(
-                    source, order, optimise="false", jit="true", roundtrip="false")),
-                ("optimised", lambda: self._render(
-                    source, order, optimise="true", jit="false", roundtrip="false")),
-                ("round-tripped", lambda: self._render(
-                    source, order, optimise="true", jit="true", roundtrip="true")),
-            ]
-            if toolchain is not None:
-                variants.append(("jit", lambda: self._through_llvm(source, order, toolchain)))
-                if self._native:
-                    variants.append(("native", lambda: self._through_native(source, order)))
-            for architecture in machines:
-                variants.append(
-                    (f"elf({architecture})", lambda a=architecture: self._through_machine(
-                        self._object_for(source, order), scratch, a))
-                )
-            if wasm:
-                variants.append(
-                    ("wasm", lambda: self._through_wasm(
-                        self._object_for(source, order), scratch))
-                )
-            variants.append(
-                ("read-back", lambda: self._through_read_back(
-                    self._object_for(source, order)))
+            variants = self._variants(
+                source, order, scratch, toolchain, machines, wasm
             )
             if front_end is not None:
                 # The front end's claim is byte equality with layer 16, which is
@@ -6108,9 +6242,13 @@ class DifferentialFuzzer:
                 comparisons += 1
                 produced = produce()
                 if produced != baseline:
-                    findings.append(
-                        FuzzFinding(case, label, source, baseline, produced)
+                    smaller = self._dwindle(
+                        source, order, label, scratch, toolchain, machines, wasm
                     )
+                    findings.append(
+                        FuzzFinding(case, label, smaller, baseline, produced)
+                    )
+                    self._keep(smaller, corpus)
         return FuzzReport(
             executed, tuple(tiers), comparisons, tuple(findings), tuple(skipped)
         )
@@ -6156,9 +6294,193 @@ def fuzz(
     seed: int = 0,
     native: bool = False,
     front_end: bool = False,
+    corpus: Path | None = None,
 ) -> FuzzReport:
     """Generates ``iterations`` random programs and cross-checks every tier."""
-    return DifferentialFuzzer(seed, native, front_end).run(iterations)
+    return DifferentialFuzzer(seed, native, front_end, corpus).run(iterations)
+
+
+# ----------------------------------------------------------------------
+# layer 17b: the half of the claim that is about refusing
+# ----------------------------------------------------------------------
+#
+# The generator emits programs that are always well formed, so everything
+# above checks that the two front ends agree about what they accept and
+# nothing checks that they agree about what they reject.  A compiler is as
+# much its refusals as its acceptances, and two compilers that accept the
+# same language can still disagree about where it ends.
+#
+# So: take a program that works, break one token of it, and see whether both
+# of them say no.  A mutation that happens to produce another valid program
+# is not a disagreement about anything and is counted separately.
+
+GSL_TOKEN: Final[Any] = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+|\.\.|[;(){}+*/=-]")
+
+
+def mutilate(source: str, entropy: random.Random) -> str:
+    """One token of ``source`` dropped, doubled, moved or replaced.
+
+    The change is made in place so that everything around it keeps its line
+    and its column, which is what makes a later comparison of positions
+    possible without the mutation itself having moved them.
+    """
+    spans = [(m.start(), m.end()) for m in GSL_TOKEN.finditer(source)]
+    if len(spans) < 2:
+        return source
+    start, finish = entropy.choice(spans)
+    word = source[start:finish]
+    how = entropy.randrange(5)
+    if how == 0:
+        replacement = ""
+    elif how == 1:
+        replacement = word + " " + word
+    elif how == 2:
+        other, ending = entropy.choice(spans)
+        replacement = source[other:ending]
+    elif how == 3:
+        replacement = entropy.choice((";", "(", ")", "{", "}", "..", "=", "*"))
+    else:
+        return source[:start]
+    return source[:start] + replacement + source[finish:]
+
+
+@dataclass(frozen=True, slots=True)
+class RefusalCase:
+    """One broken program, and what each of the two front ends made of it."""
+
+    source: str
+    here: str | None
+    there: str | None
+    status: int
+
+    @property
+    def crashed(self) -> bool:
+        """Refusing is exiting with one.  Anything else is not refusing."""
+        return self.status not in (0, 1)
+
+    @property
+    def valid(self) -> bool:
+        """Whether the break was not a break: both still accept it."""
+        return self.here is None and self.there is None
+
+    @property
+    def agreed(self) -> bool:
+        return not self.crashed and (self.here is None) == (self.there is None)
+
+
+@dataclass(frozen=True, slots=True)
+class RefusalReport:
+    """Whether the two front ends draw the language's edge in one place."""
+
+    cases: tuple[RefusalCase, ...]
+
+    @property
+    def considered(self) -> int:
+        return len(self.cases)
+
+    @property
+    def still_valid(self) -> int:
+        return sum(1 for case in self.cases if case.valid)
+
+    @property
+    def refused(self) -> int:
+        return sum(1 for case in self.cases if not case.valid and case.agreed)
+
+    @property
+    def disagreements(self) -> tuple[RefusalCase, ...]:
+        return tuple(case for case in self.cases if not case.agreed)
+
+    @property
+    def clean(self) -> bool:
+        return not self.disagreements
+
+    def render(self) -> str:
+        lines = [
+            f"{self.considered} broken program(s): {self.refused} refused by "
+            f"both, {self.still_valid} not broken after all"
+        ]
+        for case in self.disagreements[:3]:
+            if case.crashed:
+                said = f"the other one exited {case.status} rather than refusing"
+            elif case.here is None:
+                said = "accepted here, refused there"
+            else:
+                said = "refused here, accepted there"
+            lines.append(f"  [FAIL] {said}")
+            lines.append("    " + "\n    ".join(case.source.strip().splitlines()))
+            lines.append(f"    here:  {case.here}")
+            lines.append(f"    there: {case.there}")
+        if self.clean:
+            lines.append("  [ok]   both front ends drew the edge in one place")
+        return "\n".join(lines)
+
+
+def _refusal_here(source: str) -> str | None:
+    """What tier 1's front end says, or nothing if it accepts the program.
+
+    A machine that faults while running a program is not a front end that
+    refused it, and the other front end does not run anything, so the two are
+    only comparable on what happens before that.  This is the one distinction
+    the whole comparison rests on, and it was found by making it wrongly:
+    a program with an interval that runs backwards compiles perfectly well
+    and fails when it is executed.
+    """
+    outcome = Result.attempt(lambda: SynthesisOrchestrator(
+        ConfigurationBuilder().with_defaults().with_mapping(
+            "refusal", {"motif": SOURCE_MOTIF}
+        ).build(),
+        source=source,
+    ).run())
+    if outcome.is_ok:
+        return None
+    failure = typing.cast(Err, outcome).failure
+    if isinstance(failure, ExecutionFault):
+        return None
+    return str(failure)
+
+
+def _refusal_there(front_end: Path, source: str) -> tuple[str | None, int]:
+    """The same question, asked of the front end written in GSL-2."""
+    done = subprocess.run(
+        [str(front_end)], input=source.encode(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if done.returncode == 0:
+        return None, 0
+    return (
+        done.stdout.decode(errors="replace").strip() or "(said nothing)",
+        done.returncode,
+    )
+
+
+def fuzz_refusals(iterations: int = 100, seed: int = 0) -> RefusalReport:
+    """Breaks generated programs and asks both front ends about the pieces.
+
+    The front end written in GSL-2 is built by the seed, which writes a
+    program rather than a description of one, so this needs nothing installed
+    either.
+    """
+    entropy = random.Random(seed)
+    generator = GslProgramGenerator(entropy)
+    with tempfile.TemporaryDirectory(prefix="ouroboros-refusal-") as scratch:
+        front_end = Path(scratch) / "glyphc"
+        front_end.write_bytes(gsl2_machine_code(GLYPHC_GSL2))
+        front_end.chmod(0o755)
+        cases = []
+        for _ in range(iterations):
+            source, _ = generator.generate()
+            broken = mutilate(source, entropy)
+            there, status = _refusal_there(front_end, broken)
+            cases.append(
+                RefusalCase(
+                    source=broken,
+                    here=_refusal_here(broken),
+                    there=there,
+                    status=status,
+                )
+            )
+    return RefusalReport(tuple(cases))
 
 
 # ======================================================================
@@ -18469,6 +18791,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     fuzzing.add_argument("--fuzz", type=int, metavar="N", help="cross-check N random programs")
     fuzzing.add_argument("--fuzz-seed", type=int, default=0)
     fuzzing.add_argument("--fuzz-native", action="store_true", help="also link and run each case")
+    fuzzing.add_argument("--fuzz-corpus", metavar="DIR",
+                         help="keep what is found here, and re-check it first")
+    fuzzing.add_argument("--fuzz-refusals", type=int, metavar="N",
+                         help="break N programs and check both front ends refuse")
     fuzzing.add_argument("--fuzz-loop", action="store_true",
                          help="also compile each case with the GSL-2 front end")
     return parser.parse_args(argv)
@@ -18534,7 +18860,7 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
     ):
         if getattr(namespace, flag):
             return f"{mode} chooses what it compiles"
-    if namespace.fuzz is not None:
+    if namespace.fuzz is not None or namespace.fuzz_refusals is not None:
         return "--fuzz chooses what it compiles"
     if namespace.carry:
         return "--carry says what goes on the disk, and it is not this"
@@ -18588,9 +18914,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))
+    if namespace.fuzz_refusals is not None:
+        refusals = fuzz_refusals(namespace.fuzz_refusals, namespace.fuzz_seed)
+        print(refusals.render())
+        return 0 if refusals.clean else 1
     if namespace.fuzz is not None:
         report = fuzz(
-            namespace.fuzz, namespace.fuzz_seed, namespace.fuzz_native, namespace.fuzz_loop
+            namespace.fuzz,
+            namespace.fuzz_seed,
+            namespace.fuzz_native,
+            namespace.fuzz_loop,
+            Path(namespace.fuzz_corpus) if namespace.fuzz_corpus else None,
         )
         print(report.render())
         return 0 if report.clean else 1
