@@ -7548,8 +7548,10 @@ var GLBINIT = 1470000;
 var RSP = 4;
 var RBP = 5;
 
-var TEXT_LIMIT = 340000;
+var TEXT_LIMIT = 339824;
 var MAXFN = 4096;
+var LABEL_LIMIT = 40000;
+var FIX_LIMIT = 40000;
 
 # Names for the places a branch can land.  Below L_FN are the routines the
 # runtime is made of; a function is L_FN plus its place in the table, and a
@@ -7674,7 +7676,12 @@ fn shift_octet(v) {
   return v / 256;
 }
 
+# Everything below writes into an array with something else after it, so
+# each of them says so before it writes and not once it has.
 fn emit(b) {
+  if (textlen >= TEXT_LIMIT) {
+    fail("the program is longer than there is room to build it in");
+  }
   mem[TEXT + textlen] = octet_of(b);
   textlen = textlen + 1;
   return 0;
@@ -7690,12 +7697,34 @@ fn emit_wide(v, count) {
   return 0;
 }
 
+# Four octets, and a complaint rather than a wrong answer when what is being
+# written into them does not fit.  A displacement or a literal that has been
+# quietly cut down is a program that is wrong and says nothing.
+fn emit_long(v) {
+  if (v > 2147483647) {
+    fail("a number in this program does not fit where it has to go");
+  }
+  if (v < 0 - 2147483648) {
+    fail("a number in this program does not fit where it has to go");
+  }
+  return emit_wide(v, 4);
+}
+
 fn lab(id) {
+  if (id >= LABEL_LIMIT) {
+    fail("more places to jump to than there is room for");
+  }
   mem[LBLOFF + id] = textlen;
   return 0;
 }
 
 fn where_to(id) {
+  if (nfix >= FIX_LIMIT) {
+    fail("more jumps than there is room to remember");
+  }
+  if (id >= LABEL_LIMIT) {
+    fail("more places to jump to than there is room for");
+  }
   mem[FIXAT + nfix] = textlen;
   mem[FIXID + nfix] = id;
   nfix = nfix + 1;
@@ -7767,7 +7796,7 @@ fn operand_tail(reg, kept, base, index, scale, disp) {
   }
   emit(128 + (reg % 8) * 8 + 4);
   emit(scale_bits(scale) * 64 + slot * 8 + (base % 8));
-  emit_wide(disp, 4);
+  emit_long(disp);
   return 0;
 }
 
@@ -7875,7 +7904,7 @@ fn alu(op, d, s) {
 # add 0, or 1, and 4, sub 5, xor 6, cmp 7 - the extensions.
 fn alu_imm(ext, d, v) {
   wide(129, 0 - 1, ext, 0, d, 0 - 1, 1, 0);
-  emit_wide(v, 4);
+  emit_long(v);
   return 0;
 }
 
@@ -7885,7 +7914,7 @@ fn mul(d, s) {
 
 fn mul_imm(d, s, v) {
   wide(105, 0 - 1, d, 0, s, 0 - 1, 1, 0);
-  emit_wide(v, 4);
+  emit_long(v);
   return 0;
 }
 
@@ -8559,9 +8588,6 @@ fn emit_trailer() {
   while (i < strtop) {
     emit_wide(mem[STRBUF + i], 8);
     i = i + 1;
-  }
-  if (textlen >= TEXT_LIMIT) {
-    fail("the program is longer than there is room for");
   }
   link_text();
   native_image(BSS_SPAN);
@@ -10966,6 +10992,11 @@ var LBLOFF = 1730000;
 var FIXAT = 1800000;
 var FIXID = 1870000;
 
+# What each of those has room for, which is the distance to the next one.
+var TEXT_LIMIT = 399824;
+var LABEL_LIMIT = 70000;
+var FIX_LIMIT = 70000;
+
 var L_EXIT = 0;
 var L_PAINT = 1;
 var L_PAINT_DONE = 2;
@@ -12870,6 +12901,14 @@ def build_front_ends(directory: Path, opt_level: int = 2) -> tuple[Path, str, Pa
     (directory / "glyphc.ll").write_text(glyphc_ir)
     glyphelf_ir = _run(gslc, GLYPHELF_GSL2)
     (directory / "glyphelf.ll").write_text(glyphelf_ir)
+
+    # The seed and the language have to agree about the whole language, and
+    # the bootstrap only ever asks them about a program that uses the part of
+    # it the compiler itself is written in.  This one uses the rest.
+    if glyphelf_ir != gsl2_compile(GLYPHELF_GSL2):
+        raise Gsl2Error(
+            "the seed and the compiler disagree about the front end"
+        )
     return (
         link_executable(glyphc_ir, directory / "glyphc", opt_level),
         glyphc_ir,
@@ -12911,6 +12950,7 @@ def close_the_toolchain(
     opt_level: int = 2,
     order: int = DEFAULT_LATTICE_ORDER,
     motif: str = DEFAULT_MOTIF,
+    source: str | None = None,
 ) -> ToolchainReport:
     """Takes the toolchain out of the chain, and then checks it is out.
 
@@ -12938,7 +12978,8 @@ def close_the_toolchain(
         stages.append(previous)
 
     front_end = _compile_with(stages[-1], GLYPHELF_GSL2, directory / "glyphelf")
-    source = typing.cast(type, Motif.lookup(motif))().source(order)
+    if source is None:
+        source = typing.cast(type, Motif.lookup(motif))().source(order)
     program = _compile_with(front_end, source, directory / "glyph")
     return ToolchainReport(
         workdir=directory,
@@ -15256,12 +15297,9 @@ def run_efi(image: bytes, lines: int, patience: float = 40.0) -> str:
 
 KERNEL_BASE: Final[int] = PAYLOAD_BASE
 KERNEL_SPAN: Final[int] = 0x1000
-KERNEL_CODE_SPAN: Final[int] = 0xA00
 PROGRAM_LBA: Final[int] = 1 + KERNEL_SPAN // SECTOR
 HEADER_SECTORS: Final[int] = 4
 HEADER_SCRATCH: Final[int] = KERNEL_BASE + KERNEL_SPAN
-PREPARED_STACK: Final[int] = KERNEL_BASE + KERNEL_CODE_SPAN
-PREPARED_SPAN: Final[int] = KERNEL_SPAN - KERNEL_CODE_SPAN
 
 # Where a program's stack, its break and its mappings go is not a constant:
 # a compiler wants sixteen megaoctets of its own and would have had the stack
@@ -15274,6 +15312,10 @@ VECTOR_SPAN: Final[int] = 0x800
 
 INPUT_AT: Final[int] = 0x100000
 INPUT_LIMIT: Final[int] = 0x300000
+
+# What a machine started by `run_boot` has, and therefore what a program is
+# allowed to reach before it is refused here rather than hanging there.
+MACHINE_MEMORY: Final[int] = 128 * 1024 * 1024
 
 EFER_MSR: Final[int] = 0xC0000080
 STAR_MSR: Final[int] = 0xC0000081
@@ -15399,7 +15441,17 @@ class ProgramPlan:
     @property
     def places(self) -> ProgramPlaces:
         """Above everything the program asked for, and clear of each other."""
+        return self.placed(0)
+
+    def placed(self, wander: int) -> ProgramPlaces:
+        """The same, moved up by ``wander`` pages.
+
+        Nothing needs this to be anything in particular, which is the point of
+        being able to change it: a program that only works in one place, or a
+        kernel that only puts it in one place, says so the moment it moves.
+        """
         vector = _align_up(self.ceiling, HUGE_PAGE) + PROGRAM_ROOM
+        vector = vector + wander * HUGE_PAGE
         brk = vector + BREAK_ROOM
         return ProgramPlaces(vector, brk, brk + MAPPING_ROOM)
 
@@ -15454,10 +15506,19 @@ def program_plan(program: bytes) -> ProgramPlan:
                 raise MachineCodeError(
                     "two segments would land on each other, sector for sector"
                 )
-    return ProgramPlan(entry, segments_at, span, count, tuple(segments))
+    plan = ProgramPlan(entry, segments_at, span, count, tuple(segments))
+    wanted = plan.places.mappings + MAPPING_ROOM
+    if wanted > MACHINE_MEMORY:
+        raise MachineCodeError(
+            f"the program and what it is given reach {wanted:#x}, and the "
+            f"machine has {MACHINE_MEMORY:#x}"
+        )
+    return plan
 
 
-def initial_stack(plan: ProgramPlan, arguments: Sequence[str]) -> bytes:
+def initial_stack(
+    plan: ProgramPlan, arguments: Sequence[str], places: ProgramPlaces
+) -> bytes:
     """The block the program wakes up looking at, laid out here rather than there.
 
     Every address in it is known before the machine starts, because the stack
@@ -15483,7 +15544,7 @@ def initial_stack(plan: ProgramPlan, arguments: Sequence[str]) -> bytes:
     # argc, the arguments, their terminator, an empty environment's
     # terminator, the pairs, the entropy pair, the name pair, and the end.
     words = 1 + len(named) + 1 + 1 + 2 * len(pairs) + 2 + 2 + 2
-    entropy_at = plan.places.vector + words * 8
+    entropy_at = places.vector + words * 8
     strings_at = entropy_at + 16
 
     places: list[int] = []
@@ -15503,10 +15564,6 @@ def initial_stack(plan: ProgramPlan, arguments: Sequence[str]) -> bytes:
     block = b"".join(struct.pack("<Q", value) for value in vector)
     block += bytes(range(16))
     block += b"".join(named)
-    if len(block) + 8 > PREPARED_SPAN:
-        raise MachineCodeError(
-            f"the prepared stack wants {len(block) + 8} octets of {PREPARED_SPAN}"
-        )
     return struct.pack("<Q", len(block)) + block
 
 
@@ -15543,6 +15600,7 @@ SYS_FSTATAT: Final[int] = 262
 # Not a number anybody's kernel uses, for a thing no kernel does: the octets
 # it is handed are a program, and the machine is to be that program instead.
 SYS_BECOME: Final[int] = 666
+ELF_SIGNATURE: Final[int] = 0x464C457F
 
 ARCH_SET_FS: Final[int] = 0x1002
 NO_SUCH_FILE: Final[int] = -2
@@ -15749,6 +15807,9 @@ def _kernel_settle_in_place(text: X86Assembler, places: ProgramPlaces) -> None:
     """
     text.label("become")
     text.load(Register.RBP, Register.RDI)
+    text.widen_long(Register.RAX, MemoryOperand(Register.RBP, None, 1, 0))
+    text.arithmetic_immediate("cmp", Register.RAX, ELF_SIGNATURE)
+    text.jump_if("ne", "become.refuse")
     text.load(Register.R9, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENTS_AT))
     text.arithmetic("add", Register.R9, Register.RBP)
     text.widen_word(
@@ -15792,6 +15853,10 @@ def _kernel_settle_in_place(text: X86Assembler, places: ProgramPlaces) -> None:
     text.decrement(Register.R10)
     text.jump("become.head")
 
+    text.label("become.refuse")
+    text.immediate(Register.RAX, NOT_ALLOWED)
+    text.jump("attend.leave")
+
     text.label("become.done")
     text.load(Register.RCX, MemoryOperand(Register.RBP, None, 1, ELF_ENTRY))
     text.immediate(Register.RSP, places.vector)
@@ -15809,7 +15874,7 @@ def _kernel_handler(text: X86Assembler) -> None:
     kept = (
         Register.RDI, Register.RSI, Register.RDX, Register.R8, Register.R9,
         Register.R10, Register.R11, Register.R12, Register.R13,
-        KERNEL_SCRATCH, KERNEL_SPARE,
+        Register.RBP, KERNEL_SCRATCH, KERNEL_SPARE,
     )
     text.label("attend")
     text.push(Register.RBX)
@@ -16009,7 +16074,10 @@ def _kernel_prologue(text: X86Assembler, places: ProgramPlaces) -> None:
 
 
 def kernel_text(
-    places: ProgramPlaces, input_lba: int, input_span: int
+    places: ProgramPlaces,
+    input_lba: int,
+    input_span: int,
+    prepared_at: int,
 ) -> bytes:
     """Everything that has to exist before a binary somebody else built runs."""
     text = X86Assembler()
@@ -16030,7 +16098,7 @@ def kernel_text(
     text.call("settle")
     text.load(Register.RBX, Register.RAX)
 
-    text.immediate(Register.RSI, PREPARED_STACK)
+    text.immediate(Register.RSI, prepared_at)
     text.load(Register.R12, MemoryOperand(Register.RSI, None, 1, 0))
     text.arithmetic_immediate("add", Register.RSI, 8)
     text.immediate(Register.RDI, places.vector)
@@ -16074,6 +16142,7 @@ def kernel_carrying(
     program: bytes,
     arguments: Sequence[str] = ("glyph",),
     reading: bytes = b"",
+    wander: int = 0,
 ) -> bytes:
     """A disk holding the sector, the kernel, its stack, the program, its input.
 
@@ -16086,14 +16155,26 @@ def kernel_carrying(
         raise MachineCodeError(
             f"there are {len(reading)} octets to read and room for {INPUT_LIMIT}"
         )
+    places = plan.placed(wander)
     program_sectors = -(-len(program) // SECTOR)
     input_lba = PROGRAM_LBA + program_sectors
-    kernel = kernel_text(plan.places, input_lba, len(reading))
-    if len(kernel) > KERNEL_CODE_SPAN:
+    # Where the stack it prepares goes is wherever the kernel stops, which is
+    # not known until the kernel is built - and the address is an immediate of
+    # a fixed width, so building it twice answers the question without moving
+    # anything the second time.
+    measured = kernel_text(places, input_lba, len(reading), 0)
+    prepared_at = KERNEL_BASE + _align_up(len(measured), 16)
+    kernel = kernel_text(places, input_lba, len(reading), prepared_at)
+    if len(kernel) != len(measured):
+        raise MachineCodeError("the kernel changed length when it was told where")
+    block = (
+        kernel.ljust(prepared_at - KERNEL_BASE, b"\x00")
+        + initial_stack(plan, arguments, places)
+    )
+    if len(block) > KERNEL_SPAN:
         raise MachineCodeError(
-            f"the kernel wants {len(kernel)} octets of {KERNEL_CODE_SPAN}"
+            f"the kernel and its stack want {len(block)} octets of {KERNEL_SPAN}"
         )
-    block = kernel.ljust(KERNEL_CODE_SPAN, b"\x00") + initial_stack(plan, arguments)
     body = (
         block.ljust(KERNEL_SPAN, b"\x00")
         + program.ljust(program_sectors * SECTOR, b"\x00")
@@ -16150,6 +16231,24 @@ def trespassing_program(module: ObjectModule, where: int) -> bytes:
     return elf64_image(backend.encode(), backend.layout.size, machine, align)
 
 
+def kernel_wanders(program: bytes, lines: int, spread: int = 4) -> tuple[str, ...]:
+    """The same program, put in several different places, and what each said.
+
+    Nothing here needs the stack, the break or the mappings to be at any
+    particular address, and the only way to be sure of that is to move them.
+    A program that answers differently from a different place, or a kernel
+    that only works with the numbers it was written against, says so here.
+    """
+    said = []
+    for wander in range(spread):
+        image = kernel_carrying(program, wander=wander)
+        with tempfile.TemporaryDirectory(prefix="ouroboros-wander-") as scratch:
+            disk = Path(scratch) / "kernel.img"
+            disk.write_bytes(image)
+            said.append(run_boot(disk, lines, patience=20.0).removesuffix("\n"))
+    return tuple(said)
+
+
 def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
     """Whether each of two stores was allowed, the program's and the other.
 
@@ -16204,6 +16303,7 @@ def boot_what_it_compiles(
     opt_level: int = 2,
     order: int = DEFAULT_LATTICE_ORDER,
     motif: str = DEFAULT_MOTIF,
+    source: str | None = None,
 ) -> tuple[str, str]:
     """The machine reads a program, compiles it, and becomes what it compiled.
 
@@ -16219,17 +16319,19 @@ def boot_what_it_compiles(
     )
     compiler = _compile_with(seeded, GSLCELF_GSL2, directory / "gslcelf")
     front_end = _compile_with(compiler, GLYPHELF_GSL2, directory / "glyphelf")
-    source = typing.cast(type, Motif.lookup(motif))().source(order)
+    if source is None:
+        source = typing.cast(type, Motif.lookup(motif))().source(order)
     (directory / "glyph.gsl").write_text(source)
     image = kernel_carrying(
         front_end.read_bytes(), ("glyphelf",), source.encode()
     )
     (directory / "compile.img").write_bytes(image)
+    wanted = synthesize_source(source).unwrap_or_raise()
     with tempfile.TemporaryDirectory(prefix="ouroboros-metal-") as scratch:
         disk = Path(scratch) / "compile.img"
         disk.write_bytes(image)
-        said = run_boot(disk, order, patience=60.0).removesuffix("\n")
-    return said, synthesize_source(source).unwrap_or_raise().rendering
+        said = run_boot(disk, wanted.module.order, patience=60.0).removesuffix("\n")
+    return said, wanted.rendering
 
 
 def boot_runnable() -> bool:
@@ -17782,6 +17884,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          help="an executable to put on that disk instead of this one")
     machine.add_argument("--carry-as", metavar="WORDS", default="",
                          help="the words the carried program is called with")
+    machine.add_argument("--carry-reading", metavar="PATH",
+                         help="what that program finds when it reads")
     machine.add_argument("--emit-efi", metavar="PATH",
                          help="write the same text as a UEFI application")
 
@@ -17872,6 +17976,8 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
             return f"{mode} chooses what it compiles"
     if namespace.fuzz is not None:
         return "--fuzz chooses what it compiles"
+    if namespace.carry:
+        return "--carry says what goes on the disk, and it is not this"
     return None
 
 
@@ -17883,6 +17989,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(levelname)s %(name)s %(message)s",
     )
+
+    for flag, mode, beside in (
+        ("carry_as", "--carry-as", "--carry"),
+        ("carry_reading", "--carry-reading", "--carry"),
+    ):
+        if getattr(namespace, flag) and not namespace.carry:
+            print(f"{mode} means nothing without {beside}", file=sys.stderr)
+            return 2
 
     source: str | None = None
     if namespace.program is not None:
@@ -17930,7 +18044,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.boot_the_compiler:
         try:
             workdir = Path(namespace.workdir) if namespace.workdir else None
-            said, wanted = boot_what_it_compiles(workdir, namespace.opt_level or 2)
+            said, wanted = boot_what_it_compiles(
+                workdir,
+                namespace.opt_level or 2,
+                namespace.order or DEFAULT_LATTICE_ORDER,
+                namespace.motif or DEFAULT_MOTIF,
+                source,
+            )
             print(said)
             if said != wanted:
                 print("that is not the figure", file=sys.stderr)
@@ -17944,7 +18064,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             workdir = Path(namespace.workdir) if namespace.workdir else None
             return _emit_toolchain_report(
-                close_the_toolchain(workdir, namespace.opt_level or 2)
+                close_the_toolchain(
+                    workdir,
+                    namespace.opt_level or 2,
+                    namespace.order or DEFAULT_LATTICE_ORDER,
+                    namespace.motif or DEFAULT_MOTIF,
+                    source,
+                )
             )
         except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
             print(f"the toolchain cannot be closed here: {exc}", file=sys.stderr)
@@ -18064,7 +18190,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.emit_kernel:
         if namespace.carry:
             words = shlex.split(namespace.carry_as) or [_program_name(namespace.carry)]
-            blob = kernel_carrying(_read_octets(namespace.carry), words)
+            reading = (
+                _read_octets(namespace.carry_reading)
+                if namespace.carry_reading else b""
+            )
+            blob = kernel_carrying(_read_octets(namespace.carry), words, reading)
         else:
             blob = kernel_image(artifacts.module)
         written = _write_octets(namespace.emit_kernel, blob)

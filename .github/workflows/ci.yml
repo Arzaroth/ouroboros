@@ -194,6 +194,19 @@ jobs:
           print('a disk with a compiler and a source on it, and nothing else')
           "
 
+      - name: nothing depends on where the kernel decided to put it
+        run: |
+          python -c "
+          import pathlib, ouroboros
+          module = ouroboros.synthesize(7).unwrap_or_raise().module
+          said = ouroboros.kernel_wanders(
+              ouroboros.machine_code(module, 'x86-64'), 7
+          )
+          assert len(set(said)) == 1, said
+          assert said[0] == ouroboros.synthesize(7).unwrap_or_raise().rendering
+          print(f'{len(said)} placements, one answer')
+          "
+
       - name: and the program it loaded cannot reach the kernel that loaded it
         run: |
           python -c "
