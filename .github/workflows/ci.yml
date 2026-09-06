@@ -162,7 +162,8 @@ jobs:
       - name: an emulator to start, and firmware to start it with
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-system-arm ovmf
           pip install llvmlite
 
       - name: the disk boots and the figure comes out of the serial port
@@ -214,6 +215,18 @@ jobs:
           said, wanted = ouroboros.boot_what_it_compiles()
           assert said == wanted, said
           print('a disk with a compiler and a source on it, and nothing else')
+          "
+
+      - name: and a board that is the other machine, with nothing on it either
+        run: |
+          python ouroboros.py --emit-boot glyph-arm.elf --machine aarch64
+          python -c "
+          import pathlib, ouroboros
+          wanted = ouroboros.synthesize(7).unwrap_or_raise().rendering
+          image = pathlib.Path('glyph-arm.elf').read_bytes()
+          got = ouroboros.run_arm_boot(image, 7, patience=60.0).removesuffix('\n')
+          assert got == wanted, got
+          print('started by the board itself, with no sector in front of it')
           "
 
       - name: 30 programs nobody wrote, started on a machine, twice each

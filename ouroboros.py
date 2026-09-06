@@ -14927,15 +14927,13 @@ class Aarch64CodeBackend:
         """The whole text section: entry point, instruction stream, runtime."""
         text = Aarch64Assembler()
         text.label("_start")
-        text.immediate(DATA, DATA_BASE)
+        self._prologue(text)
         for address, instruction in enumerate(self._module.instructions):
             text.label(f"A{address}")
             self._instruction(text, instruction, address)
         text.label("exit")
         text.call("render")
-        text.immediate(8, ARM_SYS_EXIT_GROUP)
-        text.immediate(0, 0)
-        text.syscall()
+        self._epilogue(text)
         text.label("divide.by.zero")
         text.trap()
         self._paint(text)
@@ -14943,7 +14941,32 @@ class Aarch64CodeBackend:
         self._snapshot(text)
         self._apply(text)
         self._render(text)
+        self._appendix(text)
         return text.link()
+
+    # -- what a kernel underneath is asked for, on this machine too --------
+
+    DATA_ORIGIN: ClassVar[int] = DATA_BASE
+    IMAGE_ORIGIN: ClassVar[int] = IMAGE_BASE
+
+    def _prologue(self, text: Aarch64Assembler) -> None:
+        """Where .bss is; the loader has already zeroed it."""
+        text.immediate(DATA, self.DATA_ORIGIN)
+
+    def _epilogue(self, text: Aarch64Assembler) -> None:
+        text.immediate(8, ARM_SYS_EXIT_GROUP)
+        text.immediate(0, 0)
+        text.syscall()
+
+    def _flush(self, text: Aarch64Assembler) -> None:
+        text.immediate(8, ARM_SYS_WRITE)
+        text.immediate(0, 1)
+        text.arithmetic_immediate("add", 1, DATA, self._layout.output)
+        text.move(2, 14)
+        text.syscall()
+
+    def _appendix(self, text: Aarch64Assembler) -> None:
+        """Routines a platform needs and this one does not."""
 
     def _intrinsic(self, name: str) -> int:
         try:
@@ -15214,11 +15237,7 @@ class Aarch64CodeBackend:
         text.arithmetic_immediate("add", 11, 11, 1)
         text.jump("render.row")
         text.label("render.flush")
-        text.immediate(8, ARM_SYS_WRITE)
-        text.immediate(0, 1)
-        text.arithmetic_immediate("add", 1, DATA, self._layout.output)
-        text.move(2, 14)
-        text.syscall()
+        self._flush(text)
         text.ret()
 
 
@@ -15433,6 +15452,138 @@ class Riscv64Assembler:
 A0, A1, A2, A3 = 10, 11, 12, 13
 T0, T1, T2, T3 = 5, 6, 7, 28
 S4, S5, S6, S7, S8, S9, S10, S11 = 20, 21, 22, 23, 24, 25, 26, 27
+
+
+# ----------------------------------------------------------------------
+# tier 7 again, on the machine that is one
+# ----------------------------------------------------------------------
+#
+# This board has nothing in front of it.  The emulator reads an executable by
+# its own headers and enters at the first instruction with the memory unit
+# off, so the sector of real mode, the gate, the page tables and the walk up
+# to sixty-four bits are all things that do not have to happen: there is
+# nothing to walk up from.
+#
+# What differs instead is where everything lives.  Memory begins at a
+# gigaoctet, so an executable that asks to be put at four megaoctets is asking
+# for somewhere that is not there; and the port is a device at a fixed
+# address rather than something to be addressed with an instruction of its
+# own, so an octet leaves by being stored.
+
+ARM_RAM: Final[int] = 0x4000_0000
+ARM_BOOT_IMAGE: Final[int] = ARM_RAM + 0x0010_0000
+ARM_BOOT_DATA: Final[int] = ARM_RAM + 0x0080_0000
+ARM_BOOT_STACK: Final[int] = ARM_RAM + 0x0070_0000
+ARM_UART: Final[int] = 0x0900_0000
+
+
+class Aarch64BootBackend(Aarch64CodeBackend):
+    """The same text as layer 18's, for a machine with nothing underneath it.
+
+    The three answers are the ones tier 7 always needs.  Nobody has zeroed
+    .bss, so the prologue does it.  There is nowhere to exit to, so the
+    epilogue stays where it is.  And there is no descriptor to write to, so
+    the octets are stored one at a time at the address the port answers on.
+    """
+
+    DATA_ORIGIN: ClassVar[int] = ARM_BOOT_DATA
+    IMAGE_ORIGIN: ClassVar[int] = ARM_BOOT_IMAGE
+
+    def _prologue(self, text: Aarch64Assembler) -> None:
+        # The operand stack is the hardware stack, and on a machine with
+        # nothing underneath it nobody has said where that is.
+        text.immediate(9, ARM_BOOT_STACK)
+        text.arithmetic_immediate("add", STACK, 9, 0)
+        text.immediate(DATA, self.DATA_ORIGIN)
+        text.immediate(9, 0)
+        text.immediate(10, self._layout.size)
+        text.immediate(11, 0)
+        text.label("wipe.head")
+        text.compare(9, 10)
+        text.jump_if("ge", "wipe.done")
+        text.store_octet(11, DATA, 9)
+        text.arithmetic_immediate("add", 9, 9, 1)
+        text.jump("wipe.head")
+        text.label("wipe.done")
+
+    def _epilogue(self, text: Aarch64Assembler) -> None:
+        text.label("stop")
+        text.jump("stop")
+
+    def _flush(self, text: Aarch64Assembler) -> None:
+        """The output buffer, one octet at a time, to the port.
+
+        Written where it is used rather than called.  A branch with a link
+        writes the register a return reads, and this file parks that register
+        for exactly one level of nesting, which the routine that renders has
+        already spent.
+        """
+        text.immediate(16, ARM_UART)
+        text.immediate(9, 0)
+        text.immediate(19, 0)
+        text.arithmetic_immediate("add", 17, DATA, self._layout.output)
+        text.label("blit.head")
+        text.compare(9, 14)
+        text.jump_if("ge", "blit.done")
+        text.load_octet(18, 17, 9)
+        text.store_octet(18, 16, 19)
+        text.arithmetic_immediate("add", 9, 9, 1)
+        text.jump("blit.head")
+        text.label("blit.done")
+
+
+def arm_boot_image(module: ObjectModule) -> bytes:
+    """An executable a board with nothing on it will start by itself."""
+    backend = Aarch64BootBackend(module)
+    return elf64_image(
+        backend.encode(),
+        backend.layout.size,
+        EM_AARCH64,
+        ARM_PAGE,
+        ARM_BOOT_IMAGE,
+        ARM_BOOT_DATA,
+    )
+
+
+def arm_boot_runnable() -> bool:
+    """Whether anything here can be asked to start a machine that is one."""
+    return shutil.which("qemu-system-aarch64") is not None
+
+
+def run_arm_boot(image: bytes, lines: int, patience: float = 20.0) -> str:
+    """Starts a board on ``image`` and answers what left the serial port."""
+    emulator = shutil.which("qemu-system-aarch64")
+    if emulator is None:
+        raise MachineCodeError("no emulator here is that machine")
+    with tempfile.TemporaryDirectory(prefix="ouroboros-arm-") as scratch:
+        elf = Path(scratch) / "glyph.elf"
+        elf.write_bytes(image)
+        capture = Path(scratch) / "serial"
+        machine = subprocess.Popen(
+            [
+                emulator, "-M", "virt", "-cpu", "cortex-a57",
+                "-display", "none", "-serial", f"file:{capture}",
+                "-no-reboot", "-net", "none", "-kernel", str(elf),
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + patience
+            while time.monotonic() < deadline:
+                if capture.exists():
+                    written = capture.read_text(errors="replace")
+                    if written.count("\n") >= lines:
+                        return written
+                if machine.poll() is not None:
+                    raise MachineCodeError(
+                        f"the machine stopped of its own accord: "
+                        f"{complaint(machine)}"
+                    )
+                time.sleep(0.05)
+            raise MachineCodeError(f"no {lines} lines left the machine in time")
+        finally:
+            machine.kill()
+            machine.wait()
 
 
 class Riscv64CodeBackend:
@@ -15780,7 +15931,14 @@ PROGRAM_HEADER_SIZE: Final[int] = 56
 PROGRAM_HEADERS: Final[int] = 2
 
 
-def elf64_image(text: bytes, bss: int, machine: int, align: int) -> bytes:
+def elf64_image(
+    text: bytes,
+    bss: int,
+    machine: int,
+    align: int,
+    origin: int = IMAGE_BASE,
+    data: int = DATA_BASE,
+) -> bytes:
     """Wraps a text section in the smallest static ELF64 executable that runs it.
 
     Two loadable segments and nothing else: the headers and the text, mapped
@@ -15796,13 +15954,13 @@ def elf64_image(text: bytes, bss: int, machine: int, align: int) -> bytes:
     header = struct.pack(
         "<4sBBBBB7xHHIQQQIHHHHHH",
         b"\x7fELF", 2, 1, 1, 0, 0,
-        2, machine, 1, IMAGE_BASE + prologue, ELF_HEADER_SIZE, 0, 0,
+        2, machine, 1, origin + prologue, ELF_HEADER_SIZE, 0, 0,
         ELF_HEADER_SIZE, PROGRAM_HEADER_SIZE, PROGRAM_HEADERS, 64, 0, 0,
     )
     segments = struct.pack(
-        "<IIQQQQQQ", 1, 5, 0, IMAGE_BASE, IMAGE_BASE, loaded, loaded, align
+        "<IIQQQQQQ", 1, 5, 0, origin, origin, loaded, loaded, align
     ) + struct.pack(
-        "<IIQQQQQQ", 1, 6, 0, DATA_BASE, DATA_BASE, 0, bss, align
+        "<IIQQQQQQ", 1, 6, 0, data, data, 0, bss, align
     )
     return header + segments + text
 
@@ -19028,6 +19186,16 @@ def _selftest(orders: Sequence[int]) -> int:
             except (GlyphPlatformError, OSError) as exc:
                 print(f"  n={order:<3} elf({architecture}) skipped: {exc}", file=sys.stderr)
         try:
+            if not arm_boot_runnable():
+                raise OSError("no emulator here is that machine")
+            tiers.append((
+                "arm-boot",
+                run_arm_boot(arm_boot_image(artifacts.module), order)
+                .removesuffix("\n"),
+            ))
+        except (GlyphPlatformError, OSError) as exc:
+            print(f"  n={order:<3} arm boot tier skipped: {exc}", file=sys.stderr)
+        try:
             tiers.append((
                 "machine-read-back",
                 execute_machine_code(
@@ -19538,7 +19706,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
     if namespace.emit_boot:
-        blob = boot_image(artifacts.module)
+        blob = (
+            arm_boot_image(artifacts.module)
+            if namespace.machine == "aarch64"
+            else boot_image(artifacts.module)
+        )
         written = _write_octets(namespace.emit_boot, blob)
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
