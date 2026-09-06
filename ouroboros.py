@@ -16378,6 +16378,10 @@ def program_plan(program: bytes) -> ProgramPlan:
     for segment in segments:
         if segment.offset + segment.on_disk > len(program):
             raise MachineCodeError("a segment runs off the end of the file")
+        if segment.in_memory < segment.on_disk:
+            raise MachineCodeError(
+                "a segment brings more than it says it needs room for"
+            )
         for other in segments:
             if other is segment:
                 continue
@@ -16605,16 +16609,13 @@ def _kernel_loader(text: X86Assembler) -> None:
     text.call("fetch")
 
     text.load(Register.RDI, MemoryOperand(Register.R9, None, 1, SEGMENT_ADDRESS))
-    text.load(Register.R12, MemoryOperand(Register.R9, None, 1, SEGMENT_ON_DISK))
+    text.load(Register.RCX, MemoryOperand(Register.R9, None, 1, SEGMENT_ON_DISK))
     text.load(KERNEL_SPARE, MemoryOperand(Register.R9, None, 1, SEGMENT_IN_MEMORY))
-    text.arithmetic("add", Register.RDI, Register.R12)
-    text.arithmetic("sub", KERNEL_SPARE, Register.R12)
     text.label("settle.wipe")
-    text.test(KERNEL_SPARE, KERNEL_SPARE)
-    text.jump_if("e", "settle.next")
-    text.store_octet_immediate(MemoryOperand(Register.RDI, None, 1, 0), 0)
-    text.increment(Register.RDI)
-    text.decrement(KERNEL_SPARE)
+    text.arithmetic("cmp", Register.RCX, KERNEL_SPARE)
+    text.jump_if("ge", "settle.next")
+    text.store_octet_immediate(MemoryOperand(Register.RDI, Register.RCX, 1, 0), 0)
+    text.increment(Register.RCX)
     text.jump("settle.wipe")
 
     text.label("settle.next")
