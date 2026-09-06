@@ -2359,12 +2359,23 @@ def grammar_disagreements() -> tuple[str, ...]:
     return tuple(found)
 
 
+# How deep an expression may nest, counted in levels of descent - a
+# parenthesised subexpression costs two of them.  Descent costs stack, and
+# the stack this runs on is not this file's to enlarge, so past some depth a
+# program stops being read and becomes a way to end the process.  Every phase
+# below survives about six hundred and fifty levels, the analyser being the
+# first to give way; this refuses at a stated four hundred instead of finding
+# that out, and nothing anyone writes comes near it.
+MAXIMUM_NESTING: Final[int] = 400
+
+
 class RecursiveDescentParser:
     """Recursive descent for statements, precedence climbing for expressions."""
 
     def __init__(self, tokens: Sequence[Token], diagnostics: DiagnosticEngine | None = None) -> None:
         self._stream = TokenStream(tokens)
         self._diagnostics = diagnostics or DIAGNOSTICS
+        self._depth = 0
 
     @woven
     def parse(self) -> Program:
@@ -2440,15 +2451,31 @@ class RecursiveDescentParser:
         return self._parse_form(form)
 
     def _parse_expression(self, minimum_precedence: int = 0) -> AstNode:
-        left = self._parse_prefix()
-        while True:
-            spec = INFIX_TABLE.get(self._stream.peek().kind)
-            if spec is None or spec.precedence < minimum_precedence:
-                return left
-            token = self._stream.advance()
-            next_precedence = spec.precedence + (0 if spec.right_associative else 1)
-            right = self._parse_expression(next_precedence)
-            left = BinaryOperation(spec.symbol, left, right, token.position)
+        self._depth += 1
+        if self._depth > MAXIMUM_NESTING:
+            self._depth -= 1
+            token = self._stream.peek()
+            self._diagnostics.emit(
+                Severity.FATAL, "SY0004", "diag.unexpected_token", token.position,
+                expected=f"an expression nested no deeper than {MAXIMUM_NESTING}",
+                found=str(token),
+            )
+            raise SyntaxError_(
+                f"{token.position}: an expression nested deeper than "
+                f"{MAXIMUM_NESTING} is more than this reads"
+            )
+        try:
+            left = self._parse_prefix()
+            while True:
+                spec = INFIX_TABLE.get(self._stream.peek().kind)
+                if spec is None or spec.precedence < minimum_precedence:
+                    return left
+                token = self._stream.advance()
+                next_precedence = spec.precedence + (0 if spec.right_associative else 1)
+                right = self._parse_expression(next_precedence)
+                left = BinaryOperation(spec.symbol, left, right, token.position)
+        finally:
+            self._depth -= 1
 
     def _parse_prefix(self) -> AstNode:
         token = self._stream.peek()
