@@ -15244,6 +15244,46 @@ def build_front_ends(directory: Path, opt_level: int = 2) -> tuple[Path, str, Pa
     )
 
 
+# The machines this one is not, each with the tail that writes for it and,
+# where there is one, the compiler that runs there.
+CROSSINGS: Final[tuple[tuple[str, str, str, str, str], ...]] = (
+    ("aarch64", "gslcarm", "glypharm", GSLCARM_GSL2, GLYPHARM_GSL2),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CrossedMachine:
+    """One machine that is not this one, written for and then written on.
+
+    The first three say what this host made for it: a front end, a program,
+    and whether that program is octet for octet what layer 18 writes.  The
+    rest say what happened over there, which is only askable where this host
+    can run that machine's programs, and is what the note says when it
+    cannot.
+    """
+
+    name: str
+    compiler: str
+    front_end_name: str
+    front_end: int
+    size: int
+    program: bool
+    stages: tuple[tuple[int, str], ...]
+    native_front: int
+    native_program: bool
+    skipped: str
+
+    @property
+    def settled(self) -> bool:
+        """Whether the compiler for that machine is a fixpoint over there."""
+        return bool(self.stages) and len({digest for _, digest in self.stages}) == 1
+
+    @property
+    def clean(self) -> bool:
+        there = self.settled and self.native_program
+        return self.program and (there or bool(self.skipped))
+
+
 @dataclass(frozen=True, slots=True)
 class ToolchainReport:
     """What came out of building the compiler with nothing but itself."""
@@ -15253,13 +15293,7 @@ class ToolchainReport:
     stages: tuple[tuple[int, str], ...]
     front_end: int
     program: int
-    other_front_end: int
-    other_size: int
-    other_program: bool
-    elsewhere: tuple[tuple[int, str], ...]
-    elsewhere_front: int
-    elsewhere_program: bool
-    elsewhere_skipped: str
+    crossed: tuple[CrossedMachine, ...]
     glyph: str
     expected: str
 
@@ -15267,15 +15301,6 @@ class ToolchainReport:
     def fixed(self) -> bool:
         """Whether the compiler, built by itself, is the same octets twice."""
         return len({digest for _, digest in self.stages}) == 1
-
-    @property
-    def settled_elsewhere(self) -> bool:
-        """Whether the compiler for the other machine is a fixpoint over there.
-
-        Only askable where this host can run that machine's programs, which
-        is what the note says when it cannot.
-        """
-        return bool(self.elsewhere) and len({d for _, d in self.elsewhere}) == 1
 
     @property
     def seeded_matches(self) -> bool:
@@ -15289,12 +15314,10 @@ class ToolchainReport:
 
     @property
     def clean(self) -> bool:
-        settled = self.settled_elsewhere and self.elsewhere_program
         return (
             self.fixed
             and self.seeded_matches
-            and self.other_program
-            and (settled or bool(self.elsewhere_skipped))
+            and all(machine.clean for machine in self.crossed)
             and self.glyph == self.expected
         )
 
@@ -15326,6 +15349,8 @@ def close_the_toolchain(
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "gslcelf.gsl2").write_text(GSLCELF_GSL2)
     (directory / "glyphelf.gsl2").write_text(GLYPHELF_GSL2)
+    for _, _, front_name, _, front_text in CROSSINGS:
+        (directory / f"{front_name}.gsl2").write_text(front_text)
 
     # The seed writes a program rather than a description of one, so there is
     # nothing under this at all: no assembler, no linker, nothing installed.
@@ -15345,41 +15370,54 @@ def close_the_toolchain(
         source = typing.cast(type, Motif.lookup(motif))().source(order)
     program = _compile_with(front_end, source, directory / "glyph")
 
-    # And once more for the machine this one is not.  The compiler does not
+    # And once more for every machine this one is not.  The compiler does not
     # care which; what changes is the tail it is handed.
-    other = _compile_with(stages[-1], GLYPHARM_GSL2, directory / "glypharm")
-    crossed = _compile_with(other, source, directory / "glyph-aarch64")
-    matches = crossed.read_bytes() == machine_code(
-        synthesize_source(source).unwrap_or_raise().module, "aarch64"
-    )
-    # And the same again over there, which needs this host to be able to run
-    # that machine's programs, since after the first turn they are what does
-    # the compiling.
-    elsewhere: list[tuple[int, str]] = []
-    elsewhere_front = 0
-    elsewhere_program = False
-    elsewhere_skipped = ""
-    if machine_code_runnable("aarch64"):
-        seeded_there = directory / "seeded-aarch64"
-        seeded_there.write_bytes(gsl2_machine_code(GSLCARM_GSL2))
-        seeded_there.chmod(0o755)
-        previous = seeded_there
-        for turn in range(3):
-            previous = _compile_with(
-                previous, GSLCARM_GSL2, directory / f"gslcarm{turn + 1}"
+    module = synthesize_source(source).unwrap_or_raise().module
+    crossed: list[CrossedMachine] = []
+    for name, compiler, front_name, compiler_text, front_text in CROSSINGS:
+        other = _compile_with(stages[-1], front_text, directory / front_name)
+        written = _compile_with(other, source, directory / f"glyph-{name}")
+        # And the same again over there, which needs this host to be able to
+        # run that machine's programs, since after the first turn they are
+        # what does the compiling.
+        elsewhere: list[tuple[int, str]] = []
+        native_front = 0
+        native_program = False
+        skipped = ""
+        if machine_code_runnable(name):
+            seeded_there = directory / f"seeded-{name}"
+            seeded_there.write_bytes(gsl2_machine_code(compiler_text))
+            seeded_there.chmod(0o755)
+            previous = seeded_there
+            for turn in range(3):
+                previous = _compile_with(
+                    previous, compiler_text, directory / f"{compiler}{turn + 1}"
+                )
+                elsewhere.append((
+                    previous.stat().st_size,
+                    reference_digest(previous.read_bytes().hex()),
+                ))
+            native = _compile_with(
+                previous, front_text, directory / f"{front_name}-native"
             )
-            elsewhere.append(
-                (previous.stat().st_size, reference_digest(previous.read_bytes().hex()))
-            )
-        native = _compile_with(previous, GLYPHARM_GSL2, directory / "glypharm-native")
-        elsewhere_front = native.stat().st_size
-        elsewhere_program = _compile_with(
-            native, source, directory / "glyph-aarch64-native"
-        ).read_bytes() == machine_code(
-            synthesize_source(source).unwrap_or_raise().module, "aarch64"
-        )
-    else:
-        elsewhere_skipped = "this host cannot run that machine's programs"
+            native_front = native.stat().st_size
+            native_program = _compile_with(
+                native, source, directory / f"glyph-{name}-native"
+            ).read_bytes() == machine_code(module, name)
+        else:
+            skipped = "this host cannot run that machine's programs"
+        crossed.append(CrossedMachine(
+            name=name,
+            compiler=compiler,
+            front_end_name=front_name,
+            front_end=other.stat().st_size,
+            size=written.stat().st_size,
+            program=written.read_bytes() == machine_code(module, name),
+            stages=tuple(elsewhere),
+            native_front=native_front,
+            native_program=native_program,
+            skipped=skipped,
+        ))
 
     return ToolchainReport(
         workdir=directory,
@@ -15393,13 +15431,7 @@ def close_the_toolchain(
         ),
         front_end=front_end.stat().st_size,
         program=program.stat().st_size,
-        other_front_end=other.stat().st_size,
-        other_size=crossed.stat().st_size,
-        other_program=matches,
-        elsewhere=tuple(elsewhere),
-        elsewhere_front=elsewhere_front,
-        elsewhere_program=elsewhere_program,
-        elsewhere_skipped=elsewhere_skipped,
+        crossed=tuple(crossed),
         glyph=_run(program, "").removesuffix("\n"),
         expected=synthesize_source(source).unwrap_or_raise().rendering,
     )
@@ -21583,26 +21615,30 @@ def _emit_toolchain_report(report: ToolchainReport) -> int:
     line("gslcelf   ->  glyphelf", "it builds the front end", report.front_end)
     line("glyphelf  ->  glyph", "and the front end writes a program",
          report.program)
-    line("gslcelf   ->  glypharm", "and one for the machine this is not",
-         report.other_front_end)
-    line("glypharm  ->  glyph", "which writes one for that machine too",
-         report.other_size)
-    for turn, (span, _) in enumerate(report.elsewhere):
-        line("gslcarm   ->  gslcarm",
-             "and over there it builds itself" if turn == 0 else "and again", span)
-    if report.elsewhere:
-        line("gslcarm   ->  glypharm", "the front end, over there",
-             report.elsewhere_front)
+    for machine in report.crossed:
+        front = machine.front_end_name
+        line(f"gslcelf   ->  {front}", f"and one for {machine.name}",
+             machine.front_end)
+        line(f"{front:<10}->  glyph", "which writes one for that machine too",
+             machine.size)
+        for turn, (span, _) in enumerate(machine.stages):
+            line(f"{machine.compiler:<10}->  {machine.compiler}",
+                 "and over there it builds itself" if turn == 0 else "and again",
+                 span)
+        if machine.stages:
+            line(f"{machine.compiler:<10}->  {front}", "the front end, over there",
+                 machine.native_front)
     print(rule)
     same = "[ok]  " if report.seeded_matches else "[FAIL]"
     print(f"  {same} the seed wrote the compiler the compiler writes")
-    other = "[ok]  " if report.other_program else "[FAIL]"
-    print(f"  {other} and what it wrote for the other machine is layer 18's")
-    if report.elsewhere_skipped:
-        print(f"  [--]   the other machine was not asked: {report.elsewhere_skipped}")
-    else:
-        there = "[ok]  " if report.settled_elsewhere and report.elsewhere_program else "[FAIL]"
-        print(f"  {there} and the whole of it settles over there as well")
+    for machine in report.crossed:
+        wrote = "[ok]  " if machine.program else "[FAIL]"
+        print(f"  {wrote} and what it wrote for {machine.name} is layer 18's")
+        if machine.skipped:
+            print(f"  [--]   {machine.name} was not asked: {machine.skipped}")
+        else:
+            there = "[ok]  " if machine.settled and machine.native_program else "[FAIL]"
+            print(f"  {there} and the whole of it settles on {machine.name} as well")
     fixed = "[ok]  " if report.fixed else "[FAIL]"
     renders = "[ok]  " if report.glyph == report.expected else "[FAIL]"
     print(f"  {fixed} the compiler it built is the compiler that built it")
