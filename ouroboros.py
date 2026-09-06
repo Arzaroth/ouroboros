@@ -7922,6 +7922,17 @@ GSL2_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
 var IMAGE_AT = 990000;
 var TEXT = 990176;
 var LBLOFF = 1330000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var ELF_ALIGN = 4096;
+var ELF_MACHINE = 62;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+var SYS_WRITE = 1;
+var SYS_EXIT_GROUP = 231;
 var FIXAT = 1370000;
 var FIXID = 1410000;
 var FNSTART = 1450000;
@@ -8000,17 +8011,6 @@ X86_ENCODER_GSL2: Final[str] = r'''
 #
 # Whoever includes this declares TEXT, LBLOFF, FIXAT and FIXID first, since
 # where those go depends on what else the program is keeping.
-
-var IMAGE_BASE = 4194304;
-var DATA_BASE = 6291456;
-var PAGE_SIZE = 4096;
-var EM_X86_64 = 62;
-var ELF_HEADER = 64;
-var SEGMENT_HEADER = 56;
-var SEGMENTS = 2;
-
-var SYS_WRITE = 1;
-var SYS_EXIT_GROUP = 231;
 
 var RAX = 0;
 var RCX = 1;
@@ -8428,7 +8428,7 @@ fn native_image(bss) {
   place(0);
   place_wide(0, 7);
   place_wide(2, 2);
-  place_wide(EM_X86_64, 2);
+  place_wide(ELF_MACHINE, 2);
   place_wide(1, 4);
   place_wide(IMAGE_BASE + prologue, 8);
   place_wide(ELF_HEADER, 8);
@@ -8448,7 +8448,7 @@ fn native_image(bss) {
   place_wide(IMAGE_BASE, 8);
   place_wide(loaded, 8);
   place_wide(loaded, 8);
-  place_wide(PAGE_SIZE, 8);
+  place_wide(ELF_ALIGN, 8);
 
   place_wide(1, 4);
   place_wide(6, 4);
@@ -8457,7 +8457,7 @@ fn native_image(bss) {
   place_wide(DATA_BASE, 8);
   place_wide(0, 8);
   place_wide(bss, 8);
-  place_wide(PAGE_SIZE, 8);
+  place_wide(ELF_ALIGN, 8);
 
   if (imglen != prologue) {
     fail("the headers came out the wrong length");
@@ -11372,6 +11372,17 @@ GLYPH_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
 var IMAGE_AT = 1330000;
 var TEXT = 1330176;
 var LBLOFF = 1730000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var ELF_ALIGN = 4096;
+var ELF_MACHINE = 62;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+var SYS_WRITE = 1;
+var SYS_EXIT_GROUP = 231;
 var FIXAT = 1800000;
 var FIXID = 1870000;
 
@@ -11809,9 +11820,812 @@ GSLCELF_GSL2: Final[str] = (
     + ELF_WRITER_GSL2 + GSL2_NATIVE_TAIL_GSL2
 )
 GLYPHC_GSL2: Final[str] = GSL_FRONT_END_GSL2 + GLYPHC_TAIL_GSL2
+
+GLYPH_ARM_ADDRESSES_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# the other machine, and where its octets are kept
+# ----------------------------------------------------------------------
+#
+# Every instruction on this machine is a word, so there is no addressing
+# octet to write and no length to track: a branch site is a word and the
+# fixup is a field inside it.  What that costs instead is that a literal
+# arrives sixteen bits at a time.
+
+var IMAGE_AT = 1330000;
+var TEXT = 1330176;
+var LBLOFF = 1730000;
+var FIXAT = 1800000;
+var FIXID = 1870000;
+var FIXKIND = 1940000;
+
+var TEXT_LIMIT = 399824;
+var LABEL_LIMIT = 70000;
+var FIX_LIMIT = 60000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var ELF_ALIGN = 65536;
+var ELF_MACHINE = 183;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+var SYS_WRITE = 64;
+var SYS_EXIT_GROUP = 94;
+
+# The registers this backend uses by name, and the two the machine keeps.
+var ZERO = 31;
+var STACK = 31;
+var DATA = 12;
+var LINK_SAVE = 13;
+
+var CC_EQ = 0;
+var CC_NE = 1;
+var CC_GE = 10;
+var CC_LT = 11;
+var CC_GT = 12;
+var CC_LE = 13;
+
+var L_EXIT = 0;
+var L_ZERO_DIVIDE = 1;
+var L_PAINT = 2;
+var L_PAINT_DONE = 3;
+var L_RUN = 4;
+var L_RUN_HEAD = 5;
+var L_RUN_COLUMN = 6;
+var L_RUN_DIAGONAL = 7;
+var L_RUN_ANTI = 8;
+var L_RUN_PAINT = 9;
+var L_RUN_DONE = 10;
+var L_SNAP = 11;
+var L_SNAP_HEAD = 12;
+var L_SNAP_DONE = 13;
+var L_APPLY = 14;
+var L_APPLY_ROW = 15;
+var L_APPLY_COLUMN = 16;
+var L_APPLY_COLUMN_STEP = 17;
+var L_APPLY_ROW_STEP = 18;
+var L_APPLY_DONE = 19;
+var L_RENDER = 20;
+var L_RENDER_ROW = 21;
+var L_RENDER_SCAN = 22;
+var L_RENDER_SCAN_STEP = 23;
+var L_RENDER_PRINT = 24;
+var L_RENDER_CELL = 25;
+var L_RENDER_INK = 26;
+var L_RENDER_BLANK = 27;
+var L_RENDER_ADVANCE = 28;
+var L_RENDER_NEWLINE = 29;
+var L_RENDER_FLUSH = 30;
+var L_CODE = 32;
+
+var textlen = 0;
+var nfix = 0;
+var spare = 0;
+
+var lay_canvas = 0;
+var lay_snapshot = 0;
+var lay_frame = 0;
+var lay_output = 0;
+var lay_size = 0;
+'''
+
+ARM_ENCODER_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# an aarch64 encoder, and the octets it makes
+# ----------------------------------------------------------------------
+#
+# The same trick as the other machine's encoder and for the same reason:
+# every field in a word is disjoint from its neighbours, so an addition makes
+# the word an or would have made and a multiplication makes the word a shift
+# would have made.
+
+fn octet_of(v) {
+  var r = v % 256;
+  if (r < 0) {
+    r = r + 256;
+  }
+  return r;
+}
+
+fn shift_octet(v) {
+  if (v < 0) {
+    return (v - 255) / 256;
+  }
+  return v / 256;
+}
+
+fn shift_half(v) {
+  if (v < 0) {
+    return (v - 65535) / 65536;
+  }
+  return v / 65536;
+}
+
+fn half_of(v) {
+  var r = v % 65536;
+  if (r < 0) {
+    r = r + 65536;
+  }
+  return r;
+}
+
+fn emit_wide(v, count) {
+  var i = 0;
+  while (i < count) {
+    if (textlen >= TEXT_LIMIT) {
+      fail("the program is longer than there is room to build it in");
+    }
+    mem[TEXT + textlen] = octet_of(v);
+    textlen = textlen + 1;
+    v = shift_octet(v);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn word(v) {
+  return emit_wide(v, 4);
+}
+
+fn lab(id) {
+  if (id >= LABEL_LIMIT) {
+    fail("more places to jump to than there is room for");
+  }
+  mem[LBLOFF + id] = textlen;
+  return 0;
+}
+
+# A branch is a word with a hole in it, and the hole is one of two widths.
+fn branch_site(w, id, kind) {
+  if (nfix >= FIX_LIMIT) {
+    fail("more jumps than there is room to remember");
+  }
+  if (id >= LABEL_LIMIT) {
+    fail("more places to jump to than there is room for");
+  }
+  mem[FIXAT + nfix] = textlen;
+  mem[FIXID + nfix] = id;
+  mem[FIXKIND + nfix] = kind;
+  nfix = nfix + 1;
+  word(w);
+  return 0;
+}
+
+fn read_word(at) {
+  return mem[TEXT + at]
+       + mem[TEXT + at + 1] * 256
+       + mem[TEXT + at + 2] * 65536
+       + mem[TEXT + at + 3] * 16777216;
+}
+
+fn write_word(at, v) {
+  var k = 0;
+  while (k < 4) {
+    mem[TEXT + at + k] = octet_of(v);
+    v = shift_octet(v);
+    k = k + 1;
+  }
+  return 0;
+}
+
+fn link_text() {
+  var i = 0;
+  while (i < nfix) {
+    var site = mem[FIXAT + i];
+    var offset = (mem[LBLOFF + mem[FIXID + i]] - site) / 4;
+    var w = read_word(site);
+    if (mem[FIXKIND + i] == 26) {
+      if (offset >= 33554432 || offset < 0 - 33554432) {
+        fail("a jump is further than a jump reaches");
+      }
+      var low = offset % 67108864;
+      if (low < 0) {
+        low = low + 67108864;
+      }
+      write_word(site, w + low);
+    } else {
+      if (offset >= 262144 || offset < 0 - 262144) {
+        fail("a jump is further than a jump reaches");
+      }
+      var short = offset % 524288;
+      if (short < 0) {
+        short = short + 524288;
+      }
+      write_word(site, w + short * 32);
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# moving values
+# ----------------------------------------------------------------------
+
+fn move(d, s) {
+  return word(2852127712 + s * 65536 + d);
+}
+
+# Sixteen bits at a time, which is what a word-wide instruction can carry.
+fn imm(d, v) {
+  var halves = 0;
+  var h0 = half_of(v);
+  var h1 = half_of(shift_half(v));
+  var h2 = half_of(shift_half(shift_half(v)));
+  var h3 = half_of(shift_half(shift_half(shift_half(v))));
+  if (v < 0) {
+    var i0 = 65535 - h0;
+    var i1 = 65535 - h1;
+    var i2 = 65535 - h2;
+    var i3 = 65535 - h3;
+    var first = 0;
+    if (i0 != 0) {
+      first = 0;
+    } else {
+      if (i1 != 0) {
+        first = 1;
+      } else {
+        if (i2 != 0) {
+          first = 2;
+        } else {
+          if (i3 != 0) {
+            first = 3;
+          } else {
+            first = 0;
+          }
+        }
+      }
+    }
+    var chosen = i0;
+    if (first == 1) { chosen = i1; }
+    if (first == 2) { chosen = i2; }
+    if (first == 3) { chosen = i3; }
+    word(2457862144 + first * 2097152 + chosen * 32 + d);
+    if (first != 0 && h0 != 65535) { word(4068474880 + h0 * 32 + d); }
+    if (first != 1 && h1 != 65535) { word(4068474880 + 2097152 + h1 * 32 + d); }
+    if (first != 2 && h2 != 65535) { word(4068474880 + 4194304 + h2 * 32 + d); }
+    if (first != 3 && h3 != 65535) { word(4068474880 + 6291456 + h3 * 32 + d); }
+    return 0;
+  }
+  if (h0 == 0 && h1 == 0 && h2 == 0 && h3 == 0) {
+    return word(3531603968 + d);
+  }
+  var written = 0;
+  if (h0 != 0) { word(3531603968 + h0 * 32 + d); written = 1; }
+  if (h1 != 0) {
+    if (written == 1) { word(4068474880 + 2097152 + h1 * 32 + d); }
+    else { word(3531603968 + 2097152 + h1 * 32 + d); written = 1; }
+  }
+  if (h2 != 0) {
+    if (written == 1) { word(4068474880 + 4194304 + h2 * 32 + d); }
+    else { word(3531603968 + 4194304 + h2 * 32 + d); written = 1; }
+  }
+  if (h3 != 0) {
+    if (written == 1) { word(4068474880 + 6291456 + h3 * 32 + d); }
+    else { word(3531603968 + 6291456 + h3 * 32 + d); written = 1; }
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# arithmetic
+# ----------------------------------------------------------------------
+
+fn alu(op, d, l, r) {
+  var base = 2332033024;
+  if (op == 1) { base = 3405774848; }
+  if (op == 2) { base = 3388997632; }
+  if (op == 3) { base = 3942645760; }
+  return word(base + r * 65536 + l * 32 + d);
+}
+
+fn alu_imm(op, d, l, v) {
+  var base = 2432696320;
+  if (op == 1) { base = 3506438144; }
+  if (op == 3) { base = 4043309056; }
+  if (v < 0) {
+    if (op == 0) {
+      return alu_imm(1, d, l, 0 - v);
+    }
+    if (op == 1) {
+      return alu_imm(0, d, l, 0 - v);
+    }
+  }
+  if (v >= 0 && v < 4096) {
+    return word(base + v * 1024 + l * 32 + d);
+  }
+  if (v >= 0 && v < 16777216 && v % 4096 == 0) {
+    return word(base + 4194304 + (v / 4096) * 1024 + l * 32 + d);
+  }
+  imm(24, v);
+  return alu(op, d, l, 24);
+}
+
+fn compare(l, r) {
+  return alu(3, ZERO, l, r);
+}
+
+fn compare_imm(l, v) {
+  return alu_imm(3, ZERO, l, v);
+}
+
+fn mul(d, l, r) {
+  return word(2600500224 + r * 65536 + l * 32 + d);
+}
+
+fn sdiv(d, l, r) {
+  return word(2596277248 + r * 65536 + l * 32 + d);
+}
+
+fn msub(d, l, r, minuend) {
+  return word(2600501248 + r * 65536 + minuend * 1024 + l * 32 + d);
+}
+
+fn negate(d, s) {
+  return alu(1, d, ZERO, s);
+}
+
+fn set_when(cc, d) {
+  var inverted = cc + 1;
+  if (cc % 2 == 1) {
+    inverted = cc - 1;
+  }
+  return word(2594113504 + inverted * 4096 + d);
+}
+
+# ----------------------------------------------------------------------
+# memory
+# ----------------------------------------------------------------------
+
+fn ld(d, base, offset) {
+  return word(4181721088 + (offset / 8) * 1024 + base * 32 + d);
+}
+
+fn st(s, base, offset) {
+  return word(4177526784 + (offset / 8) * 1024 + base * 32 + s);
+}
+
+fn ld_octet(d, base, index) {
+  return word(945842176 + index * 65536 + base * 32 + d);
+}
+
+fn st_octet(s, base, index) {
+  return word(941647872 + index * 65536 + base * 32 + s);
+}
+
+fn push_reg(r) {
+  return word(4160752640 + 496 * 4096 + STACK * 32 + r);
+}
+
+fn pop_reg(r) {
+  return word(4164944896 + 16 * 4096 + STACK * 32 + r);
+}
+
+# ----------------------------------------------------------------------
+# control
+# ----------------------------------------------------------------------
+
+fn go(id) {
+  return branch_site(335544320, id, 26);
+}
+
+fn go_when(cc, id) {
+  return branch_site(1409286144 + cc, id, 19);
+}
+
+fn go_if_zero(r, id) {
+  return branch_site(3019898880 + r, id, 19);
+}
+
+fn call_to(id) {
+  return branch_site(2483027968, id, 26);
+}
+
+fn ret_now() {
+  return word(3596551104);
+}
+
+fn trap_now() {
+  return word(3558866944);
+}
+
+fn ask_the_world() {
+  return word(3556769793);
+}
+
+fn align_up(value, boundary) {
+  return ((value + boundary - 1) / boundary) * boundary;
+}
+'''
+
+GLYPH_ARM_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# layer 18 again, for the other machine
+# ----------------------------------------------------------------------
+#
+# The same shape as the one beside it: the operand stack is the hardware
+# stack, the runtime is reached by a branch with a link, and everything else
+# lives at an address the prologue put in a register.  What differs is that a
+# branch with a link writes the register a return reads, so the two routines
+# a stream calls park it for the one level of nesting there is.
+
+fn next_label() {
+  spare = spare + 1;
+  return spare - 1;
+}
+
+fn layout_build() {
+  var cells = ORDER * ORDER;
+  var slots = frame;
+  if (slots < 1) {
+    slots = 1;
+  }
+  lay_canvas = 0;
+  lay_snapshot = cells;
+  lay_frame = align_up(2 * cells, 8);
+  lay_output = lay_frame + slots * 8;
+  lay_size = lay_output + 2 * cells + ORDER + 16;
+  return 0;
+}
+
+fn native_intrinsic(index) {
+  if (index == 0) { return 0; }
+  if (index == 1) { return APOTHEM; }
+  if (index == 2) { return EXTREMUM; }
+  return ORDER;
+}
+
+fn native_divide(address) {
+  var floored = next_label();
+  pop_reg(1);
+  pop_reg(0);
+  go_if_zero(1, L_ZERO_DIVIDE);
+  sdiv(2, 0, 1);
+  msub(3, 2, 1, 0);
+  compare_imm(3, 0);
+  go_when(CC_EQ, floored);
+  alu(2, 3, 3, 1);
+  compare_imm(3, 0);
+  go_when(CC_GE, floored);
+  alu_imm(1, 2, 2, 1);
+  lab(floored);
+  push_reg(2);
+  return 0;
+}
+
+fn native_close() {
+  call_to(L_SNAP);
+  var i = 0;
+  while (i < ngroup) {
+    imm(0, mem[GRPA + i]);
+    imm(1, mem[GRPB + i]);
+    imm(2, mem[GRPC + i]);
+    imm(3, mem[GRPD + i]);
+    call_to(L_APPLY);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn native_instruction(address) {
+  var kind = mem[CODEK + address];
+  var argument = mem[CODEA + address];
+  if (kind == OP_HALT) {
+    go(L_EXIT);
+  }
+  if (kind == OP_JMP) {
+    go(L_CODE + argument);
+  }
+  if (kind == OP_JF) {
+    pop_reg(0);
+    compare_imm(0, 0);
+    go_when(CC_EQ, L_CODE + argument);
+  }
+  if (kind == OP_PUSH) {
+    imm(0, argument);
+    push_reg(0);
+  }
+  if (kind == OP_INTR) {
+    imm(0, native_intrinsic(argument));
+    push_reg(0);
+  }
+  if (kind == OP_LOADL) {
+    alu_imm(0, 9, DATA, lay_frame + argument * 8);
+    ld(0, 9, 0);
+    push_reg(0);
+  }
+  if (kind == OP_STOREL) {
+    pop_reg(0);
+    alu_imm(0, 9, DATA, lay_frame + argument * 8);
+    st(0, 9, 0);
+  }
+  if (kind == OP_ADD) {
+    pop_reg(1);
+    pop_reg(0);
+    alu(0, 0, 0, 1);
+    push_reg(0);
+  }
+  if (kind == OP_SUB) {
+    pop_reg(1);
+    pop_reg(0);
+    alu(1, 0, 0, 1);
+    push_reg(0);
+  }
+  if (kind == OP_MUL) {
+    pop_reg(1);
+    pop_reg(0);
+    mul(0, 0, 1);
+    push_reg(0);
+  }
+  if (kind == OP_DIV) {
+    native_divide(address);
+  }
+  if (kind == OP_NEG) {
+    pop_reg(0);
+    negate(0, 0);
+    push_reg(0);
+  }
+  if (kind == OP_CMPLE) {
+    pop_reg(1);
+    pop_reg(0);
+    compare(0, 1);
+    set_when(CC_LE, 0);
+    push_reg(0);
+  }
+  if (kind == OP_EMIT) {
+    pop_reg(3);
+    pop_reg(2);
+    pop_reg(1);
+    imm(0, argument);
+    call_to(L_RUN);
+  }
+  if (kind == OP_CLOSE) {
+    native_close();
+  }
+  return 0;
+}
+
+fn native_paint() {
+  lab(L_PAINT);
+  compare_imm(0, 0);
+  go_when(CC_LT, L_PAINT_DONE);
+  compare_imm(0, ORDER);
+  go_when(CC_GE, L_PAINT_DONE);
+  compare_imm(1, 0);
+  go_when(CC_LT, L_PAINT_DONE);
+  compare_imm(1, ORDER);
+  go_when(CC_GE, L_PAINT_DONE);
+  imm(21, ORDER);
+  mul(21, 0, 21);
+  alu(0, 21, 21, 1);
+  alu_imm(0, 22, DATA, lay_canvas);
+  imm(23, 1);
+  st_octet(23, 22, 21);
+  lab(L_PAINT_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_run() {
+  lab(L_RUN);
+  move(LINK_SAVE, 30);
+  move(5, 0);
+  move(6, 1);
+  move(7, 2);
+  move(9, 3);
+  lab(L_RUN_HEAD);
+  compare(7, 9);
+  go_when(CC_GT, L_RUN_DONE);
+  compare_imm(5, 1);
+  go_when(CC_EQ, L_RUN_COLUMN);
+  compare_imm(5, 2);
+  go_when(CC_EQ, L_RUN_DIAGONAL);
+  compare_imm(5, 3);
+  go_when(CC_EQ, L_RUN_ANTI);
+  move(0, 6);
+  move(1, 7);
+  go(L_RUN_PAINT);
+  lab(L_RUN_COLUMN);
+  move(0, 7);
+  move(1, 6);
+  go(L_RUN_PAINT);
+  lab(L_RUN_DIAGONAL);
+  move(0, 7);
+  alu(0, 1, 7, 6);
+  go(L_RUN_PAINT);
+  lab(L_RUN_ANTI);
+  move(0, 7);
+  alu(1, 1, 6, 7);
+  lab(L_RUN_PAINT);
+  call_to(L_PAINT);
+  alu_imm(0, 7, 7, 1);
+  go(L_RUN_HEAD);
+  lab(L_RUN_DONE);
+  move(30, LINK_SAVE);
+  ret_now();
+  return 0;
+}
+
+fn native_snapshot() {
+  lab(L_SNAP);
+  alu_imm(0, 9, DATA, lay_canvas);
+  alu_imm(0, 10, DATA, lay_snapshot);
+  imm(5, 0);
+  lab(L_SNAP_HEAD);
+  compare_imm(5, ORDER * ORDER);
+  go_when(CC_GE, L_SNAP_DONE);
+  ld_octet(7, 9, 5);
+  st_octet(7, 10, 5);
+  alu_imm(0, 5, 5, 1);
+  go(L_SNAP_HEAD);
+  lab(L_SNAP_DONE);
+  ret_now();
+  return 0;
+}
+
+fn native_apply() {
+  lab(L_APPLY);
+  move(LINK_SAVE, 30);
+  move(5, 0);
+  move(6, 1);
+  move(7, 2);
+  move(9, 3);
+  alu_imm(0, 10, DATA, lay_snapshot);
+  imm(11, 0);
+  lab(L_APPLY_ROW);
+  compare_imm(11, ORDER);
+  go_when(CC_GE, L_APPLY_DONE);
+  imm(15, 0);
+  lab(L_APPLY_COLUMN);
+  compare_imm(15, ORDER);
+  go_when(CC_GE, L_APPLY_ROW_STEP);
+  imm(16, ORDER);
+  mul(16, 11, 16);
+  alu(0, 16, 16, 15);
+  ld_octet(17, 10, 16);
+  compare_imm(17, 0);
+  go_when(CC_EQ, L_APPLY_COLUMN_STEP);
+  alu_imm(1, 19, 11, APOTHEM);
+  alu_imm(1, 20, 15, APOTHEM);
+  mul(16, 5, 19);
+  mul(17, 6, 20);
+  alu(0, 16, 16, 17);
+  alu_imm(0, 0, 16, APOTHEM);
+  mul(16, 7, 19);
+  mul(17, 9, 20);
+  alu(0, 16, 16, 17);
+  alu_imm(0, 1, 16, APOTHEM);
+  call_to(L_PAINT);
+  lab(L_APPLY_COLUMN_STEP);
+  alu_imm(0, 15, 15, 1);
+  go(L_APPLY_COLUMN);
+  lab(L_APPLY_ROW_STEP);
+  alu_imm(0, 11, 11, 1);
+  go(L_APPLY_ROW);
+  lab(L_APPLY_DONE);
+  move(30, LINK_SAVE);
+  ret_now();
+  return 0;
+}
+
+fn native_render() {
+  lab(L_RENDER);
+  alu_imm(0, 9, DATA, lay_canvas);
+  alu_imm(0, 10, DATA, lay_output);
+  imm(11, 0);
+  imm(14, 0);
+  lab(L_RENDER_ROW);
+  compare_imm(11, ORDER);
+  go_when(CC_GE, L_RENDER_FLUSH);
+  imm(16, 0 - 1);
+  imm(15, 0);
+  lab(L_RENDER_SCAN);
+  compare_imm(15, ORDER);
+  go_when(CC_GE, L_RENDER_PRINT);
+  imm(17, ORDER);
+  mul(17, 11, 17);
+  alu(0, 17, 17, 15);
+  ld_octet(17, 9, 17);
+  compare_imm(17, 0);
+  go_when(CC_EQ, L_RENDER_SCAN_STEP);
+  move(16, 15);
+  lab(L_RENDER_SCAN_STEP);
+  alu_imm(0, 15, 15, 1);
+  go(L_RENDER_SCAN);
+  lab(L_RENDER_PRINT);
+  imm(15, 0);
+  lab(L_RENDER_CELL);
+  compare(15, 16);
+  go_when(CC_GT, L_RENDER_NEWLINE);
+  compare_imm(15, 0);
+  go_when(CC_LE, L_RENDER_INK);
+  imm(17, 32);
+  st_octet(17, 10, 14);
+  alu_imm(0, 14, 14, 1);
+  lab(L_RENDER_INK);
+  imm(17, ORDER);
+  mul(17, 11, 17);
+  alu(0, 17, 17, 15);
+  ld_octet(17, 9, 17);
+  compare_imm(17, 0);
+  go_when(CC_EQ, L_RENDER_BLANK);
+  imm(17, 42);
+  go(L_RENDER_ADVANCE);
+  lab(L_RENDER_BLANK);
+  imm(17, 32);
+  lab(L_RENDER_ADVANCE);
+  st_octet(17, 10, 14);
+  alu_imm(0, 14, 14, 1);
+  alu_imm(0, 15, 15, 1);
+  go(L_RENDER_CELL);
+  lab(L_RENDER_NEWLINE);
+  imm(17, 10);
+  st_octet(17, 10, 14);
+  alu_imm(0, 14, 14, 1);
+  alu_imm(0, 11, 11, 1);
+  go(L_RENDER_ROW);
+  lab(L_RENDER_FLUSH);
+  imm(8, SYS_WRITE);
+  imm(0, 1);
+  alu_imm(0, 1, DATA, lay_output);
+  move(2, 14);
+  ask_the_world();
+  ret_now();
+  return 0;
+}
+
+fn native_encode() {
+  layout_build();
+  spare = L_CODE + ncode;
+  imm(DATA, DATA_BASE);
+  var i = 0;
+  while (i < ncode) {
+    lab(L_CODE + i);
+    native_instruction(i);
+    i = i + 1;
+  }
+  lab(L_EXIT);
+  call_to(L_RENDER);
+  imm(8, SYS_EXIT_GROUP);
+  imm(0, 0);
+  ask_the_world();
+  lab(L_ZERO_DIVIDE);
+  trap_now();
+  native_paint();
+  native_run();
+  native_snapshot();
+  native_apply();
+  native_render();
+  link_text();
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the driver
+# ----------------------------------------------------------------------
+
+fn main() {
+  read_stdin();
+  preprocess();
+  tokenize();
+  parse_program();
+  optimise();
+  assemble();
+  group_build();
+  native_encode();
+  native_image(lay_size);
+  return 0;
+}
+'''
+
 GLYPHELF_GSL2: Final[str] = (
     GSL_FRONT_END_GSL2 + GLYPH_NATIVE_ADDRESSES_GSL2 + X86_ENCODER_GSL2
     + ELF_WRITER_GSL2 + GLYPH_NATIVE_TAIL_GSL2
+)
+GLYPHARM_GSL2: Final[str] = (
+    GSL_FRONT_END_GSL2 + GLYPH_ARM_ADDRESSES_GSL2 + ARM_ENCODER_GSL2
+    + ELF_WRITER_GSL2 + GLYPH_ARM_TAIL_GSL2
 )
 
 
@@ -13846,6 +14660,9 @@ class ToolchainReport:
     stages: tuple[tuple[int, str], ...]
     front_end: int
     program: int
+    other_front_end: int
+    other_size: int
+    other_program: bool
     glyph: str
     expected: str
 
@@ -13866,7 +14683,12 @@ class ToolchainReport:
 
     @property
     def clean(self) -> bool:
-        return self.fixed and self.seeded_matches and self.glyph == self.expected
+        return (
+            self.fixed
+            and self.seeded_matches
+            and self.other_program
+            and self.glyph == self.expected
+        )
 
 
 def _compile_with(compiler: Path, source: str, destination: Path) -> Path:
@@ -13914,6 +14736,14 @@ def close_the_toolchain(
     if source is None:
         source = typing.cast(type, Motif.lookup(motif))().source(order)
     program = _compile_with(front_end, source, directory / "glyph")
+
+    # And once more for the machine this one is not.  The compiler does not
+    # care which; what changes is the tail it is handed.
+    other = _compile_with(stages[-1], GLYPHARM_GSL2, directory / "glypharm")
+    elsewhere = _compile_with(other, source, directory / "glyph-aarch64")
+    matches = elsewhere.read_bytes() == machine_code(
+        synthesize_source(source).unwrap_or_raise().module, "aarch64"
+    )
     return ToolchainReport(
         workdir=directory,
         seeded=(
@@ -13926,6 +14756,9 @@ def close_the_toolchain(
         ),
         front_end=front_end.stat().st_size,
         program=program.stat().st_size,
+        other_front_end=other.stat().st_size,
+        other_size=elsewhere.stat().st_size,
+        other_program=matches,
         glyph=_run(program, "").removesuffix("\n"),
         expected=synthesize_source(source).unwrap_or_raise().rendering,
     )
@@ -19589,9 +20422,15 @@ def _emit_toolchain_report(report: ToolchainReport) -> int:
     line("gslcelf   ->  glyphelf", "it builds the front end", report.front_end)
     line("glyphelf  ->  glyph", "and the front end writes a program",
          report.program)
+    line("gslcelf   ->  glypharm", "and one for the machine this is not",
+         report.other_front_end)
+    line("glypharm  ->  glyph", "which writes one for that machine too",
+         report.other_size)
     print(rule)
     same = "[ok]  " if report.seeded_matches else "[FAIL]"
     print(f"  {same} the seed wrote the compiler the compiler writes")
+    other = "[ok]  " if report.other_program else "[FAIL]"
+    print(f"  {other} and what it wrote for the other machine is layer 18's")
     fixed = "[ok]  " if report.fixed else "[FAIL]"
     renders = "[ok]  " if report.glyph == report.expected else "[FAIL]"
     print(f"  {fixed} the compiler it built is the compiler that built it")
@@ -19713,7 +20552,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot.add_argument("--bootstrap", action="store_true")
     boot.add_argument("--workdir", metavar="DIR")
     boot.add_argument("--emit-gsl2",
-                      choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf"))
+                      choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf",
+                               "glypharm"))
     boot.add_argument("--close-the-toolchain", action="store_true",
                       help="build the compiler with itself, and nothing else")
     boot.add_argument("--boot-the-compiler", action="store_true",
@@ -19844,6 +20684,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "glyph": GLYPH_GSL2,
                 "glyphc": GLYPHC_GSL2,
                 "glyphelf": GLYPHELF_GSL2,
+                "glypharm": GLYPHARM_GSL2,
             }[namespace.emit_gsl2]
         )
         return 0
