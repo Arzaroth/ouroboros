@@ -6176,11 +6176,12 @@ class DifferentialFuzzer:
             ("read-back", lambda: self._through_read_back(
                 self._object_for(source, order)))
         )
-        variants.append(
-            ("machine-read-back", lambda: execute_machine_code(
-                machine_code(self._object_for(source, order), "x86-64")
-            ).removesuffix("\n"))
-        )
+        for architecture in MACHINE_READERS:
+            variants.append(
+                (f"read({architecture})", lambda a=architecture: read_back_machine_code(
+                    machine_code(self._object_for(source, order), a), a
+                ).removesuffix("\n"))
+            )
         if self._metal and boot_runnable():
             variants.append(
                 ("boot", lambda: self._through_metal(
@@ -6256,7 +6257,7 @@ class DifferentialFuzzer:
         else:
             skipped.append("wasm tier (no WebAssembly host is installed)")
         tiers.append("read-back")
-        tiers.append("machine-read-back")
+        tiers.extend(f"read({name})" for name in MACHINE_READERS)
         if self._metal:
             if boot_runnable():
                 tiers.extend(("boot", "kernel"))
@@ -20239,6 +20240,378 @@ def narrate_machine_code(image: bytes) -> str:
     return "\n".join(lines) + "\n"
 
 
+class WordReader:
+    """What the two machines whose instructions are all one width share.
+
+    Neither has a prefix, an addressing octet or a length to work out: every
+    instruction is a word, so reading one is masking it and looking at what
+    is left.  That makes these two readers shorter than the first, and the
+    part they have in common is the part that is not about instructions.
+    """
+
+    ZERO_REGISTER: ClassVar[int] = 32
+
+    def __init__(self, image: bytes) -> None:
+        self._memory = MachineMemory(image)
+        self._registers = [0] * 33
+        self._at = self._memory.entry
+        self._written = bytearray()
+        self._stopped = False
+
+    def _get(self, register: int) -> int:
+        return self._registers[register]
+
+    def _put(self, register: int, value: int) -> None:
+        if register != self.ZERO_REGISTER:
+            self._registers[register] = value & MASK64
+
+    @staticmethod
+    def _signed(value: int, width: int = 64) -> int:
+        top = 1 << (width - 1)
+        return value - (top << 1) if value & top else value
+
+    def _wrote(self) -> None:
+        """write(1, buffer, length) and exit are all either of them asks for."""
+        raise NotImplementedError
+
+    def run(self, patience: int = 200_000_000) -> str:
+        steps = 0
+        while not self._stopped:
+            steps += 1
+            if steps > patience:
+                raise MachineTrap("the program did not finish")
+            word = self._memory.read(self._at, 4)
+            self._at += 4
+            self._step(word)
+        return self._written.decode()
+
+    def _step(self, word: int) -> None:
+        raise NotImplementedError
+
+
+class Aarch64Reader(WordReader):
+    """Reads and runs the text of an aarch64 executable layer 18 wrote.
+
+    Register thirty-one is two things depending on where it appears, which is
+    the one thing about this machine that is not obvious: it reads as nothing
+    where a value is wanted and means the stack where an address is.
+    """
+
+    STACK_REGISTER: ClassVar[int] = 33
+
+    def __init__(self, image: bytes) -> None:
+        super().__init__(image)
+        self._registers.append(STACK_CEILING - 4096)
+        self._negative = False
+        self._zero = False
+        self._carry = False
+        self._overflow = False
+
+    def _value(self, field: int) -> int:
+        return self.ZERO_REGISTER if field == 31 else field
+
+    def _address(self, field: int) -> int:
+        return self.STACK_REGISTER if field == 31 else field
+
+    def _holds(self, condition: int) -> bool:
+        return {
+            0: self._zero,
+            1: not self._zero,
+            10: self._negative == self._overflow,
+            11: self._negative != self._overflow,
+            12: not self._zero and self._negative == self._overflow,
+            13: self._zero or self._negative != self._overflow,
+        }[condition]
+
+    def _settle(self, left: int, right: int, answer: int) -> int:
+        kept = answer & MASK64
+        self._zero = kept == 0
+        self._negative = bool(kept >> 63)
+        self._carry = answer >= (1 << 64) or answer >= 0 and left >= right
+        signed = self._signed(left) - self._signed(right)
+        self._overflow = not -(1 << 63) <= signed < (1 << 63)
+        return kept
+
+    def _step(self, word: int) -> None:
+        rd, rn, rm = word & 0x1F, (word >> 5) & 0x1F, (word >> 16) & 0x1F
+        if word == 0xD65F03C0:
+            self._at = self._get(30)
+            return
+        if word == 0xD4000001:
+            return self._asked()
+        if word == 0xD4200000:
+            raise MachineTrap("the program asked to stop here")
+        if word & 0xFFE0FFE0 == 0xAA0003E0:
+            self._put(self._value(rd), self._get(self._value(rm)))
+            return
+        if word & 0xFF800000 in (0xD2800000, 0xF2800000, 0x92800000):
+            shift = ((word >> 21) & 3) * 16
+            half = (word >> 5) & 0xFFFF
+            if word & 0xFF800000 == 0xD2800000:
+                self._put(self._value(rd), half << shift)
+            elif word & 0xFF800000 == 0x92800000:
+                self._put(self._value(rd), ~(half << shift) & MASK64)
+            else:
+                kept = self._get(self._value(rd)) & ~(0xFFFF << shift)
+                self._put(self._value(rd), kept | (half << shift))
+            return
+        if word & 0xFFE0FC00 in (0x8B000000, 0xCB000000, 0xCA000000, 0xEB000000):
+            left, right = self._get(self._value(rn)), self._get(self._value(rm))
+            head = word & 0xFFE0FC00
+            if head == 0xCA000000:
+                self._put(self._value(rd), left ^ right)
+            elif head == 0x8B000000:
+                self._put(self._value(rd), left + right)
+            elif head == 0xCB000000:
+                self._put(self._value(rd), left - right)
+            else:
+                self._put(self._value(rd), self._settle(left, right, left - right))
+            return
+        if word & 0xFF800000 in (0x91000000, 0xD1000000, 0xF1000000):
+            amount = (word >> 10) & 0xFFF
+            if word & (1 << 22):
+                amount <<= 12
+            head = word & 0xFF800000
+            left = self._get(self._address(rn) if head == 0x91000000 else self._value(rn))
+            if head == 0x91000000:
+                self._put(self._address(rd), left + amount)
+            elif head == 0xD1000000:
+                self._put(self._address(rd), left - amount)
+            else:
+                self._put(self._value(rd), self._settle(left, amount, left - amount))
+            return
+        if word & 0xFFE0FC00 == 0x9B007C00:
+            self._put(
+                self._value(rd),
+                self._signed(self._get(self._value(rn)))
+                * self._signed(self._get(self._value(rm))),
+            )
+            return
+        if word & 0xFFE0FC00 == 0x9AC00C00:
+            left = self._signed(self._get(self._value(rn)))
+            right = self._signed(self._get(self._value(rm)))
+            if right == 0:
+                self._put(self._value(rd), 0)
+                return
+            quotient = abs(left) // abs(right)
+            self._put(self._value(rd), -quotient if (left < 0) != (right < 0) else quotient)
+            return
+        if word & 0xFFE08000 == 0x9B008000:
+            minuend = self._get(self._value((word >> 10) & 0x1F))
+            self._put(
+                self._value(rd),
+                minuend
+                - self._signed(self._get(self._value(rn)))
+                * self._signed(self._get(self._value(rm))),
+            )
+            return
+        if word & 0xFFFF0FE0 == 0x9A9F07E0:
+            self._put(self._value(rd), 1 if self._holds(((word >> 12) & 0xF) ^ 1) else 0)
+            return
+        if word & 0xFFC00000 in (0xF9400000, 0xF9000000):
+            where = self._get(self._address(rn)) + ((word >> 10) & 0xFFF) * 8
+            if word & 0xFFC00000 == 0xF9400000:
+                self._put(self._value(rd), self._memory.read(where, 8))
+            else:
+                self._memory.write(where, 8, self._get(self._value(rd)))
+            return
+        if word & 0xFFE0FC00 in (0x38606800, 0x38206800):
+            where = self._get(self._address(rn)) + self._get(self._value(rm))
+            if word & 0xFFE0FC00 == 0x38606800:
+                self._put(self._value(rd), self._memory.read(where, 1))
+            else:
+                self._memory.write(where, 1, self._get(self._value(rd)) & 0xFF)
+            return
+        if word & 0xFFE00C00 in (0xF8000C00, 0xF8400400):
+            step = self._signed((word >> 12) & 0x1FF, 9)
+            base = self._get(self._address(rn))
+            if word & 0xFFE00C00 == 0xF8000C00:
+                self._registers[self._address(rn)] = (base + step) & MASK64
+                self._memory.write(base + step, 8, self._get(self._value(rd)))
+            else:
+                self._put(self._value(rd), self._memory.read(base, 8))
+                self._registers[self._address(rn)] = (base + step) & MASK64
+            return
+        if word & 0xFC000000 in (0x14000000, 0x94000000):
+            step = self._signed(word & 0x3FFFFFF, 26) * 4
+            if word & 0xFC000000 == 0x94000000:
+                self._put(30, self._at)
+            self._at = (self._at - 4 + step) & MASK64
+            return
+        if word & 0xFF000010 == 0x54000000:
+            if self._holds(word & 0xF):
+                self._at = (self._at - 4 + self._signed((word >> 5) & 0x7FFFF, 19) * 4) & MASK64
+            return
+        if word & 0xFF000000 == 0xB4000000:
+            if self._get(self._value(rd)) == 0:
+                self._at = (self._at - 4 + self._signed((word >> 5) & 0x7FFFF, 19) * 4) & MASK64
+            return
+        raise MachineDecodeError(f"the word {word:#010x} is not one this file writes")
+
+    def _asked(self) -> None:
+        number = self._get(8)
+        if number == ARM_SYS_WRITE:
+            length = self._get(2)
+            self._written.extend(self._memory.octets(self._get(1), length))
+            self._put(0, length)
+            return
+        if number == ARM_SYS_EXIT_GROUP:
+            self._stopped = True
+            return
+        raise MachineTrap(f"this world was not asked for {number} before")
+
+
+class Riscv64Reader(WordReader):
+    """Reads and runs the text of a riscv64 executable layer 18 wrote.
+
+    Register zero reads as nothing and keeps nothing, which is the same rule
+    the other machine has for its thirty-first and is the only thing the two
+    of them share.  What differs is that the offset of a jump is scattered
+    through the word rather than lying in one field, so putting it back
+    together is most of what a reader here does.
+    """
+
+    ZERO_REGISTER: ClassVar[int] = 0
+
+    def __init__(self, image: bytes) -> None:
+        super().__init__(image)
+        self._registers = [0] * 32
+        self._registers[RISCV_STACK] = STACK_CEILING - 4096
+
+    @staticmethod
+    def _branch_offset(word: int) -> int:
+        return WordReader._signed(
+            ((word >> 31) << 12)
+            | (((word >> 25) & 0x3F) << 5)
+            | (((word >> 8) & 0xF) << 1)
+            | (((word >> 7) & 1) << 11),
+            13,
+        )
+
+    @staticmethod
+    def _jump_offset(word: int) -> int:
+        return WordReader._signed(
+            ((word >> 31) << 20)
+            | (((word >> 21) & 0x3FF) << 1)
+            | (((word >> 20) & 1) << 11)
+            | (((word >> 12) & 0xFF) << 12),
+            21,
+        )
+
+    def _step(self, word: int) -> None:
+        opcode = word & 0x7F
+        rd, rs1, rs2 = (word >> 7) & 0x1F, (word >> 15) & 0x1F, (word >> 20) & 0x1F
+        funct3 = (word >> 12) & 7
+        if word == 0x00000073:
+            return self._asked()
+        if word == 0x00100073:
+            raise MachineTrap("the program asked to stop here")
+        if opcode == 0b0110111:
+            self._put(rd, self._signed(word & 0xFFFFF000, 32))
+            return
+        if opcode == 0b0010011:
+            value = self._signed(word >> 20, 12)
+            left = self._get(rs1)
+            if funct3 == 0b000:
+                self._put(rd, left + value)
+            elif funct3 == 0b100:
+                self._put(rd, left ^ (value & MASK64))
+            else:
+                raise MachineDecodeError(f"an immediate form with funct3 {funct3}")
+            return
+        if opcode == 0b0110011:
+            left, right = self._signed(self._get(rs1)), self._signed(self._get(rs2))
+            funct7 = word >> 25
+            if (funct7, funct3) == (0b0000000, 0b000):
+                self._put(rd, left + right)
+            elif (funct7, funct3) == (0b0100000, 0b000):
+                self._put(rd, left - right)
+            elif (funct7, funct3) == (0b0000000, 0b100):
+                self._put(rd, self._get(rs1) ^ self._get(rs2))
+            elif (funct7, funct3) == (0b0000000, 0b010):
+                self._put(rd, 1 if left < right else 0)
+            elif (funct7, funct3) == (0b0000001, 0b000):
+                self._put(rd, left * right)
+            elif (funct7, funct3) == (0b0000001, 0b100):
+                if right == 0:
+                    self._put(rd, MASK64)
+                else:
+                    quotient = abs(left) // abs(right)
+                    self._put(rd, -quotient if (left < 0) != (right < 0) else quotient)
+            elif (funct7, funct3) == (0b0000001, 0b110):
+                if right == 0:
+                    self._put(rd, left)
+                else:
+                    quotient = abs(left) // abs(right)
+                    if (left < 0) != (right < 0):
+                        quotient = -quotient
+                    self._put(rd, left - quotient * right)
+            else:
+                raise MachineDecodeError(f"an operation with {funct7:07b}/{funct3:03b}")
+            return
+        if opcode == 0b0000011:
+            where = self._get(rs1) + self._signed(word >> 20, 12)
+            if funct3 == 0b011:
+                self._put(rd, self._memory.read(where, 8))
+            elif funct3 == 0b100:
+                self._put(rd, self._memory.read(where, 1))
+            else:
+                raise MachineDecodeError(f"a load with funct3 {funct3}")
+            return
+        if opcode == 0b0100011:
+            value = self._signed(((word >> 25) << 5) | ((word >> 7) & 0x1F), 12)
+            where = self._get(rs1) + value
+            self._memory.write(where, 8 if funct3 == 0b011 else 1, self._get(rs2))
+            return
+        if opcode == 0b1100011:
+            left, right = self._signed(self._get(rs1)), self._signed(self._get(rs2))
+            taken = {
+                0b000: left == right, 0b001: left != right,
+                0b100: left < right, 0b101: left >= right,
+            }[funct3]
+            if taken:
+                self._at = (self._at - 4 + self._branch_offset(word)) & MASK64
+            return
+        if opcode == 0b1101111:
+            self._put(rd, self._at)
+            self._at = (self._at - 4 + self._jump_offset(word)) & MASK64
+            return
+        if opcode == 0b1100111:
+            where = (self._get(rs1) + self._signed(word >> 20, 12)) & MASK64
+            self._put(rd, self._at)
+            self._at = where
+            return
+        raise MachineDecodeError(f"the word {word:#010x} is not one this file writes")
+
+    def _asked(self) -> None:
+        number = self._get(RISCV_SYSCALL)
+        if number == RISCV_SYS_WRITE:
+            length = self._get(12)
+            self._written.extend(self._memory.octets(self._get(11), length))
+            self._put(10, length)
+            return
+        if number == RISCV_SYS_EXIT_GROUP:
+            self._stopped = True
+            return
+        raise MachineTrap(f"this world was not asked for {number} before")
+
+
+MACHINE_READERS: Final[Mapping[str, type]] = {
+    "x86-64": MachineReader,
+    "aarch64": Aarch64Reader,
+    "riscv64": Riscv64Reader,
+}
+
+
+def read_back_machine_code(image: bytes, architecture: str) -> str:
+    """Runs an executable this file wrote, on no processor of that kind."""
+    try:
+        reader = MACHINE_READERS[architecture]
+    except KeyError as exc:
+        raise MachineDecodeError(f"nothing here reads {architecture}") from exc
+    return reader(image).run()
+
+
 def execute_machine_code(image: bytes) -> str:
     """Runs an executable this file wrote, on no processor of that kind."""
     return MachineReader(image).run()
@@ -20334,15 +20707,19 @@ def _selftest(orders: Sequence[int]) -> int:
             ))
         except (GlyphPlatformError, OSError) as exc:
             print(f"  n={order:<3} arm boot tier skipped: {exc}", file=sys.stderr)
-        try:
-            tiers.append((
-                "machine-read-back",
-                execute_machine_code(
-                    machine_code(artifacts.module, "x86-64")
-                ).removesuffix("\n"),
-            ))
-        except GlyphPlatformError as exc:
-            print(f"  n={order:<3} machine read-back skipped: {exc}", file=sys.stderr)
+        for architecture in MACHINE_READERS:
+            try:
+                tiers.append((
+                    f"read({architecture})",
+                    read_back_machine_code(
+                        machine_code(artifacts.module, architecture), architecture
+                    ).removesuffix("\n"),
+                ))
+            except GlyphPlatformError as exc:
+                print(
+                    f"  n={order:<3} read({architecture}) skipped: {exc}",
+                    file=sys.stderr,
+                )
         try:
             if not boot_runnable():
                 raise OSError("no system emulator is installed")
