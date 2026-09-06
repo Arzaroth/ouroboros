@@ -17126,15 +17126,13 @@ class Riscv64CodeBackend:
         """The whole text section: entry point, instruction stream, runtime."""
         text = Riscv64Assembler()
         text.label("_start")
-        text.immediate(RISCV_DATA, DATA_BASE)
+        self._prologue(text)
         for address, instruction in enumerate(self._module.instructions):
             text.label(f"A{address}")
             self._instruction(text, instruction, address)
         text.label("exit")
         text.call("render")
-        text.immediate(RISCV_SYSCALL, RISCV_SYS_EXIT_GROUP)
-        text.immediate(A0, 0)
-        text.syscall()
+        self._epilogue(text)
         text.label("divide.by.zero")
         text.trap()
         self._paint(text)
@@ -17142,7 +17140,31 @@ class Riscv64CodeBackend:
         self._snapshot(text)
         self._apply(text)
         self._render(text)
+        self._appendix(text)
         return text.link()
+
+    # -- what a kernel underneath is asked for, on this machine too --------
+
+    DATA_ORIGIN: ClassVar[int] = DATA_BASE
+
+    def _prologue(self, text: Riscv64Assembler) -> None:
+        """Where .bss is; the loader has already zeroed it."""
+        text.immediate(RISCV_DATA, self.DATA_ORIGIN)
+
+    def _epilogue(self, text: Riscv64Assembler) -> None:
+        text.immediate(RISCV_SYSCALL, RISCV_SYS_EXIT_GROUP)
+        text.immediate(A0, 0)
+        text.syscall()
+
+    def _flush(self, text: Riscv64Assembler) -> None:
+        text.immediate(RISCV_SYSCALL, RISCV_SYS_WRITE)
+        text.immediate(A0, 1)
+        self._address(text, A1, RISCV_ZERO, self._layout.output)
+        text.move(A2, S7)
+        text.syscall()
+
+    def _appendix(self, text: Riscv64Assembler) -> None:
+        """Routines a platform needs and this one does not."""
 
     @staticmethod
     def _address(text: Riscv64Assembler, destination: int, index: int, offset: int) -> None:
@@ -17413,11 +17435,7 @@ class Riscv64CodeBackend:
         text.arithmetic_immediate(S6, S6, 1)
         text.jump("render.row")
         text.label("render.flush")
-        text.immediate(RISCV_SYSCALL, RISCV_SYS_WRITE)
-        text.immediate(A0, 1)
-        self._address(text, A1, RISCV_ZERO, self._layout.output)
-        text.move(A2, S7)
-        text.syscall()
+        self._flush(text)
         text.ret()
 
 
@@ -17458,6 +17476,129 @@ def elf64_image(
         "<IIQQQQQQ", 1, 6, 0, data, data, 0, bss, align
     )
     return header + segments + text
+
+
+# ----------------------------------------------------------------------
+# tier 7 once more, on the third machine
+# ----------------------------------------------------------------------
+#
+# This board wants neither a sector nor an executable.  Its reset vector
+# jumps to the first octet of memory whatever is there, so an executable put
+# in front of the code would be jumped into as though the header were an
+# instruction - which is what happened, and what the letter printed at each
+# stage said.  What it takes is the text and nothing else.
+#
+# Everything else is the shape the other board had: memory somewhere else
+# entirely, a port that is a device at an address, and two things nobody has
+# done because there is nobody to do them.
+
+RISCV_RAM: Final[int] = 0x8000_0000
+RISCV_BOOT_DATA: Final[int] = RISCV_RAM + 0x0080_0000
+RISCV_BOOT_STACK: Final[int] = RISCV_RAM + 0x0070_0000
+RISCV_UART: Final[int] = 0x1000_0000
+
+
+class Riscv64BootBackend(Riscv64CodeBackend):
+    """The same text as layer 18's, for a board with nothing underneath it."""
+
+    DATA_ORIGIN: ClassVar[int] = RISCV_BOOT_DATA
+
+    @staticmethod
+    def _wide(text: Riscv64Assembler, register: int, value: int) -> None:
+        """A number the container will not carry, out of one that it will.
+
+        Layer 9 packs a constant as an i32 and the encoder refuses anything
+        wider on purpose, which is right for a program and wrong for an
+        address in a machine whose memory starts at two gigaoctets.  Half of
+        one of those is a number the encoder is happy with, and doubling is
+        an addition.
+        """
+        if value % 2:
+            raise MachineCodeError(f"{value} is not two of anything")
+        text.immediate(register, value // 2)
+        text.arithmetic("add", register, register, register)
+
+    def _prologue(self, text: Riscv64Assembler) -> None:
+        self._wide(text, RISCV_STACK, RISCV_BOOT_STACK)
+        self._wide(text, RISCV_DATA, self.DATA_ORIGIN)
+        text.immediate(T0, 0)
+        text.immediate(T1, self._layout.size)
+        text.label("wipe.head")
+        text.branch("ge", T0, T1, "wipe.done")
+        text.arithmetic("add", T2, RISCV_DATA, T0)
+        text.store_octet(RISCV_ZERO, T2, 0)
+        text.arithmetic_immediate(T0, T0, 1)
+        text.jump("wipe.head")
+        text.label("wipe.done")
+
+    def _epilogue(self, text: Riscv64Assembler) -> None:
+        text.label("stop")
+        text.jump("stop")
+
+    def _flush(self, text: Riscv64Assembler) -> None:
+        """The buffer to the port, one octet at a time, written where it is used.
+
+        A call here writes the register a return reads, the same as on the
+        other board, and the routine that renders has already spent the one
+        level of nesting this file keeps.
+        """
+        text.immediate(T0, RISCV_UART)
+        text.immediate(T1, 0)
+        text.label("blit.head")
+        text.branch("ge", T1, S7, "blit.done")
+        text.arithmetic("add", T2, RISCV_DATA, T1)
+        text.arithmetic_immediate(T2, T2, self._layout.output)
+        text.load_octet(T3, T2, 0)
+        text.store_octet(T3, T0, 0)
+        text.arithmetic_immediate(T1, T1, 1)
+        text.jump("blit.head")
+        text.label("blit.done")
+
+
+def riscv_boot_image(module: ObjectModule) -> bytes:
+    """Just the text, because that board jumps to the first octet of memory."""
+    return Riscv64BootBackend(module).encode()
+
+
+def riscv_boot_runnable() -> bool:
+    """Whether anything here can be asked to start a board that is one."""
+    return shutil.which("qemu-system-riscv64") is not None
+
+
+def run_riscv_boot(image: bytes, lines: int, patience: float = 20.0) -> str:
+    """Starts a board on ``image`` and answers what left the serial port."""
+    emulator = shutil.which("qemu-system-riscv64")
+    if emulator is None:
+        raise MachineCodeError("no emulator here is that machine")
+    with tempfile.TemporaryDirectory(prefix="ouroboros-riscv-") as scratch:
+        flat = Path(scratch) / "glyph.bin"
+        flat.write_bytes(image)
+        capture = Path(scratch) / "serial"
+        machine = subprocess.Popen(
+            [
+                emulator, "-M", "virt", "-display", "none",
+                "-serial", f"file:{capture}", "-no-reboot", "-net", "none",
+                "-bios", "none", "-kernel", str(flat),
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + patience
+            while time.monotonic() < deadline:
+                if capture.exists():
+                    written = capture.read_text(errors="replace")
+                    if written.count("\n") >= lines:
+                        return written
+                if machine.poll() is not None:
+                    raise MachineCodeError(
+                        f"the machine stopped of its own accord: "
+                        f"{complaint(machine)}"
+                    )
+                time.sleep(0.05)
+            raise MachineCodeError(f"no {lines} lines left the machine in time")
+        finally:
+            machine.kill()
+            machine.wait()
 
 
 MACHINES: Final[Mapping[str, tuple[type, int, int, str]]] = {
@@ -21337,16 +21478,19 @@ def _selftest(orders: Sequence[int]) -> int:
                     tiers.append((f"elf({architecture})", _run(binary, "").removesuffix("\n")))
             except (GlyphPlatformError, OSError) as exc:
                 print(f"  n={order:<3} elf({architecture}) skipped: {exc}", file=sys.stderr)
-        try:
-            if not arm_boot_runnable():
-                raise OSError("no emulator here is that machine")
-            tiers.append((
-                "arm-boot",
-                run_arm_boot(arm_boot_image(artifacts.module), order)
-                .removesuffix("\n"),
-            ))
-        except (GlyphPlatformError, OSError) as exc:
-            print(f"  n={order:<3} arm boot tier skipped: {exc}", file=sys.stderr)
+        for name, runnable, make, start in (
+            ("arm-boot", arm_boot_runnable, arm_boot_image, run_arm_boot),
+            ("riscv-boot", riscv_boot_runnable, riscv_boot_image, run_riscv_boot),
+        ):
+            try:
+                if not runnable():
+                    raise OSError("no emulator here is that machine")
+                tiers.append((
+                    name,
+                    start(make(artifacts.module), order).removesuffix("\n"),
+                ))
+            except (GlyphPlatformError, OSError) as exc:
+                print(f"  n={order:<3} {name} tier skipped: {exc}", file=sys.stderr)
         for architecture in MACHINE_READERS:
             try:
                 tiers.append((
@@ -21912,11 +22056,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
     if namespace.emit_boot:
-        blob = (
-            arm_boot_image(artifacts.module)
-            if namespace.machine == "aarch64"
-            else boot_image(artifacts.module)
-        )
+        blob = {
+            "aarch64": arm_boot_image,
+            "riscv64": riscv_boot_image,
+        }.get(namespace.machine, boot_image)(artifacts.module)
         written = _write_octets(namespace.emit_boot, blob)
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 

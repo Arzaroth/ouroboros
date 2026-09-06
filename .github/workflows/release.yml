@@ -75,6 +75,8 @@ jobs:
           python ouroboros.py --emit-boot "dist/glyph-$safe.img" > /dev/null
           python ouroboros.py --emit-boot "dist/glyph-$safe-aarch64-boot.elf" \
             --machine aarch64 > /dev/null
+          python ouroboros.py --emit-boot "dist/glyph-$safe-riscv64-boot.bin" \
+            --machine riscv64 > /dev/null
           python ouroboros.py --emit-kernel "dist/glyph-$safe-kernel.img" > /dev/null
           python ouroboros.py --emit-efi "dist/glyph-$safe.efi" > /dev/null
           python ouroboros.py --emit-llvm > "dist/glyph-$safe.ll"
