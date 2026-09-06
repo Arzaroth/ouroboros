@@ -16876,6 +16876,47 @@ def _kernel_console(text: X86Assembler) -> None:
     text.ret()
 
 
+def _kernel_advance(text: X86Assembler) -> None:
+    """advance: the next of the things on the disk there are to be read.
+
+    What a program is given is not one run of octets but several, because a
+    program that hands over another program leaves that one wanting to read
+    as well.  The disk says how many and where each begins; this moves to the
+    next, and to nothing at all once they are used up.
+    """
+    text.label("advance")
+    text.push(Register.RAX)
+    text.push(Register.RCX)
+    text.push(Register.RDX)
+    text.push(KERNEL_SCRATCH)
+    text.address_of_label(KERNEL_SCRATCH, "cell.read")
+    text.load(Register.RCX, MemoryOperand(KERNEL_SCRATCH, None, 1, 16))
+    text.increment(Register.RCX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 16), Register.RCX)
+    text.immediate(Register.RDX, INPUT_AT)
+    text.load(Register.RAX, MemoryOperand(Register.RDX, None, 1, 0))
+    text.arithmetic("cmp", Register.RCX, Register.RAX)
+    text.jump_if("l", "advance.more")
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RAX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 8), Register.RAX)
+    text.jump("advance.done")
+    text.label("advance.more")
+    text.multiply_immediate(Register.RAX, Register.RCX, 16)
+    text.arithmetic("add", Register.RAX, Register.RDX)
+    text.load(Register.RCX, MemoryOperand(Register.RAX, None, 1, 8))
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RCX)
+    text.load(Register.RDX, MemoryOperand(Register.RAX, None, 1, 16))
+    text.arithmetic("add", Register.RDX, Register.RCX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 8), Register.RDX)
+    text.label("advance.done")
+    text.pop(KERNEL_SCRATCH)
+    text.pop(Register.RDX)
+    text.pop(Register.RCX)
+    text.pop(Register.RAX)
+    text.ret()
+
+
 def _kernel_settle_in_place(text: X86Assembler, places: ProgramPlaces) -> None:
     """become: the octets at rdi are a program, and the machine is to be it.
 
@@ -16888,13 +16929,35 @@ def _kernel_settle_in_place(text: X86Assembler, places: ProgramPlaces) -> None:
     text.widen_long(Register.RAX, MemoryOperand(Register.RBP, None, 1, 0))
     text.arithmetic_immediate("cmp", Register.RAX, ELF_SIGNATURE)
     text.jump_if("ne", "become.refuse")
-    text.load(Register.R9, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENTS_AT))
-    text.arithmetic("add", Register.R9, Register.RBP)
+
+    # The headers are put somewhere the program cannot reach before anything
+    # is loaded, because a segment that clears sixteen megaoctets of its own
+    # memory clears the octets it is being read out of, and the entry is in
+    # them.  It goes unnoticed until a program hands over another one that is
+    # as large as itself, which is the whole point of doing this twice.
+    text.immediate(Register.R8, HEADER_SCRATCH)
+    text.immediate(Register.RCX, HEADER_SECTORS * SECTOR)
+    text.arithmetic("cmp", Register.RSI, Register.RCX)
+    text.jump_if("ge", "become.enough")
+    text.load(Register.RCX, Register.RSI)
+    text.label("become.enough")
+    text.arithmetic("xor", Register.RDX, Register.RDX)
+    text.label("become.headers")
+    text.arithmetic("cmp", Register.RDX, Register.RCX)
+    text.jump_if("ge", "become.kept")
+    text.load_octet(Register.RAX, MemoryOperand(Register.RBP, Register.RDX, 1, 0))
+    text.store_octet(MemoryOperand(Register.R8, Register.RDX, 1, 0), Register.RAX)
+    text.increment(Register.RDX)
+    text.jump("become.headers")
+    text.label("become.kept")
+
+    text.load(Register.R9, MemoryOperand(Register.R8, None, 1, ELF_SEGMENTS_AT))
+    text.arithmetic("add", Register.R9, Register.R8)
     text.widen_word(
-        Register.R10, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENT_COUNT)
+        Register.R10, MemoryOperand(Register.R8, None, 1, ELF_SEGMENT_COUNT)
     )
     text.widen_word(
-        Register.R11, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENT_SPAN)
+        Register.R11, MemoryOperand(Register.R8, None, 1, ELF_SEGMENT_SPAN)
     )
 
     text.label("become.head")
@@ -16936,7 +16999,9 @@ def _kernel_settle_in_place(text: X86Assembler, places: ProgramPlaces) -> None:
     text.jump("attend.leave")
 
     text.label("become.done")
-    text.load(Register.RCX, MemoryOperand(Register.RBP, None, 1, ELF_ENTRY))
+    text.call("advance")
+    text.immediate(Register.R8, HEADER_SCRATCH)
+    text.load(Register.RCX, MemoryOperand(Register.R8, None, 1, ELF_ENTRY))
     text.immediate(Register.RSP, places.vector)
     text.immediate(Register.R11, PROGRAM_FLAGS)
     text.system_return()
@@ -17166,8 +17231,9 @@ def kernel_text(
     text.immediate(Register.R13, -(-input_span // SECTOR))
     text.call("fetch")
     text.address_of_label(KERNEL_SCRATCH, "cell.read")
-    text.immediate(Register.RAX, input_span)
-    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 8), Register.RAX)
+    text.immediate(Register.RAX, -1)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 16), Register.RAX)
+    text.call("advance")
 
     text.immediate(Register.R8, PROGRAM_LBA)
     text.immediate(Register.RDI, HEADER_SCRATCH)
@@ -17196,6 +17262,7 @@ def kernel_text(
     text.system_return()
 
     _kernel_disk(text)
+    _kernel_advance(text)
     _kernel_settle_in_place(text, places)
     _kernel_loader(text)
     _kernel_handler(text)
@@ -17211,15 +17278,30 @@ def kernel_text(
     for _ in range(16):
         text._emit(0)
     text.label("cell.read")
-    for _ in range(16):
+    for _ in range(24):
         text._emit(0)
     return text.link()
+
+
+def input_area(readings: Sequence[bytes]) -> bytes:
+    """How many there are to read, where each begins, and then all of them.
+
+    Not one run of octets but several, because a program that hands over
+    another program leaves that one wanting to read as well, and the machine
+    has to be told where one ends and the next starts.
+    """
+    table = struct.pack("<Q", len(readings))
+    cursor = 8 + 16 * len(readings)
+    for reading in readings:
+        table += struct.pack("<QQ", cursor, len(reading))
+        cursor += len(reading)
+    return table + b"".join(readings)
 
 
 def kernel_carrying(
     program: bytes,
     arguments: Sequence[str] = ("glyph",),
-    reading: bytes = b"",
+    reading: bytes | Sequence[bytes] = b"",
     wander: int = 0,
 ) -> bytes:
     """A disk holding the sector, the kernel, its stack, the program, its input.
@@ -17229,6 +17311,11 @@ def kernel_carrying(
     what a program is to be given.
     """
     plan = program_plan(program)
+    readings = (
+        [bytes(reading)] if isinstance(reading, (bytes, bytearray))
+        else [bytes(one) for one in reading]
+    )
+    reading = input_area([one for one in readings if one])
     if len(reading) > INPUT_LIMIT:
         raise MachineCodeError(
             f"there are {len(reading)} octets to read and room for {INPUT_LIMIT}"
@@ -17409,6 +17496,47 @@ def boot_what_it_compiles(
         disk = Path(scratch) / "compile.img"
         disk.write_bytes(image)
         said = run_boot(disk, wanted.module.order, patience=60.0).removesuffix("\n")
+    return said, wanted.rendering
+
+
+def boot_the_whole_way(
+    workdir: Path | None = None,
+    opt_level: int = 2,
+    order: int = DEFAULT_LATTICE_ORDER,
+    motif: str = DEFAULT_MOTIF,
+    source: str | None = None,
+) -> tuple[str, str]:
+    """Everything, on the machine: a compiler, what it compiles, and the glyph.
+
+    The disk carries a compiler and two things to read.  The machine loads the
+    compiler; the compiler reads the front end's source and compiles it and
+    hands it back, and stops being the compiler; the front end reads the
+    glyph's source and compiles it and hands it back, and stops being the
+    front end; and what is left prints.
+
+    Two compilers, three programs, one machine, and nothing underneath any of
+    it but the sector and the kernel.
+    """
+    directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-chain-"))
+    directory.mkdir(parents=True, exist_ok=True)
+    seeded = directory / "seeded"
+    seeded.write_bytes(gsl2_machine_code(GSLCELF_GSL2))
+    seeded.chmod(0o755)
+    compiler = _compile_with(seeded, GSLCELF_GSL2, directory / "gslcelf")
+    if source is None:
+        source = typing.cast(type, Motif.lookup(motif))().source(order)
+    (directory / "glyph.gsl").write_text(source)
+    image = kernel_carrying(
+        compiler.read_bytes(),
+        ("gslcelf",),
+        [GLYPHELF_GSL2.encode(), source.encode()],
+    )
+    (directory / "chain.img").write_bytes(image)
+    wanted = synthesize_source(source).unwrap_or_raise()
+    with tempfile.TemporaryDirectory(prefix="ouroboros-chain-") as scratch:
+        disk = Path(scratch) / "chain.img"
+        disk.write_bytes(image)
+        said = run_boot(disk, wanted.module.order, patience=180.0).removesuffix("\n")
     return said, wanted.rendering
 
 
@@ -19410,6 +19538,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="build the compiler with itself, and nothing else")
     boot.add_argument("--boot-the-compiler", action="store_true",
                       help="put the compiler on a disk and let the machine do it")
+    boot.add_argument("--boot-the-whole-way", action="store_true",
+                      help="and let it build the front end on the way there")
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
 
@@ -19563,6 +19693,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit_bootstrap_report(bootstrap(workdir, namespace.opt_level or 2))
         except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
             print(f"bootstrap unavailable: {exc}", file=sys.stderr)
+            return 3
+    if namespace.boot_the_whole_way:
+        try:
+            workdir = Path(namespace.workdir) if namespace.workdir else None
+            said, wanted = boot_the_whole_way(
+                workdir,
+                namespace.opt_level or 2,
+                namespace.order or DEFAULT_LATTICE_ORDER,
+                namespace.motif or DEFAULT_MOTIF,
+                source,
+            )
+            print(said)
+            if said != wanted:
+                print("that is not the figure", file=sys.stderr)
+                return 1
+            return 0
+        except (LlvmToolchainUnavailable, GlyphPlatformError,
+                subprocess.CalledProcessError) as exc:
+            print(f"no machine here would do that: {exc}", file=sys.stderr)
             return 3
     if namespace.boot_the_compiler:
         try:

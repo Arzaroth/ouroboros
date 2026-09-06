@@ -208,6 +208,15 @@ jobs:
           print('and its shell ran a loop with a variable in it')
           "
 
+      - name: and the whole way, a compiler and a front end and a glyph
+        run: |
+          python -c "
+          import ouroboros
+          said, wanted = ouroboros.boot_the_whole_way()
+          assert said == wanted, said
+          print('two compilers, three programs, one machine, no kernel but ours')
+          "
+
       - name: the machine reads a program, compiles it, and becomes what it wrote
         run: |
           python -c "
