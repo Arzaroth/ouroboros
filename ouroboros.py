@@ -13202,11 +13202,17 @@ SECTOR: Final[int] = 512
 PAGE_TABLE_BASE: Final[int] = 0x1000
 PAGE_ENTRIES: Final[int] = 512
 HUGE_PAGE: Final[int] = 0x200000
-PAGE_ENTRY: Final[int] = 0x83
+PAGE_ENTRY: Final[int] = 0x87
+PRIVILEGED_ENTRY: Final[int] = 0x83
 
 # null, then a sixty-four bit code segment, then data.
 BOOT_GDT: Final[bytes] = struct.pack(
-    "<QQQ", 0, 0x00209A0000000000, 0x0000920000000000
+    "<QQQQQ",
+    0,
+    0x00209A0000000000,   # 0x08  the ring the machine wakes up in
+    0x0000920000000000,   # 0x10  and what it reads and writes through
+    0x0000F20000000000,   # 0x18  what a program reads and writes through
+    0x0020FA0000000000,   # 0x20  and the ring a program is allowed
 )
 
 
@@ -13326,8 +13332,8 @@ def boot_sector(payload_sectors: int) -> bytes:
         emit(0xFC)                                        # cld
         emit(0xF3, 0xAB)                                  # rep stosw
         for where, entry in (
-            (PAGE_TABLE_BASE, 0x2003),
-            (PAGE_TABLE_BASE + 0x1000, 0x3003),
+            (PAGE_TABLE_BASE, 0x2007),
+            (PAGE_TABLE_BASE + 0x1000, 0x3007),
         ):
             emit(0x66, 0xC7, 0x06, where & 0xFF, where >> 8, *struct.pack("<I", entry))
         emit(0xBF, *struct.pack("<H", PAGE_TABLE_BASE + 0x2000))
@@ -13338,6 +13344,9 @@ def boot_sector(payload_sectors: int) -> bytes:
         emit(0x66, 0x05, *struct.pack("<I", HUGE_PAGE))     # add eax, 2 megaoctets
         emit(0x83, 0xC7, 0x08)                              # add di, 8
         emit(0xE2, (walk - (len(code) + 2)) & 0xFF)         # loop
+        floor = PAGE_TABLE_BASE + 0x2000
+        emit(0x66, 0xC7, 0x06, floor & 0xFF, floor >> 8,
+             *struct.pack("<I", PRIVILEGED_ENTRY))
         emit(0x66, 0x0F, 0x01, 0x16, pointer_at & 0xFF, pointer_at >> 8)
         emit(0x0F, 0x20, 0xE0)
         emit(0x66, 0x0D, *struct.pack("<I", 1 << 5))      # cr4.pae
@@ -13512,6 +13521,8 @@ LSTAR_MSR: Final[int] = 0xC0000082
 SFMASK_MSR: Final[int] = 0xC0000084
 EFER_SYSCALL: Final[int] = 1
 KERNEL_CODE_SELECTOR: Final[int] = 0x08
+PROGRAM_SELECTOR_BASE: Final[int] = 0x10
+PROGRAM_FLAGS: Final[int] = 0x202
 
 ELF_ENTRY: Final[int] = 24
 ELF_SEGMENTS_AT: Final[int] = 32
@@ -13538,7 +13549,10 @@ def _kernel_prologue(text: X86Assembler) -> None:
 
     text.immediate(Register.RCX, STAR_MSR)
     text.arithmetic("xor", Register.RAX, Register.RAX)
-    text.immediate(Register.RDX, KERNEL_CODE_SELECTOR)
+    text.immediate(
+        Register.RDX,
+        (PROGRAM_SELECTOR_BASE << 16) | KERNEL_CODE_SELECTOR,
+    )
     text.write_msr()
 
     text.immediate(Register.RCX, LSTAR_MSR)
@@ -13618,7 +13632,8 @@ def _kernel_handler(text: X86Assembler) -> None:
     """
     saved = (
         Register.RDI, Register.RSI, Register.RDX, Register.R8, Register.R9,
-        Register.R10, Register.R12, Register.R13, Register.R14, Register.R15,
+        Register.R10, Register.R11, Register.R12, Register.R13, Register.R14,
+        Register.R15,
     )
     text.label("attend")
     text.push(Register.RBX)
@@ -13648,7 +13663,7 @@ def _kernel_handler(text: X86Assembler) -> None:
         text.pop(register)
     text.load(Register.RCX, Register.RBX)
     text.pop(Register.RBX)
-    text.jump_register(Register.RCX)
+    text.system_return()
 
 
 def _kernel_console(text: X86Assembler) -> None:
@@ -13705,24 +13720,73 @@ def kernel_text() -> bytes:
     _kernel_prologue(text)
     text.call("settle")
     text.immediate(Register.RSP, PROGRAM_STACK)
-    text.jump_register(Register.RAX)
+    text.load(Register.RCX, Register.RAX)
+    text.immediate(Register.R11, PROGRAM_FLAGS)
+    text.system_return()
     _kernel_loader(text)
     _kernel_handler(text)
     _kernel_console(text)
     return text.link()
 
 
-def kernel_image(module: ObjectModule) -> bytes:
-    """A disk holding the sector, the kernel, and the executable untouched."""
+def kernel_carrying(program: bytes) -> bytes:
+    """A disk holding the sector, the kernel, and ``program`` untouched."""
     kernel = kernel_text()
     if len(kernel) > KERNEL_SPAN:
         raise MachineCodeError(
             f"the kernel wants {len(kernel)} octets of {KERNEL_SPAN}"
         )
-    program = machine_code(module, "x86-64")
     body = kernel.ljust(KERNEL_SPAN, b"\x00") + program
     sectors = -(-len(body) // SECTOR)
     return boot_sector(sectors) + body.ljust(sectors * SECTOR, b"\x00")
+
+
+def kernel_image(module: ObjectModule) -> bytes:
+    """The same, carrying exactly what ``--emit-elf`` would have written."""
+    return kernel_carrying(machine_code(module, "x86-64"))
+
+
+def trespassing_program(module: ObjectModule, where: int) -> bytes:
+    """The program again, with one store to ``where`` in front of it.
+
+    Everything else about it is the same executable, which is what makes a
+    pair of these worth running: the only difference between the one that
+    prints and the one that does not is the address in that store.
+    """
+    _, machine, align, _ = MACHINES["x86-64"]
+
+    class Trespassing(NativeCodeBackend):
+        def _prologue(self, text: X86Assembler) -> None:
+            text.immediate(Register.RBX, where)
+            text.immediate(Register.RAX, 0x2A)
+            text.store_octet(MemoryOperand(Register.RBX), Register.RAX)
+            super()._prologue(text)
+
+    backend = Trespassing(module)
+    return elf64_image(backend.encode(), backend.layout.size, machine, align)
+
+
+def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
+    """Whether each of the two stores was allowed, the program's and the other.
+
+    The first is into a page the program owns and has to be allowed or the
+    experiment says nothing; the second is into the page the kernel is in.
+    A machine that permits both is running the program in the ring the
+    kernel is in, whatever the descriptors say.
+    """
+    allowed = []
+    for where in (PROGRAM_STACK - HUGE_PAGE, KERNEL_BASE):
+        image = kernel_carrying(trespassing_program(module, where))
+        with tempfile.TemporaryDirectory(prefix="ouroboros-ring-") as scratch:
+            disk = Path(scratch) / "kernel.img"
+            disk.write_bytes(image)
+            try:
+                run_boot(disk, lines, patience=15.0)
+            except MachineCodeError:
+                allowed.append(False)
+            else:
+                allowed.append(True)
+    return allowed[0], allowed[1]
 
 
 def kernel_passenger(image: bytes, span: int) -> bytes:

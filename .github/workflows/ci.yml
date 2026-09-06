@@ -164,6 +164,17 @@ jobs:
           print('the kernel booted, loaded it, and it printed it')
           "
 
+      - name: and the program it loaded cannot reach the kernel that loaded it
+        run: |
+          python -c "
+          import ouroboros
+          module = ouroboros.synthesize(7).unwrap_or_raise().module
+          own, kernel = ouroboros.kernel_refusals(module, 7)
+          assert own, 'a program cannot write to a page it owns'
+          assert not kernel, 'a program can write to the page the kernel is in'
+          print('the store it may do was done, and the store it may not was refused')
+          "
+
       - name: the firmware loads the application and prints the same figure
         run: |
           python ouroboros.py --emit-efi glyph.efi
