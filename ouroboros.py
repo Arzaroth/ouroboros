@@ -6176,7 +6176,12 @@ class Gsl2Error(GlyphPlatformError):
     """The GSL-2 seed compiler rejected a translation unit."""
 
 
-GSLC_GSL2: Final[str] = r'''# gslc.gsl2 - the GSL-2 compiler, written in GSL-2.
+# The language and what is done with it are separate.  Above the tail is
+# the reader, the tokens, the tables and the grammar, and nothing that
+# knows what is being written; below it is the only part that does, which
+# is why there can be more than one of them.
+
+GSL2_LANGUAGE_GSL2: Final[str] = r'''# gslc.gsl2 - the GSL-2 compiler, written in GSL-2.
 #
 # Reads GSL-2 source on stdin, writes LLVM IR on stdout.  Semantically
 # identical to the stage-0 compiler gsl2c.py: for any accepted input both
@@ -6313,19 +6318,6 @@ fn name_eq(a, alen, b, blen) {
   }
   return 1;
 }
-
-fn emit_name(start, length) {
-  var i = 0;
-  while (i < length) {
-    ec(mem[start + i]);
-    i = i + 1;
-  }
-  return 0;
-}
-
-# ----------------------------------------------------------------------
-# lexer
-# ----------------------------------------------------------------------
 
 fn is_digit(c) {
   if (c >= 48 && c <= 57) {
@@ -6712,6 +6704,415 @@ fn alloc_temp_slot() {
 # emission primitives
 # ----------------------------------------------------------------------
 
+fn parse_primary() {
+  if (tk() == T_NUM) {
+    var v = tnum();
+    advance();
+    return gen_const(v);
+  }
+  if (tk() == T_STR) {
+    var v2 = tnum();
+    advance();
+    return gen_const(v2);
+  }
+  if (tk() == T_LPAREN) {
+    advance();
+    var r = parse_expr();
+    expect(T_RPAREN, "expected )");
+    return r;
+  }
+  if (tk() == T_MEM) {
+    advance();
+    expect(T_LBRACK, "expected [ after mem");
+    var i0 = parse_expr();
+    expect(T_RBRACK, "expected ]");
+    return gen_load(gen_mem_addr(i0));
+  }
+  if (tk() == T_IDENT) {
+    var start = tstart();
+    var length = tlen();
+    advance();
+    if (tk() != T_LPAREN) {
+      var slot = find_local(start, length);
+      if (slot >= 0) {
+        return gen_load(gen_slot_addr(slot));
+      }
+      if (find_global(start, length) >= 0) {
+        return gen_global_load(start, length);
+      }
+      fail("unknown identifier");
+    }
+    advance();
+    if (kw_is(start, length, "putchar")) {
+      var a1 = parse_expr();
+      expect(T_RPAREN, "expected )");
+      return parse_call_builtin(1, a1);
+    }
+    if (kw_is(start, length, "getchar")) {
+      expect(T_RPAREN, "expected )");
+      return parse_call_builtin(2, 0);
+    }
+    if (kw_is(start, length, "exit")) {
+      var a2 = parse_expr();
+      expect(T_RPAREN, "expected )");
+      return parse_call_builtin(3, a2);
+    }
+    var base = argsp;
+    argsp = argsp + 9;
+    var nargs = 0;
+    while (tk() != T_RPAREN) {
+      if (nargs > 0) {
+        expect(T_COMMA, "expected , between arguments");
+      }
+      mem[ARGS + base + nargs] = parse_expr();
+      nargs = nargs + 1;
+      if (nargs > 8) {
+        fail("too many arguments");
+      }
+    }
+    advance();
+    var r2 = gen_call(start, length, base, nargs);
+    argsp = base;
+    return r2;
+  }
+  fail("expected an expression");
+  return 0;
+}
+
+fn parse_unary() {
+  if (tk() == T_MINUS) {
+    advance();
+    var a = parse_unary();
+    return gen_binary(T_MINUS, gen_const(0), a);
+  }
+  if (tk() == T_NOT) {
+    advance();
+    var b = parse_unary();
+    return gen_compare(T_EQ, b, gen_const(0));
+  }
+  return parse_primary();
+}
+
+fn parse_mul() {
+  var a = parse_unary();
+  while (tk() == T_STAR || tk() == T_SLASH || tk() == T_PERCENT) {
+    var op = tk();
+    advance();
+    var b = parse_unary();
+    a = gen_binary(op, a, b);
+  }
+  return a;
+}
+
+fn parse_add() {
+  var a = parse_mul();
+  while (tk() == T_PLUS || tk() == T_MINUS) {
+    var op = tk();
+    advance();
+    var b = parse_mul();
+    a = gen_binary(op, a, b);
+  }
+  return a;
+}
+
+fn parse_rel() {
+  var a = parse_add();
+  while (tk() == T_LT || tk() == T_LE || tk() == T_GT || tk() == T_GE) {
+    var op = tk();
+    advance();
+    var b = parse_add();
+    a = gen_compare(op, a, b);
+  }
+  return a;
+}
+
+fn parse_eq() {
+  var a = parse_rel();
+  while (tk() == T_EQ || tk() == T_NE) {
+    var op = tk();
+    advance();
+    var b = parse_rel();
+    a = gen_compare(op, a, b);
+  }
+  return a;
+}
+
+fn parse_and() {
+  var a = parse_eq();
+  while (tk() == T_ANDAND) {
+    advance();
+    var slot = alloc_temp_slot();
+    gen_store_const(0, gen_slot_addr(slot));
+    var lrhs = new_label();
+    var lend = new_label();
+    emit_cond_br(a, lrhs, lend);
+    emit_label(lrhs);
+    var b = parse_eq();
+    var v = gen_compare(T_NE, b, gen_const(0));
+    gen_store(v, gen_slot_addr(slot));
+    emit_br(lend);
+    emit_label(lend);
+    a = gen_load(gen_slot_addr(slot));
+  }
+  return a;
+}
+
+fn parse_or() {
+  var a = parse_and();
+  while (tk() == T_OROR) {
+    advance();
+    var slot = alloc_temp_slot();
+    gen_store_const(1, gen_slot_addr(slot));
+    var lrhs = new_label();
+    var lend = new_label();
+    emit_cond_br(a, lend, lrhs);
+    emit_label(lrhs);
+    var b = parse_and();
+    var v = gen_compare(T_NE, b, gen_const(0));
+    gen_store(v, gen_slot_addr(slot));
+    emit_br(lend);
+    emit_label(lend);
+    a = gen_load(gen_slot_addr(slot));
+  }
+  return a;
+}
+
+fn parse_expr() {
+  return parse_or();
+}
+
+# ----------------------------------------------------------------------
+# statements
+# ----------------------------------------------------------------------
+
+fn parse_block() {
+  expect(T_LBRACE, "expected {");
+  while (tk() != T_RBRACE) {
+    if (tk() == T_EOF) {
+      fail("unterminated block");
+    }
+    parse_stmt();
+  }
+  advance();
+  return 0;
+}
+
+fn parse_stmt() {
+  if (tk() == T_VAR) {
+    advance();
+    if (tk() != T_IDENT) {
+      fail("expected a name after var");
+    }
+    var start = tstart();
+    var length = tlen();
+    advance();
+    expect(T_ASSIGN, "expected = in var declaration");
+    var r = parse_expr();
+    expect(T_SEMI, "expected ;");
+    var slot = declare_local(start, length);
+    gen_store(r, gen_slot_addr(slot));
+    return 0;
+  }
+  if (tk() == T_IF) {
+    advance();
+    expect(T_LPAREN, "expected ( after if");
+    var c = parse_expr();
+    expect(T_RPAREN, "expected )");
+    var lthen = new_label();
+    var lelse = new_label();
+    var lend = new_label();
+    emit_cond_br(c, lthen, lelse);
+    emit_label(lthen);
+    parse_block();
+    emit_br(lend);
+    emit_label(lelse);
+    if (tk() == T_ELSE) {
+      advance();
+      parse_block();
+    }
+    emit_br(lend);
+    emit_label(lend);
+    return 0;
+  }
+  if (tk() == T_WHILE) {
+    advance();
+    var lhead = new_label();
+    var lbody = new_label();
+    var lend2 = new_label();
+    emit_br(lhead);
+    emit_label(lhead);
+    expect(T_LPAREN, "expected ( after while");
+    var c2 = parse_expr();
+    expect(T_RPAREN, "expected )");
+    emit_cond_br(c2, lbody, lend2);
+    emit_label(lbody);
+    parse_block();
+    emit_br(lhead);
+    emit_label(lend2);
+    return 0;
+  }
+  if (tk() == T_RETURN) {
+    advance();
+    var r2 = parse_expr();
+    expect(T_SEMI, "expected ;");
+    gen_return(r2);
+    emit_label(new_label());
+    return 0;
+  }
+  if (tk() == T_MEM) {
+    advance();
+    expect(T_LBRACK, "expected [ after mem");
+    var i0 = parse_expr();
+    expect(T_RBRACK, "expected ]");
+    expect(T_ASSIGN, "expected = in mem assignment");
+    var v0 = parse_expr();
+    expect(T_SEMI, "expected ;");
+    gen_store(v0, gen_mem_addr(i0));
+    return 0;
+  }
+  if (tk() == T_IDENT && tk2() == T_ASSIGN) {
+    var start2 = tstart();
+    var length2 = tlen();
+    advance();
+    advance();
+    var r3 = parse_expr();
+    expect(T_SEMI, "expected ;");
+    var slot2 = find_local(start2, length2);
+    if (slot2 >= 0) {
+      gen_store(r3, gen_slot_addr(slot2));
+      return 0;
+    }
+    if (find_global(start2, length2) >= 0) {
+      gen_global_store(r3, start2, length2);
+      return 0;
+    }
+    fail("assignment to unknown identifier");
+  }
+  parse_expr();
+  expect(T_SEMI, "expected ;");
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# declarations
+# ----------------------------------------------------------------------
+
+fn parse_global_decl() {
+  advance();
+  if (tk() != T_IDENT) {
+    fail("expected a name after var");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  expect(T_ASSIGN, "expected = in global declaration");
+  var neg = 0;
+  if (tk() == T_MINUS) {
+    neg = 1;
+    advance();
+  }
+  if (tk() != T_NUM) {
+    fail("global initializers must be integer literals");
+  }
+  var v = tnum();
+  advance();
+  expect(T_SEMI, "expected ;");
+  declare_global(start, length);
+  gen_global_decl(start, length, v, neg);
+  return 0;
+}
+
+fn parse_function() {
+  advance();
+  if (tk() != T_IDENT) {
+    fail("expected a function name");
+  }
+  var start = tstart();
+  var length = tlen();
+  advance();
+  expect(T_LPAREN, "expected ( after function name");
+  nlocals = 0;
+  regcnt = 0;
+  labelcnt = 0;
+  var nparams = 0;
+  while (tk() != T_RPAREN) {
+    if (nparams > 0) {
+      expect(T_COMMA, "expected , between parameters");
+    }
+    if (tk() != T_IDENT) {
+      fail("expected a parameter name");
+    }
+    declare_local(tstart(), tlen());
+    nparams = nparams + 1;
+    advance();
+  }
+  advance();
+  gen_function_open(start, length, nparams);
+  parse_block();
+  gen_function_close();
+  return 0;
+}
+
+fn read_source() {
+  var i = 0;
+  var c = getchar();
+  while (c != 0 - 1) {
+    mem[SRC + i] = c;
+    i = i + 1;
+    c = getchar();
+  }
+  mem[SRC + i] = 0;
+  srclen = i;
+  return 0;
+}
+
+fn compile_unit() {
+  emit_header();
+  scan(0);
+  scan(1);
+  while (tk() != T_EOF) {
+    if (tk() == T_VAR) {
+      parse_global_decl();
+    } else {
+      if (tk() == T_FN) {
+        parse_function();
+      } else {
+        fail("expected fn or var at top level");
+      }
+    }
+  }
+  emit_trailer();
+  return 0;
+}
+
+fn main() {
+  read_source();
+  compile_unit();
+  return 0;
+}
+'''
+
+GSL2_IR_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# the back end: everything that decides what comes out
+# ----------------------------------------------------------------------
+#
+# Above this line is the language and nothing else - the reader, the
+# tokens, the tables and the grammar.  Below it is the only part that
+# knows what is being written, which is why there can be more than one.
+fn emit_name(start, length) {
+  var i = 0;
+  while (i < length) {
+    ec(mem[start + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# lexer
+# ----------------------------------------------------------------------
+
 fn new_reg() {
   regcnt = regcnt + 1;
   return regcnt;
@@ -6948,416 +7349,6 @@ fn parse_call_builtin(kind, first_arg) {
   return gen_const(0);
 }
 
-fn parse_primary() {
-  if (tk() == T_NUM) {
-    var v = tnum();
-    advance();
-    return gen_const(v);
-  }
-  if (tk() == T_STR) {
-    var v2 = tnum();
-    advance();
-    return gen_const(v2);
-  }
-  if (tk() == T_LPAREN) {
-    advance();
-    var r = parse_expr();
-    expect(T_RPAREN, "expected )");
-    return r;
-  }
-  if (tk() == T_MEM) {
-    advance();
-    expect(T_LBRACK, "expected [ after mem");
-    var i0 = parse_expr();
-    expect(T_RBRACK, "expected ]");
-    return gen_load(gen_mem_addr(i0));
-  }
-  if (tk() == T_IDENT) {
-    var start = tstart();
-    var length = tlen();
-    advance();
-    if (tk() != T_LPAREN) {
-      var slot = find_local(start, length);
-      if (slot >= 0) {
-        return gen_load(gen_slot_addr(slot));
-      }
-      if (find_global(start, length) >= 0) {
-        return gen_global_load(start, length);
-      }
-      fail("unknown identifier");
-    }
-    advance();
-    if (kw_is(start, length, "putchar")) {
-      var a1 = parse_expr();
-      expect(T_RPAREN, "expected )");
-      return parse_call_builtin(1, a1);
-    }
-    if (kw_is(start, length, "getchar")) {
-      expect(T_RPAREN, "expected )");
-      return parse_call_builtin(2, 0);
-    }
-    if (kw_is(start, length, "exit")) {
-      var a2 = parse_expr();
-      expect(T_RPAREN, "expected )");
-      return parse_call_builtin(3, a2);
-    }
-    var base = argsp;
-    argsp = argsp + 9;
-    var nargs = 0;
-    while (tk() != T_RPAREN) {
-      if (nargs > 0) {
-        expect(T_COMMA, "expected , between arguments");
-      }
-      mem[ARGS + base + nargs] = parse_expr();
-      nargs = nargs + 1;
-      if (nargs > 8) {
-        fail("too many arguments");
-      }
-    }
-    advance();
-    var r2 = new_reg();
-    es("  ");
-    er(r2);
-    es(" = call i64 @f_");
-    emit_name(start, length);
-    es("(");
-    var i = 0;
-    while (i < nargs) {
-      if (i > 0) {
-        es(", ");
-      }
-      es("i64 ");
-      er(mem[ARGS + base + i]);
-      i = i + 1;
-    }
-    es(")\n");
-    argsp = base;
-    return r2;
-  }
-  fail("expected an expression");
-  return 0;
-}
-
-fn parse_unary() {
-  if (tk() == T_MINUS) {
-    advance();
-    var a = parse_unary();
-    return gen_binary(T_MINUS, gen_const(0), a);
-  }
-  if (tk() == T_NOT) {
-    advance();
-    var b = parse_unary();
-    return gen_compare(T_EQ, b, gen_const(0));
-  }
-  return parse_primary();
-}
-
-fn parse_mul() {
-  var a = parse_unary();
-  while (tk() == T_STAR || tk() == T_SLASH || tk() == T_PERCENT) {
-    var op = tk();
-    advance();
-    var b = parse_unary();
-    a = gen_binary(op, a, b);
-  }
-  return a;
-}
-
-fn parse_add() {
-  var a = parse_mul();
-  while (tk() == T_PLUS || tk() == T_MINUS) {
-    var op = tk();
-    advance();
-    var b = parse_mul();
-    a = gen_binary(op, a, b);
-  }
-  return a;
-}
-
-fn parse_rel() {
-  var a = parse_add();
-  while (tk() == T_LT || tk() == T_LE || tk() == T_GT || tk() == T_GE) {
-    var op = tk();
-    advance();
-    var b = parse_add();
-    a = gen_compare(op, a, b);
-  }
-  return a;
-}
-
-fn parse_eq() {
-  var a = parse_rel();
-  while (tk() == T_EQ || tk() == T_NE) {
-    var op = tk();
-    advance();
-    var b = parse_rel();
-    a = gen_compare(op, a, b);
-  }
-  return a;
-}
-
-fn parse_and() {
-  var a = parse_eq();
-  while (tk() == T_ANDAND) {
-    advance();
-    var slot = alloc_temp_slot();
-    var s1 = gen_slot_addr(slot);
-    es("  store i64 0, ptr ");
-    er(s1);
-    es(", align 8\n");
-    var lrhs = new_label();
-    var lend = new_label();
-    emit_cond_br(a, lrhs, lend);
-    emit_label(lrhs);
-    var b = parse_eq();
-    var v = gen_compare(T_NE, b, gen_const(0));
-    gen_store(v, gen_slot_addr(slot));
-    emit_br(lend);
-    emit_label(lend);
-    a = gen_load(gen_slot_addr(slot));
-  }
-  return a;
-}
-
-fn parse_or() {
-  var a = parse_and();
-  while (tk() == T_OROR) {
-    advance();
-    var slot = alloc_temp_slot();
-    var s1 = gen_slot_addr(slot);
-    es("  store i64 1, ptr ");
-    er(s1);
-    es(", align 8\n");
-    var lrhs = new_label();
-    var lend = new_label();
-    emit_cond_br(a, lend, lrhs);
-    emit_label(lrhs);
-    var b = parse_and();
-    var v = gen_compare(T_NE, b, gen_const(0));
-    gen_store(v, gen_slot_addr(slot));
-    emit_br(lend);
-    emit_label(lend);
-    a = gen_load(gen_slot_addr(slot));
-  }
-  return a;
-}
-
-fn parse_expr() {
-  return parse_or();
-}
-
-# ----------------------------------------------------------------------
-# statements
-# ----------------------------------------------------------------------
-
-fn parse_block() {
-  expect(T_LBRACE, "expected {");
-  while (tk() != T_RBRACE) {
-    if (tk() == T_EOF) {
-      fail("unterminated block");
-    }
-    parse_stmt();
-  }
-  advance();
-  return 0;
-}
-
-fn parse_stmt() {
-  if (tk() == T_VAR) {
-    advance();
-    if (tk() != T_IDENT) {
-      fail("expected a name after var");
-    }
-    var start = tstart();
-    var length = tlen();
-    advance();
-    expect(T_ASSIGN, "expected = in var declaration");
-    var r = parse_expr();
-    expect(T_SEMI, "expected ;");
-    var slot = declare_local(start, length);
-    gen_store(r, gen_slot_addr(slot));
-    return 0;
-  }
-  if (tk() == T_IF) {
-    advance();
-    expect(T_LPAREN, "expected ( after if");
-    var c = parse_expr();
-    expect(T_RPAREN, "expected )");
-    var lthen = new_label();
-    var lelse = new_label();
-    var lend = new_label();
-    emit_cond_br(c, lthen, lelse);
-    emit_label(lthen);
-    parse_block();
-    emit_br(lend);
-    emit_label(lelse);
-    if (tk() == T_ELSE) {
-      advance();
-      parse_block();
-    }
-    emit_br(lend);
-    emit_label(lend);
-    return 0;
-  }
-  if (tk() == T_WHILE) {
-    advance();
-    var lhead = new_label();
-    var lbody = new_label();
-    var lend2 = new_label();
-    emit_br(lhead);
-    emit_label(lhead);
-    expect(T_LPAREN, "expected ( after while");
-    var c2 = parse_expr();
-    expect(T_RPAREN, "expected )");
-    emit_cond_br(c2, lbody, lend2);
-    emit_label(lbody);
-    parse_block();
-    emit_br(lhead);
-    emit_label(lend2);
-    return 0;
-  }
-  if (tk() == T_RETURN) {
-    advance();
-    var r2 = parse_expr();
-    expect(T_SEMI, "expected ;");
-    es("  ret i64 ");
-    er(r2);
-    es("\n");
-    emit_label(new_label());
-    return 0;
-  }
-  if (tk() == T_MEM) {
-    advance();
-    expect(T_LBRACK, "expected [ after mem");
-    var i0 = parse_expr();
-    expect(T_RBRACK, "expected ]");
-    expect(T_ASSIGN, "expected = in mem assignment");
-    var v0 = parse_expr();
-    expect(T_SEMI, "expected ;");
-    gen_store(v0, gen_mem_addr(i0));
-    return 0;
-  }
-  if (tk() == T_IDENT && tk2() == T_ASSIGN) {
-    var start2 = tstart();
-    var length2 = tlen();
-    advance();
-    advance();
-    var r3 = parse_expr();
-    expect(T_SEMI, "expected ;");
-    var slot2 = find_local(start2, length2);
-    if (slot2 >= 0) {
-      gen_store(r3, gen_slot_addr(slot2));
-      return 0;
-    }
-    if (find_global(start2, length2) >= 0) {
-      gen_global_store(r3, start2, length2);
-      return 0;
-    }
-    fail("assignment to unknown identifier");
-  }
-  parse_expr();
-  expect(T_SEMI, "expected ;");
-  return 0;
-}
-
-# ----------------------------------------------------------------------
-# declarations
-# ----------------------------------------------------------------------
-
-fn parse_global_decl() {
-  advance();
-  if (tk() != T_IDENT) {
-    fail("expected a name after var");
-  }
-  var start = tstart();
-  var length = tlen();
-  advance();
-  expect(T_ASSIGN, "expected = in global declaration");
-  var neg = 0;
-  if (tk() == T_MINUS) {
-    neg = 1;
-    advance();
-  }
-  if (tk() != T_NUM) {
-    fail("global initializers must be integer literals");
-  }
-  var v = tnum();
-  advance();
-  expect(T_SEMI, "expected ;");
-  declare_global(start, length);
-  es("@g_");
-  emit_name(start, length);
-  es(" = internal global i64 ");
-  if (neg == 1) {
-    es("-");
-  }
-  en(v);
-  es("\n");
-  return 0;
-}
-
-fn parse_function() {
-  advance();
-  if (tk() != T_IDENT) {
-    fail("expected a function name");
-  }
-  var start = tstart();
-  var length = tlen();
-  advance();
-  expect(T_LPAREN, "expected ( after function name");
-  nlocals = 0;
-  regcnt = 0;
-  labelcnt = 0;
-  var nparams = 0;
-  while (tk() != T_RPAREN) {
-    if (nparams > 0) {
-      expect(T_COMMA, "expected , between parameters");
-    }
-    if (tk() != T_IDENT) {
-      fail("expected a parameter name");
-    }
-    declare_local(tstart(), tlen());
-    nparams = nparams + 1;
-    advance();
-  }
-  advance();
-  es("\ndefine i64 @f_");
-  emit_name(start, length);
-  es("(");
-  var i = 0;
-  while (i < nparams) {
-    if (i > 0) {
-      es(", ");
-    }
-    es("i64 %p");
-    en(i);
-    i = i + 1;
-  }
-  es(") {\nentry:\n");
-  es("  %frame = alloca [");
-  en(FRAME);
-  es(" x i64], align 8\n");
-  i = 0;
-  while (i < nparams) {
-    es("  %a");
-    en(i);
-    es(" = getelementptr inbounds [");
-    en(FRAME);
-    es(" x i64], ptr %frame, i64 0, i64 ");
-    en(i);
-    es("\n");
-    es("  store i64 %p");
-    en(i);
-    es(", ptr %a");
-    en(i);
-    es(", align 8\n");
-    i = i + 1;
-  }
-  parse_block();
-  es("  ret i64 0\n}\n");
-  return 0;
-}
-
 fn emit_header() {
   es("target triple = \"x86_64-unknown-linux-gnu\"\n\n");
   es("@memory = internal global [");
@@ -7414,162 +7405,1077 @@ fn emit_trailer() {
   return 0;
 }
 
-fn read_source() {
+
+fn gen_call(start, length, base, nargs) {
+  var r2 = new_reg();
+  es("  ");
+  er(r2);
+  es(" = call i64 @f_");
+  emit_name(start, length);
+  es("(");
   var i = 0;
-  var c = getchar();
-  while (c != 0 - 1) {
-    mem[SRC + i] = c;
+  while (i < nargs) {
+    if (i > 0) {
+      es(", ");
+    }
+    es("i64 ");
+    er(mem[ARGS + base + i]);
     i = i + 1;
-    c = getchar();
   }
-  mem[SRC + i] = 0;
-  srclen = i;
-  return 0;
+  es(")\n");
+  return r2;
 }
 
-fn compile_unit() {
-  emit_header();
-  scan(0);
-  scan(1);
-  while (tk() != T_EOF) {
-    if (tk() == T_VAR) {
-      parse_global_decl();
-    } else {
-      if (tk() == T_FN) {
-        parse_function();
-      } else {
-        fail("expected fn or var at top level");
-      }
+fn gen_function_open(start, length, nparams) {
+  es("\ndefine i64 @f_");
+  emit_name(start, length);
+  es("(");
+  var i = 0;
+  while (i < nparams) {
+    if (i > 0) {
+      es(", ");
     }
+    es("i64 %p");
+    en(i);
+    i = i + 1;
   }
-  emit_trailer();
+  es(") {\nentry:\n");
+  es("  %frame = alloca [");
+  en(FRAME);
+  es(" x i64], align 8\n");
+  i = 0;
+  while (i < nparams) {
+    es("  %a");
+    en(i);
+    es(" = getelementptr inbounds [");
+    en(FRAME);
+    es(" x i64], ptr %frame, i64 0, i64 ");
+    en(i);
+    es("\n");
+    es("  store i64 %p");
+    en(i);
+    es(", ptr %a");
+    en(i);
+    es(", align 8\n");
+    i = i + 1;
+  }
   return 0;
 }
 
-fn main() {
-  read_source();
-  compile_unit();
+fn gen_function_close() {
+  es("  ret i64 0\n}\n");
+  return 0;
+}
+
+fn gen_store_const(value, addr_reg) {
+  es("  store i64 ");
+  en(value);
+  es(", ptr ");
+  er(addr_reg);
+  es(", align 8\n");
+  return 0;
+}
+
+fn gen_return(r) {
+  es("  ret i64 ");
+  er(r);
+  es("\n");
+  return 0;
+}
+
+fn gen_global_decl(start, length, v, neg) {
+  es("@g_");
+  emit_name(start, length);
+  es(" = internal global i64 ");
+  if (neg == 1) {
+    es("-");
+  }
+  en(v);
+  es("\n");
   return 0;
 }
 '''
 
-GLYPH_GSL2: Final[str] = r'''# The canonical glyph, expressed in GSL-2.
-# Reads an optional odd lattice order from stdin; defaults to 7.
-# Two canonical strokes are emitted, then closed under the cyclic group C4.
-
-var order = 7;
-var apothem = 3;
-
-fn cell(row, col) {
-  return row * order + col;
-}
-
-fn emit_run(index, lo, hi, orient) {
-  var cursor = lo;
-  while (cursor <= hi) {
-    if (orient == 0) {
-      mem[cell(index, cursor)] = 1;
-    } else {
-      mem[cell(cursor, index)] = 1;
-    }
-    cursor = cursor + 1;
-  }
-  return 0;
-}
-
-fn close_group(passes) {
-  var pass = 0;
-  while (pass < passes) {
-    var row = 0;
-    while (row < order) {
-      var col = 0;
-      while (col < order) {
-        if (mem[cell(row, col)] != 0) {
-          mem[cell(col, 2 * apothem - row)] = 1;
-        }
-        col = col + 1;
-      }
-      row = row + 1;
-    }
-    pass = pass + 1;
-  }
-  return 0;
-}
-
-fn render() {
-  var row = 0;
-  while (row < order) {
-    var last = 0 - 1;
-    var col = 0;
-    while (col < order) {
-      if (mem[cell(row, col)] != 0) {
-        last = col;
-      }
-      col = col + 1;
-    }
-    col = 0;
-    while (col <= last) {
-      if (col > 0) {
-        putchar(' ');
-      }
-      if (mem[cell(row, col)] != 0) {
-        putchar('*');
-      } else {
-        putchar(' ');
-      }
-      col = col + 1;
-    }
-    putchar('\n');
-    row = row + 1;
-  }
-  return 0;
-}
-
-fn read_order() {
-  var value = 0;
-  var seen = 0;
-  var c = getchar();
-  while (c >= '0' && c <= '9') {
-    value = value * 10 + c - '0';
-    seen = 1;
-    c = getchar();
-  }
-  if (seen == 0) {
-    return 7;
-  }
-  return value;
-}
-
-fn main() {
-  order = read_order();
-  if (order < 3 || order % 2 == 0) {
-    return 2;
-  }
-  apothem = order / 2;
-  emit_run(apothem, 0, order - 1, 1);
-  emit_run(0, apothem + 1, order - 1, 0);
-  close_group(3);
-  render();
-  return 0;
-}
-'''
-
+GSL2_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
 # ----------------------------------------------------------------------
-# tier 4: the front end, written in the language tier 3 compiles
+# the back end that writes a program instead of a description of one
 # ----------------------------------------------------------------------
 #
-# Everything above is a circle with one end loose: tiers 1 and 2 are
-# Python, tier 3 is native but only compiles itself.  glyphc.gsl2 joins
-# the ends.  It is the whole of tier 1 - preprocessor, transducer, parser,
-# analyser, pass manager, assembler - and the tier 2 lowering after it,
-# written a second time in GSL-2 and compiled by the self-hosted compiler
-# above.  The claim it makes is not that it agrees but that it is the
-# same compiler: for any program either accepts, both emit the same bytes.
+# Where the octets are kept while they are being made.  Everything below
+# 990000 belongs to the compiler above; everything from 1500000 up is where
+# the strings of the program being compiled go.
+
+var TEXT = 990000;
+var LBLOFF = 1330000;
+var FIXAT = 1370000;
+var FIXID = 1410000;
+var FNSTART = 1450000;
+var FNLEN = 1460000;
+var GLBINIT = 1470000;
+
+var RSP = 4;
+var RBP = 5;
+
+var TEXT_LIMIT = 340000;
+var MAXFN = 4096;
+
+# Names for the places a branch can land.  Below L_FN are the routines the
+# runtime is made of; a function is L_FN plus its place in the table, and a
+# block inside one is L_BLOCK upwards.
+var L_START = 0;
+var L_PUTCHAR = 1;
+var L_PUTCHAR_DONE = 2;
+var L_FLUSH = 3;
+var L_FLUSH_DONE = 4;
+var L_GETCHAR = 5;
+var L_GETCHAR_FILL = 6;
+var L_GETCHAR_TAKE = 7;
+var L_GETCHAR_ENDED = 8;
+var L_QUIT = 9;
+var L_COPY = 10;
+var L_COPY_DONE = 11;
+var L_STRDATA = 12;
+var L_MAIN = 13;
+var L_INIT = 14;
+var L_GETCHAR_DONE = 15;
+var L_FN = 16;
+var L_BLOCK = 4112;
+
+# Where the program being compiled keeps what it keeps.  Its flat memory
+# comes first because a literal address into it is what a string is.
+var MEMORY_AT = 6291456;
+var MEMORY_BYTES = 16000000;
+var GLOBALS_AT = 22291456;
+var OUT_AT = 22293504;
+var OUT_SPAN = 65536;
+var OUT_USED_AT = 22359040;
+var IN_AT = 22359048;
+var IN_SPAN = 65536;
+var IN_TAKEN_AT = 22424584;
+var IN_HELD_AT = 22424592;
+var BSS_SPAN = 16133144;
+
+var textlen = 0;
+var nfix = 0;
+var nfn = 0;
+var nblock = 0;
+var framesite = 0;
+var stringsite = 0;
+'''
+
+X86_ENCODER_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# an x86-64 encoder, and the octets it makes
+# ----------------------------------------------------------------------
+#
+# The instructions a backend here asks for and no others, in a language with
+# no bitwise operators - which it does not need, because every field in a
+# prefix, a ModRM or a SIB octet is disjoint from its neighbours, so the
+# additions below are the octets the shifts and ors would have made.
+#
+# Whoever includes this declares TEXT, LBLOFF, FIXAT and FIXID first, since
+# where those go depends on what else the program is keeping.
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var PAGE_SIZE = 4096;
+var EM_X86_64 = 62;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+var SYS_WRITE = 1;
+var SYS_EXIT_GROUP = 231;
+
+var RAX = 0;
+var RCX = 1;
+var RDX = 2;
+var RBX = 3;
+var RSI = 6;
+var RDI = 7;
+var R8 = 8;
+var R9 = 9;
+var R10 = 10;
+var R11 = 11;
+var R12 = 12;
+var R13 = 13;
+var R14 = 14;
+var R15 = 15;
+
+# The conditions the backend asks for, by their place in the opcode.
+var CC_E = 4;
+var CC_NE = 5;
+var CC_L = 12;
+var CC_GE = 13;
+var CC_LE = 14;
+var CC_G = 15;
+var CC_S = 8;
+var CC_NS = 9;
+
+# Names for the places a branch can land.  Everything below the first free
+# one is a routine or a step inside one; an instruction at address i is
+# L_CODE + i, and anything a lowering needs for itself is handed out from
+# the top by next_label.
+
+fn octet_of(v) {
+  var r = v % 256;
+  if (r < 0) {
+    r = r + 256;
+  }
+  return r;
+}
+
+# Division towards zero is not division towards the floor, and the octets of
+# a negative number are the floor's.
+fn shift_octet(v) {
+  if (v < 0) {
+    return (v - 255) / 256;
+  }
+  return v / 256;
+}
+
+fn emit(b) {
+  mem[TEXT + textlen] = octet_of(b);
+  textlen = textlen + 1;
+  return 0;
+}
+
+fn emit_wide(v, count) {
+  var i = 0;
+  while (i < count) {
+    emit(octet_of(v));
+    v = shift_octet(v);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn lab(id) {
+  mem[LBLOFF + id] = textlen;
+  return 0;
+}
+
+fn where_to(id) {
+  mem[FIXAT + nfix] = textlen;
+  mem[FIXID + nfix] = id;
+  nfix = nfix + 1;
+  emit_wide(0, 4);
+  return 0;
+}
+
+fn link_text() {
+  var i = 0;
+  while (i < nfix) {
+    var site = mem[FIXAT + i];
+    var rel = mem[LBLOFF + mem[FIXID + i]] - (site + 4);
+    var k = 0;
+    while (k < 4) {
+      mem[TEXT + site + k] = octet_of(rel);
+      rel = shift_octet(rel);
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the shape of an operand
+# ----------------------------------------------------------------------
+#
+# An operand is a register when kept is zero, and base + index * scale +
+# displacement when it is one.  A register operand keeps its register in
+# base, which is what makes one pair of functions serve both.
+
+fn scale_bits(scale) {
+  if (scale == 1) {
+    return 0;
+  }
+  if (scale == 2) {
+    return 1;
+  }
+  if (scale == 4) {
+    return 2;
+  }
+  return 3;
+}
+
+fn rex_of(reg, kept, base, index) {
+  var rex = 0;
+  if (reg >= 8) {
+    rex = rex + 4;
+  }
+  if (base >= 8) {
+    rex = rex + 1;
+  }
+  if (kept == 1) {
+    if (index >= 8) {
+      rex = rex + 2;
+    }
+  }
+  return rex;
+}
+
+fn operand_tail(reg, kept, base, index, scale, disp) {
+  if (kept == 0) {
+    emit(192 + (reg % 8) * 8 + (base % 8));
+    return 0;
+  }
+  var slot = 4;
+  if (index >= 0) {
+    slot = index % 8;
+  }
+  emit(128 + (reg % 8) * 8 + 4);
+  emit(scale_bits(scale) * 64 + slot * 8 + (base % 8));
+  emit_wide(disp, 4);
+  return 0;
+}
+
+# A sixty-four bit operation: the wide prefix is always there.
+fn wide(op0, op1, reg, kept, base, index, scale, disp) {
+  emit(72 + rex_of(reg, kept, base, index));
+  emit(op0);
+  if (op1 >= 0) {
+    emit(op1);
+  }
+  operand_tail(reg, kept, base, index, scale, disp);
+  return 0;
+}
+
+# An eight bit one: a prefix only where an operand asks for it.
+fn narrow(op0, op1, reg, kept, base, index, scale, disp) {
+  var rex = rex_of(reg, kept, base, index);
+  if (rex != 0) {
+    emit(64 + rex);
+  }
+  emit(op0);
+  if (op1 >= 0) {
+    emit(op1);
+  }
+  operand_tail(reg, kept, base, index, scale, disp);
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the instructions the backend asks for, and no more
+# ----------------------------------------------------------------------
+
+fn ld(d, s) {
+  return wide(139, 0 - 1, d, 0, s, 0 - 1, 1, 0);
+}
+
+fn ld_at(d, base, index, scale, disp) {
+  return wide(139, 0 - 1, d, 1, base, index, scale, disp);
+}
+
+fn st_at(base, index, scale, disp, s) {
+  return wide(137, 0 - 1, s, 1, base, index, scale, disp);
+}
+
+fn lea_at(d, base, index, scale, disp) {
+  return wide(141, 0 - 1, d, 1, base, index, scale, disp);
+}
+
+fn imm(d, v) {
+  var rex = 72;
+  if (d >= 8) {
+    rex = 73;
+  }
+  emit(rex);
+  emit(184 + (d % 8));
+  emit_wide(v, 8);
+  return 0;
+}
+
+fn ld_octet(d, base, index, scale, disp) {
+  return narrow(138, 0 - 1, d, 1, base, index, scale, disp);
+}
+
+fn st_octet(base, index, scale, disp, s) {
+  return narrow(136, 0 - 1, s, 1, base, index, scale, disp);
+}
+
+fn st_octet_imm(base, index, scale, disp, v) {
+  narrow(198, 0 - 1, 0, 1, base, index, scale, disp);
+  emit(v);
+  return 0;
+}
+
+fn cmp_octet_imm(base, index, scale, disp, v) {
+  narrow(128, 0 - 1, 7, 1, base, index, scale, disp);
+  emit(v);
+  return 0;
+}
+
+fn widen(d, s) {
+  return wide(15, 182, d, 0, s, 0 - 1, 1, 0);
+}
+
+fn push_reg(r) {
+  if (r >= 8) {
+    emit(65);
+  }
+  emit(80 + (r % 8));
+  return 0;
+}
+
+fn pop_reg(r) {
+  if (r >= 8) {
+    emit(65);
+  }
+  emit(88 + (r % 8));
+  return 0;
+}
+
+# add 3, or 11, and 35, sub 43, xor 51, cmp 59 - the direct forms.
+fn alu(op, d, s) {
+  return wide(op, 0 - 1, d, 0, s, 0 - 1, 1, 0);
+}
+
+# add 0, or 1, and 4, sub 5, xor 6, cmp 7 - the extensions.
+fn alu_imm(ext, d, v) {
+  wide(129, 0 - 1, ext, 0, d, 0 - 1, 1, 0);
+  emit_wide(v, 4);
+  return 0;
+}
+
+fn mul(d, s) {
+  return wide(15, 175, d, 0, s, 0 - 1, 1, 0);
+}
+
+fn mul_imm(d, s, v) {
+  wide(105, 0 - 1, d, 0, s, 0 - 1, 1, 0);
+  emit_wide(v, 4);
+  return 0;
+}
+
+fn idiv(r) {
+  return wide(247, 0 - 1, 7, 0, r, 0 - 1, 1, 0);
+}
+
+fn widen_to_pair() {
+  emit(72);
+  emit(153);
+  return 0;
+}
+
+fn neg(r) {
+  return wide(247, 0 - 1, 3, 0, r, 0 - 1, 1, 0);
+}
+
+fn inc(r) {
+  return wide(255, 0 - 1, 0, 0, r, 0 - 1, 1, 0);
+}
+
+fn dec(r) {
+  return wide(255, 0 - 1, 1, 0, r, 0 - 1, 1, 0);
+}
+
+fn tst(a, b) {
+  return wide(133, 0 - 1, a, 0, b, 0 - 1, 1, 0);
+}
+
+fn set_when(cc, r) {
+  return narrow(15, 144 + cc, 0, 0, r, 0 - 1, 1, 0);
+}
+
+fn go(id) {
+  emit(233);
+  where_to(id);
+  return 0;
+}
+
+fn go_when(cc, id) {
+  emit(15);
+  emit(128 + cc);
+  where_to(id);
+  return 0;
+}
+
+fn call_to(id) {
+  emit(232);
+  where_to(id);
+  return 0;
+}
+
+fn ret_now() {
+  emit(195);
+  return 0;
+}
+
+fn ask_the_world() {
+  emit(15);
+  emit(5);
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# where everything sits inside the space the loader zeroes
+# ----------------------------------------------------------------------
+
+fn align_up(value, boundary) {
+  return ((value + boundary - 1) / boundary) * boundary;
+}
 
 
-# The front end is shared: the same preprocessor, transducer, parser,
-# analyser, emitter, pass manager and assembler serve both backends, and
-# what differs is only what they are asked to write at the end of it.
+fn lea_label(d, id) {
+  var rex = 72;
+  if (d >= 8) {
+    rex = rex + 4;
+  }
+  emit(rex);
+  emit(141);
+  emit((d % 8) * 8 + 5);
+  where_to(id);
+  return 0;
+}
+'''
+
+ELF_WRITER_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# the smallest static executable that will run that text
+# ----------------------------------------------------------------------
+#
+# Two loadable segments and nothing else: the headers and the text, mapped
+# read-execute at the image base, and an anonymous read-write span the loader
+# zeroes, which is the whole of the program's data.
+
+fn put(b) {
+  putchar(octet_of(b));
+  return 0;
+}
+
+fn put_wide(v, count) {
+  var i = 0;
+  while (i < count) {
+    put(octet_of(v));
+    v = shift_octet(v);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn native_image(bss) {
+  var prologue = ELF_HEADER + SEGMENT_HEADER * SEGMENTS;
+  var loaded = prologue + textlen;
+  put(127);
+  put(69);
+  put(76);
+  put(70);
+  put(2);
+  put(1);
+  put(1);
+  put(0);
+  put(0);
+  put_wide(0, 7);
+  put_wide(2, 2);
+  put_wide(EM_X86_64, 2);
+  put_wide(1, 4);
+  put_wide(IMAGE_BASE + prologue, 8);
+  put_wide(ELF_HEADER, 8);
+  put_wide(0, 8);
+  put_wide(0, 4);
+  put_wide(ELF_HEADER, 2);
+  put_wide(SEGMENT_HEADER, 2);
+  put_wide(SEGMENTS, 2);
+  put_wide(64, 2);
+  put_wide(0, 2);
+  put_wide(0, 2);
+
+  put_wide(1, 4);
+  put_wide(5, 4);
+  put_wide(0, 8);
+  put_wide(IMAGE_BASE, 8);
+  put_wide(IMAGE_BASE, 8);
+  put_wide(loaded, 8);
+  put_wide(loaded, 8);
+  put_wide(PAGE_SIZE, 8);
+
+  put_wide(1, 4);
+  put_wide(6, 4);
+  put_wide(0, 8);
+  put_wide(DATA_BASE, 8);
+  put_wide(DATA_BASE, 8);
+  put_wide(0, 8);
+  put_wide(bss, 8);
+  put_wide(PAGE_SIZE, 8);
+
+  var i = 0;
+  while (i < textlen) {
+    put(mem[TEXT + i]);
+    i = i + 1;
+  }
+  return 0;
+}
+'''
+
+GSL2_NATIVE_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# what a value is, and where it lives
+# ----------------------------------------------------------------------
+#
+# A virtual register becomes a slot in the frame rather than a register, so
+# nothing above has to be told that machines have a fixed number of them.
+# The frame is the declared locals, then one slot for every virtual register
+# the function turns out to want, which is not known until the body has been
+# read - so the space it takes is written into the prologue afterwards.
+
+fn slot_disp(slot) {
+  return 0 - 8 * (slot + 1);
+}
+
+fn vreg_disp(r) {
+  return 0 - 8 * (FRAME + r + 1);
+}
+
+fn take(reg, r) {
+  return ld_at(reg, RBP, 0 - 1, 1, vreg_disp(r));
+}
+
+fn give(r, reg) {
+  return st_at(RBP, 0 - 1, 1, vreg_disp(r), reg);
+}
+
+fn patch32(site, value) {
+  var k = 0;
+  while (k < 4) {
+    mem[TEXT + site + k] = octet_of(value);
+    value = shift_octet(value);
+    k = k + 1;
+  }
+  return 0;
+}
+
+fn new_reg() {
+  regcnt = regcnt + 1;
+  if (regcnt >= 8192) {
+    fail("too many values at once in one function");
+  }
+  return regcnt - 1;
+}
+
+fn new_label() {
+  nblock = nblock + 1;
+  return L_BLOCK + nblock - 1;
+}
+
+# A function is known by its name whether it has been defined yet or not, so
+# the table is filled by whichever of the two comes first.
+fn fn_id(start, length) {
+  var i = 0;
+  while (i < nfn) {
+    if (mem[FNLEN + i] == length) {
+      var k = 0;
+      var same = 1;
+      while (k < length) {
+        if (mem[SRC + mem[FNSTART + i] + k] != mem[SRC + start + k]) {
+          same = 0;
+        }
+        k = k + 1;
+      }
+      if (same == 1) {
+        return L_FN + i;
+      }
+    }
+    i = i + 1;
+  }
+  if (nfn >= MAXFN) {
+    fail("too many functions");
+  }
+  mem[FNSTART + nfn] = start;
+  mem[FNLEN + nfn] = length;
+  nfn = nfn + 1;
+  return L_FN + nfn - 1;
+}
+
+# ----------------------------------------------------------------------
+# the interface the reader above calls
+# ----------------------------------------------------------------------
+
+fn emit_label(l) {
+  return lab(l);
+}
+
+fn emit_br(l) {
+  return go(l);
+}
+
+fn emit_cond_br(r, a, b) {
+  take(RAX, r);
+  tst(RAX, RAX);
+  go_when(CC_NE, a);
+  go(b);
+  return 0;
+}
+
+fn gen_const(v) {
+  var r = new_reg();
+  imm(RAX, v);
+  give(r, RAX);
+  return r;
+}
+
+fn gen_slot_addr(slot) {
+  var r = new_reg();
+  lea_at(RAX, RBP, 0 - 1, 1, slot_disp(slot));
+  give(r, RAX);
+  return r;
+}
+
+fn gen_mem_addr(index_reg) {
+  var r = new_reg();
+  take(RAX, index_reg);
+  imm(RCX, MEMORY_AT);
+  lea_at(RAX, RCX, RAX, 8, 0);
+  give(r, RAX);
+  return r;
+}
+
+fn gen_load(addr_reg) {
+  var r = new_reg();
+  take(RAX, addr_reg);
+  ld_at(RAX, RAX, 0 - 1, 1, 0);
+  give(r, RAX);
+  return r;
+}
+
+fn gen_store(value_reg, addr_reg) {
+  take(RAX, value_reg);
+  take(RCX, addr_reg);
+  st_at(RCX, 0 - 1, 1, 0, RAX);
+  return 0;
+}
+
+fn gen_store_const(value, addr_reg) {
+  imm(RAX, value);
+  take(RCX, addr_reg);
+  st_at(RCX, 0 - 1, 1, 0, RAX);
+  return 0;
+}
+
+fn gen_global_load(start, length) {
+  var r = new_reg();
+  imm(RCX, GLOBALS_AT + find_global(start, length) * 8);
+  ld_at(RAX, RCX, 0 - 1, 1, 0);
+  give(r, RAX);
+  return r;
+}
+
+fn gen_global_store(value_reg, start, length) {
+  take(RAX, value_reg);
+  imm(RCX, GLOBALS_AT + find_global(start, length) * 8);
+  st_at(RCX, 0 - 1, 1, 0, RAX);
+  return 0;
+}
+
+fn gen_binary(op, a, b) {
+  var r = new_reg();
+  take(RAX, a);
+  take(RCX, b);
+  if (op == T_PLUS) {
+    alu(3, RAX, RCX);
+  }
+  if (op == T_MINUS) {
+    alu(43, RAX, RCX);
+  }
+  if (op == T_STAR) {
+    mul(RAX, RCX);
+  }
+  if (op == T_SLASH) {
+    widen_to_pair();
+    idiv(RCX);
+  }
+  if (op == T_PERCENT) {
+    widen_to_pair();
+    idiv(RCX);
+    ld(RAX, RDX);
+  }
+  give(r, RAX);
+  return r;
+}
+
+fn condition_of(op) {
+  if (op == T_EQ) {
+    return CC_E;
+  }
+  if (op == T_NE) {
+    return CC_NE;
+  }
+  if (op == T_LT) {
+    return CC_L;
+  }
+  if (op == T_LE) {
+    return CC_LE;
+  }
+  if (op == T_GT) {
+    return CC_G;
+  }
+  return CC_GE;
+}
+
+fn gen_compare(op, a, b) {
+  var r = new_reg();
+  take(RAX, a);
+  take(RCX, b);
+  alu(59, RAX, RCX);
+  set_when(condition_of(op), RAX);
+  widen(RAX, RAX);
+  give(r, RAX);
+  return r;
+}
+
+fn gen_return(r) {
+  take(RAX, r);
+  emit(201);
+  ret_now();
+  return 0;
+}
+
+# The convention is this program's own, since the only things it calls are
+# itself and three routines written just below: the arguments go on the
+# stack, nearest first, and the caller takes them off again.
+fn gen_call(start, length, base, nargs) {
+  var i = nargs;
+  while (i > 0) {
+    i = i - 1;
+    take(RAX, mem[ARGS + base + i]);
+    push_reg(RAX);
+  }
+  call_to(fn_id(start, length));
+  if (nargs > 0) {
+    alu_imm(0, RSP, 8 * nargs);
+  }
+  var r = new_reg();
+  give(r, RAX);
+  return r;
+}
+
+fn gen_function_open(start, length, nparams) {
+  lab(fn_id(start, length));
+  if (kw_is(start, length, "main") == 1) {
+    lab(L_MAIN);
+  }
+  push_reg(RBP);
+  ld(RBP, RSP);
+  alu_imm(5, RSP, 0);
+  framesite = textlen - 4;
+  var i = 0;
+  while (i < nparams) {
+    ld_at(RAX, RBP, 0 - 1, 1, 16 + 8 * i);
+    st_at(RBP, 0 - 1, 1, slot_disp(i), RAX);
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn gen_function_close() {
+  imm(RAX, 0);
+  emit(201);
+  ret_now();
+  patch32(framesite, align_up(8 * (FRAME + regcnt + 1), 16));
+  return 0;
+}
+
+fn gen_global_decl(start, length, v, neg) {
+  if (neg == 1) {
+    v = 0 - v;
+  }
+  mem[GLBINIT + find_global(start, length)] = v;
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the three routines a program in this language asks the world for
+# ----------------------------------------------------------------------
+#
+# Nothing here is anybody else's code.  An octet does not leave on its own -
+# it waits in a buffer until there are enough of them to be worth a call, and
+# the last of them leave when the program does.
+
+fn runtime_putchar() {
+  lab(L_PUTCHAR);
+  push_reg(RCX);
+  push_reg(RDX);
+  push_reg(RSI);
+  push_reg(RDI);
+  imm(RDX, OUT_USED_AT);
+  ld_at(RCX, RDX, 0 - 1, 1, 0);
+  imm(RSI, OUT_AT);
+  st_octet(RSI, RCX, 1, 0, RAX);
+  inc(RCX);
+  st_at(RDX, 0 - 1, 1, 0, RCX);
+  alu_imm(7, RCX, OUT_SPAN);
+  go_when(CC_L, L_PUTCHAR_DONE);
+  call_to(L_FLUSH);
+  lab(L_PUTCHAR_DONE);
+  pop_reg(RDI);
+  pop_reg(RSI);
+  pop_reg(RDX);
+  pop_reg(RCX);
+  ret_now();
+  return 0;
+}
+
+fn runtime_flush() {
+  lab(L_FLUSH);
+  push_reg(RAX);
+  push_reg(RCX);
+  push_reg(RDX);
+  push_reg(RSI);
+  push_reg(RDI);
+  imm(RDX, OUT_USED_AT);
+  ld_at(RCX, RDX, 0 - 1, 1, 0);
+  tst(RCX, RCX);
+  go_when(CC_E, L_FLUSH_DONE);
+  ld(RDX, RCX);
+  imm(RAX, SYS_WRITE);
+  imm(RDI, 1);
+  imm(RSI, OUT_AT);
+  ask_the_world();
+  imm(RDX, OUT_USED_AT);
+  alu(51, RAX, RAX);
+  st_at(RDX, 0 - 1, 1, 0, RAX);
+  lab(L_FLUSH_DONE);
+  pop_reg(RDI);
+  pop_reg(RSI);
+  pop_reg(RDX);
+  pop_reg(RCX);
+  pop_reg(RAX);
+  ret_now();
+  return 0;
+}
+
+fn runtime_getchar() {
+  lab(L_GETCHAR);
+  push_reg(RCX);
+  push_reg(RDX);
+  push_reg(RSI);
+  push_reg(RDI);
+  imm(RCX, IN_TAKEN_AT);
+  ld_at(RDX, RCX, 0 - 1, 1, 0);
+  imm(RSI, IN_HELD_AT);
+  ld_at(RDI, RSI, 0 - 1, 1, 0);
+  alu(59, RDX, RDI);
+  go_when(CC_L, L_GETCHAR_TAKE);
+  lab(L_GETCHAR_FILL);
+  alu(51, RAX, RAX);
+  alu(51, RDI, RDI);
+  imm(RSI, IN_AT);
+  imm(RDX, IN_SPAN);
+  ask_the_world();
+  alu_imm(7, RAX, 0);
+  go_when(CC_LE, L_GETCHAR_ENDED);
+  imm(RSI, IN_HELD_AT);
+  st_at(RSI, 0 - 1, 1, 0, RAX);
+  imm(RCX, IN_TAKEN_AT);
+  alu(51, RDX, RDX);
+  st_at(RCX, 0 - 1, 1, 0, RDX);
+  lab(L_GETCHAR_TAKE);
+  imm(RSI, IN_AT);
+  alu(51, RAX, RAX);
+  ld_octet(RAX, RSI, RDX, 1, 0);
+  inc(RDX);
+  imm(RCX, IN_TAKEN_AT);
+  st_at(RCX, 0 - 1, 1, 0, RDX);
+  go(L_GETCHAR_DONE);
+  lab(L_GETCHAR_ENDED);
+  imm(RAX, 0 - 1);
+  lab(L_GETCHAR_DONE);
+  pop_reg(RDI);
+  pop_reg(RSI);
+  pop_reg(RDX);
+  pop_reg(RCX);
+  ret_now();
+  return 0;
+}
+
+fn runtime_quit() {
+  lab(L_QUIT);
+  push_reg(RAX);
+  call_to(L_FLUSH);
+  pop_reg(RDI);
+  imm(RAX, SYS_EXIT_GROUP);
+  ask_the_world();
+  return 0;
+}
+
+fn parse_call_builtin(kind, first_arg) {
+  if (kind == 1) {
+    take(RAX, first_arg);
+    call_to(L_PUTCHAR);
+    var r = new_reg();
+    give(r, RAX);
+    return r;
+  }
+  if (kind == 2) {
+    call_to(L_GETCHAR);
+    var r2 = new_reg();
+    give(r2, RAX);
+    return r2;
+  }
+  take(RAX, first_arg);
+  call_to(L_QUIT);
+  return gen_const(0);
+}
+
+# ----------------------------------------------------------------------
+# the two ends of the file
+# ----------------------------------------------------------------------
+
+fn emit_header() {
+  lab(L_START);
+  call_to(L_INIT);
+  call_to(L_MAIN);
+  call_to(L_FLUSH);
+  imm(RAX, SYS_EXIT_GROUP);
+  alu(51, RDI, RDI);
+  ask_the_world();
+  runtime_putchar();
+  runtime_flush();
+  runtime_getchar();
+  runtime_quit();
+  return 0;
+}
+
+fn emit_trailer() {
+  lab(L_INIT);
+  var i = 0;
+  while (i < nglobals) {
+    imm(RCX, GLOBALS_AT + i * 8);
+    imm(RAX, mem[GLBINIT + i]);
+    st_at(RCX, 0 - 1, 1, 0, RAX);
+    i = i + 1;
+  }
+  lea_label(RSI, L_STRDATA);
+  imm(RDI, MEMORY_AT + STRBASE * 8);
+  imm(RCX, strtop);
+  lab(L_COPY);
+  tst(RCX, RCX);
+  go_when(CC_E, L_COPY_DONE);
+  ld_at(RAX, RSI, 0 - 1, 1, 0);
+  st_at(RDI, 0 - 1, 1, 0, RAX);
+  alu_imm(0, RSI, 8);
+  alu_imm(0, RDI, 8);
+  dec(RCX);
+  go(L_COPY);
+  lab(L_COPY_DONE);
+  ret_now();
+
+  lab(L_STRDATA);
+  i = 0;
+  while (i < strtop) {
+    emit_wide(mem[STRBUF + i], 8);
+    i = i + 1;
+  }
+  if (textlen >= TEXT_LIMIT) {
+    fail("the program is longer than there is room for");
+  }
+  link_text();
+  native_image(BSS_SPAN);
+  return 0;
+}
+'''
+
 GSL_FRONT_END_GSL2: Final[str] = r'''# glyphc.gsl2 - the GSL front end, written in GSL-2.
 #
 # Reads a GSL program on stdin, writes LLVM IR on stdout.  Byte-identical to
@@ -9946,7 +10852,7 @@ fn main() {
 }
 '''
 
-GLYPHELF_TAIL_GSL2: Final[str] = r'''
+GLYPH_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
 # ----------------------------------------------------------------------
 # layer 18: the machine, without a toolchain under it either
 # ----------------------------------------------------------------------
@@ -9966,46 +10872,6 @@ var LBLOFF = 1730000;
 var FIXAT = 1800000;
 var FIXID = 1870000;
 
-var IMAGE_BASE = 4194304;
-var DATA_BASE = 6291456;
-var PAGE_SIZE = 4096;
-var EM_X86_64 = 62;
-var ELF_HEADER = 64;
-var SEGMENT_HEADER = 56;
-var SEGMENTS = 2;
-
-var SYS_WRITE = 1;
-var SYS_EXIT_GROUP = 231;
-
-var RAX = 0;
-var RCX = 1;
-var RDX = 2;
-var RBX = 3;
-var RSI = 6;
-var RDI = 7;
-var R8 = 8;
-var R9 = 9;
-var R10 = 10;
-var R11 = 11;
-var R12 = 12;
-var R13 = 13;
-var R14 = 14;
-var R15 = 15;
-
-# The conditions the backend asks for, by their place in the opcode.
-var CC_E = 4;
-var CC_NE = 5;
-var CC_L = 12;
-var CC_GE = 13;
-var CC_LE = 14;
-var CC_G = 15;
-var CC_S = 8;
-var CC_NS = 9;
-
-# Names for the places a branch can land.  Everything below the first free
-# one is a routine or a step inside one; an instruction at address i is
-# L_CODE + i, and anything a lowering needs for itself is handed out from
-# the top by next_label.
 var L_EXIT = 0;
 var L_PAINT = 1;
 var L_PAINT_DONE = 2;
@@ -10047,7 +10913,9 @@ var lay_snapshot = 0;
 var lay_frame = 0;
 var lay_output = 0;
 var lay_size = 0;
+'''
 
+GLYPH_NATIVE_TAIL_GSL2: Final[str] = r'''
 fn next_label() {
   spare = spare + 1;
   return spare - 1;
@@ -10056,306 +10924,6 @@ fn next_label() {
 # ----------------------------------------------------------------------
 # octets
 # ----------------------------------------------------------------------
-
-fn octet_of(v) {
-  var r = v % 256;
-  if (r < 0) {
-    r = r + 256;
-  }
-  return r;
-}
-
-# Division towards zero is not division towards the floor, and the octets of
-# a negative number are the floor's.
-fn shift_octet(v) {
-  if (v < 0) {
-    return (v - 255) / 256;
-  }
-  return v / 256;
-}
-
-fn emit(b) {
-  mem[TEXT + textlen] = octet_of(b);
-  textlen = textlen + 1;
-  return 0;
-}
-
-fn emit_wide(v, count) {
-  var i = 0;
-  while (i < count) {
-    emit(octet_of(v));
-    v = shift_octet(v);
-    i = i + 1;
-  }
-  return 0;
-}
-
-fn lab(id) {
-  mem[LBLOFF + id] = textlen;
-  return 0;
-}
-
-fn where_to(id) {
-  mem[FIXAT + nfix] = textlen;
-  mem[FIXID + nfix] = id;
-  nfix = nfix + 1;
-  emit_wide(0, 4);
-  return 0;
-}
-
-fn link_text() {
-  var i = 0;
-  while (i < nfix) {
-    var site = mem[FIXAT + i];
-    var rel = mem[LBLOFF + mem[FIXID + i]] - (site + 4);
-    var k = 0;
-    while (k < 4) {
-      mem[TEXT + site + k] = octet_of(rel);
-      rel = shift_octet(rel);
-      k = k + 1;
-    }
-    i = i + 1;
-  }
-  return 0;
-}
-
-# ----------------------------------------------------------------------
-# the shape of an operand
-# ----------------------------------------------------------------------
-#
-# An operand is a register when kept is zero, and base + index * scale +
-# displacement when it is one.  A register operand keeps its register in
-# base, which is what makes one pair of functions serve both.
-
-fn scale_bits(scale) {
-  if (scale == 1) {
-    return 0;
-  }
-  if (scale == 2) {
-    return 1;
-  }
-  if (scale == 4) {
-    return 2;
-  }
-  return 3;
-}
-
-fn rex_of(reg, kept, base, index) {
-  var rex = 0;
-  if (reg >= 8) {
-    rex = rex + 4;
-  }
-  if (base >= 8) {
-    rex = rex + 1;
-  }
-  if (kept == 1) {
-    if (index >= 8) {
-      rex = rex + 2;
-    }
-  }
-  return rex;
-}
-
-fn operand_tail(reg, kept, base, index, scale, disp) {
-  if (kept == 0) {
-    emit(192 + (reg % 8) * 8 + (base % 8));
-    return 0;
-  }
-  var slot = 4;
-  if (index >= 0) {
-    slot = index % 8;
-  }
-  emit(128 + (reg % 8) * 8 + 4);
-  emit(scale_bits(scale) * 64 + slot * 8 + (base % 8));
-  emit_wide(disp, 4);
-  return 0;
-}
-
-# A sixty-four bit operation: the wide prefix is always there.
-fn wide(op0, op1, reg, kept, base, index, scale, disp) {
-  emit(72 + rex_of(reg, kept, base, index));
-  emit(op0);
-  if (op1 >= 0) {
-    emit(op1);
-  }
-  operand_tail(reg, kept, base, index, scale, disp);
-  return 0;
-}
-
-# An eight bit one: a prefix only where an operand asks for it.
-fn narrow(op0, op1, reg, kept, base, index, scale, disp) {
-  var rex = rex_of(reg, kept, base, index);
-  if (rex != 0) {
-    emit(64 + rex);
-  }
-  emit(op0);
-  if (op1 >= 0) {
-    emit(op1);
-  }
-  operand_tail(reg, kept, base, index, scale, disp);
-  return 0;
-}
-
-# ----------------------------------------------------------------------
-# the instructions the backend asks for, and no more
-# ----------------------------------------------------------------------
-
-fn ld(d, s) {
-  return wide(139, 0 - 1, d, 0, s, 0 - 1, 1, 0);
-}
-
-fn ld_at(d, base, index, scale, disp) {
-  return wide(139, 0 - 1, d, 1, base, index, scale, disp);
-}
-
-fn st_at(base, index, scale, disp, s) {
-  return wide(137, 0 - 1, s, 1, base, index, scale, disp);
-}
-
-fn lea_at(d, base, index, scale, disp) {
-  return wide(141, 0 - 1, d, 1, base, index, scale, disp);
-}
-
-fn imm(d, v) {
-  var rex = 72;
-  if (d >= 8) {
-    rex = 73;
-  }
-  emit(rex);
-  emit(184 + (d % 8));
-  emit_wide(v, 8);
-  return 0;
-}
-
-fn ld_octet(d, base, index, scale, disp) {
-  return narrow(138, 0 - 1, d, 1, base, index, scale, disp);
-}
-
-fn st_octet(base, index, scale, disp, s) {
-  return narrow(136, 0 - 1, s, 1, base, index, scale, disp);
-}
-
-fn st_octet_imm(base, index, scale, disp, v) {
-  narrow(198, 0 - 1, 0, 1, base, index, scale, disp);
-  emit(v);
-  return 0;
-}
-
-fn cmp_octet_imm(base, index, scale, disp, v) {
-  narrow(128, 0 - 1, 7, 1, base, index, scale, disp);
-  emit(v);
-  return 0;
-}
-
-fn widen(d, s) {
-  return wide(15, 182, d, 0, s, 0 - 1, 1, 0);
-}
-
-fn push_reg(r) {
-  if (r >= 8) {
-    emit(65);
-  }
-  emit(80 + (r % 8));
-  return 0;
-}
-
-fn pop_reg(r) {
-  if (r >= 8) {
-    emit(65);
-  }
-  emit(88 + (r % 8));
-  return 0;
-}
-
-# add 3, or 11, and 35, sub 43, xor 51, cmp 59 - the direct forms.
-fn alu(op, d, s) {
-  return wide(op, 0 - 1, d, 0, s, 0 - 1, 1, 0);
-}
-
-# add 0, or 1, and 4, sub 5, xor 6, cmp 7 - the extensions.
-fn alu_imm(ext, d, v) {
-  wide(129, 0 - 1, ext, 0, d, 0 - 1, 1, 0);
-  emit_wide(v, 4);
-  return 0;
-}
-
-fn mul(d, s) {
-  return wide(15, 175, d, 0, s, 0 - 1, 1, 0);
-}
-
-fn mul_imm(d, s, v) {
-  wide(105, 0 - 1, d, 0, s, 0 - 1, 1, 0);
-  emit_wide(v, 4);
-  return 0;
-}
-
-fn idiv(r) {
-  return wide(247, 0 - 1, 7, 0, r, 0 - 1, 1, 0);
-}
-
-fn widen_to_pair() {
-  emit(72);
-  emit(153);
-  return 0;
-}
-
-fn neg(r) {
-  return wide(247, 0 - 1, 3, 0, r, 0 - 1, 1, 0);
-}
-
-fn inc(r) {
-  return wide(255, 0 - 1, 0, 0, r, 0 - 1, 1, 0);
-}
-
-fn dec(r) {
-  return wide(255, 0 - 1, 1, 0, r, 0 - 1, 1, 0);
-}
-
-fn tst(a, b) {
-  return wide(133, 0 - 1, a, 0, b, 0 - 1, 1, 0);
-}
-
-fn set_when(cc, r) {
-  return narrow(15, 144 + cc, 0, 0, r, 0 - 1, 1, 0);
-}
-
-fn go(id) {
-  emit(233);
-  where_to(id);
-  return 0;
-}
-
-fn go_when(cc, id) {
-  emit(15);
-  emit(128 + cc);
-  where_to(id);
-  return 0;
-}
-
-fn call_to(id) {
-  emit(232);
-  where_to(id);
-  return 0;
-}
-
-fn ret_now() {
-  emit(195);
-  return 0;
-}
-
-fn ask_the_world() {
-  emit(15);
-  emit(5);
-  return 0;
-}
-
-# ----------------------------------------------------------------------
-# where everything sits inside the space the loader zeroes
-# ----------------------------------------------------------------------
-
-fn align_up(value, boundary) {
-  return ((value + boundary - 1) / boundary) * boundary;
-}
 
 fn layout_build() {
   var cells = ORDER * ORDER;
@@ -10710,82 +11278,6 @@ fn native_encode() {
 }
 
 # ----------------------------------------------------------------------
-# the smallest static executable that will run that text
-# ----------------------------------------------------------------------
-#
-# Two loadable segments and nothing else: the headers and the text, mapped
-# read-execute at the image base, and an anonymous read-write span the loader
-# zeroes, which is the whole of the program's data.
-
-fn put(b) {
-  putchar(octet_of(b));
-  return 0;
-}
-
-fn put_wide(v, count) {
-  var i = 0;
-  while (i < count) {
-    put(octet_of(v));
-    v = shift_octet(v);
-    i = i + 1;
-  }
-  return 0;
-}
-
-fn native_image() {
-  var prologue = ELF_HEADER + SEGMENT_HEADER * SEGMENTS;
-  var loaded = prologue + textlen;
-  put(127);
-  put(69);
-  put(76);
-  put(70);
-  put(2);
-  put(1);
-  put(1);
-  put(0);
-  put(0);
-  put_wide(0, 7);
-  put_wide(2, 2);
-  put_wide(EM_X86_64, 2);
-  put_wide(1, 4);
-  put_wide(IMAGE_BASE + prologue, 8);
-  put_wide(ELF_HEADER, 8);
-  put_wide(0, 8);
-  put_wide(0, 4);
-  put_wide(ELF_HEADER, 2);
-  put_wide(SEGMENT_HEADER, 2);
-  put_wide(SEGMENTS, 2);
-  put_wide(64, 2);
-  put_wide(0, 2);
-  put_wide(0, 2);
-
-  put_wide(1, 4);
-  put_wide(5, 4);
-  put_wide(0, 8);
-  put_wide(IMAGE_BASE, 8);
-  put_wide(IMAGE_BASE, 8);
-  put_wide(loaded, 8);
-  put_wide(loaded, 8);
-  put_wide(PAGE_SIZE, 8);
-
-  put_wide(1, 4);
-  put_wide(6, 4);
-  put_wide(0, 8);
-  put_wide(DATA_BASE, 8);
-  put_wide(DATA_BASE, 8);
-  put_wide(0, 8);
-  put_wide(lay_size, 8);
-  put_wide(PAGE_SIZE, 8);
-
-  var i = 0;
-  while (i < textlen) {
-    put(mem[TEXT + i]);
-    i = i + 1;
-  }
-  return 0;
-}
-
-# ----------------------------------------------------------------------
 # the driver
 # ----------------------------------------------------------------------
 
@@ -10798,13 +11290,138 @@ fn main() {
   assemble();
   group_build();
   native_encode();
-  native_image();
+  native_image(lay_size);
   return 0;
 }
 '''
 
+GSLC_GSL2: Final[str] = GSL2_LANGUAGE_GSL2 + GSL2_IR_TAIL_GSL2
+GSLCELF_GSL2: Final[str] = (
+    GSL2_LANGUAGE_GSL2 + GSL2_NATIVE_ADDRESSES_GSL2 + X86_ENCODER_GSL2
+    + ELF_WRITER_GSL2 + GSL2_NATIVE_TAIL_GSL2
+)
 GLYPHC_GSL2: Final[str] = GSL_FRONT_END_GSL2 + GLYPHC_TAIL_GSL2
-GLYPHELF_GSL2: Final[str] = GSL_FRONT_END_GSL2 + GLYPHELF_TAIL_GSL2
+GLYPHELF_GSL2: Final[str] = (
+    GSL_FRONT_END_GSL2 + GLYPH_NATIVE_ADDRESSES_GSL2 + X86_ENCODER_GSL2
+    + ELF_WRITER_GSL2 + GLYPH_NATIVE_TAIL_GSL2
+)
+
+
+GLYPH_GSL2: Final[str] = r'''# The canonical glyph, expressed in GSL-2.
+# Reads an optional odd lattice order from stdin; defaults to 7.
+# Two canonical strokes are emitted, then closed under the cyclic group C4.
+
+var order = 7;
+var apothem = 3;
+
+fn cell(row, col) {
+  return row * order + col;
+}
+
+fn emit_run(index, lo, hi, orient) {
+  var cursor = lo;
+  while (cursor <= hi) {
+    if (orient == 0) {
+      mem[cell(index, cursor)] = 1;
+    } else {
+      mem[cell(cursor, index)] = 1;
+    }
+    cursor = cursor + 1;
+  }
+  return 0;
+}
+
+fn close_group(passes) {
+  var pass = 0;
+  while (pass < passes) {
+    var row = 0;
+    while (row < order) {
+      var col = 0;
+      while (col < order) {
+        if (mem[cell(row, col)] != 0) {
+          mem[cell(col, 2 * apothem - row)] = 1;
+        }
+        col = col + 1;
+      }
+      row = row + 1;
+    }
+    pass = pass + 1;
+  }
+  return 0;
+}
+
+fn render() {
+  var row = 0;
+  while (row < order) {
+    var last = 0 - 1;
+    var col = 0;
+    while (col < order) {
+      if (mem[cell(row, col)] != 0) {
+        last = col;
+      }
+      col = col + 1;
+    }
+    col = 0;
+    while (col <= last) {
+      if (col > 0) {
+        putchar(' ');
+      }
+      if (mem[cell(row, col)] != 0) {
+        putchar('*');
+      } else {
+        putchar(' ');
+      }
+      col = col + 1;
+    }
+    putchar('\n');
+    row = row + 1;
+  }
+  return 0;
+}
+
+fn read_order() {
+  var value = 0;
+  var seen = 0;
+  var c = getchar();
+  while (c >= '0' && c <= '9') {
+    value = value * 10 + c - '0';
+    seen = 1;
+    c = getchar();
+  }
+  if (seen == 0) {
+    return 7;
+  }
+  return value;
+}
+
+fn main() {
+  order = read_order();
+  if (order < 3 || order % 2 == 0) {
+    return 2;
+  }
+  apothem = order / 2;
+  emit_run(apothem, 0, order - 1, 1);
+  emit_run(0, apothem + 1, order - 1, 0);
+  close_group(3);
+  render();
+  return 0;
+}
+'''
+
+# ----------------------------------------------------------------------
+# tier 4: the front end, written in the language tier 3 compiles
+# ----------------------------------------------------------------------
+#
+# Everything above is a circle with one end loose: tiers 1 and 2 are
+# Python, tier 3 is native but only compiles itself.  glyphc.gsl2 joins
+# the ends.  It is the whole of tier 1 - preprocessor, transducer, parser,
+# analyser, pass manager, assembler - and the tier 2 lowering after it,
+# written a second time in GSL-2 and compiled by the self-hosted compiler
+# above.  The claim it makes is not that it agrees but that it is the
+# same compiler: for any program either accepts, both emit the same bytes.
+
+
+
 
 _S0_OUT: list[str] = []
 _S0_SOURCE: str = ""
@@ -12122,6 +12739,83 @@ def build_front_ends(directory: Path, opt_level: int = 2) -> tuple[Path, str, Pa
         link_executable(glyphc_ir, directory / "glyphc", opt_level),
         glyphc_ir,
         link_executable(glyphelf_ir, directory / "glyphelf", opt_level),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ToolchainReport:
+    """What came out of building the compiler with nothing but itself."""
+
+    workdir: Path
+    seeded: int
+    stages: tuple[tuple[int, str], ...]
+    front_end: int
+    program: int
+    glyph: str
+    expected: str
+
+    @property
+    def fixed(self) -> bool:
+        """Whether the compiler, built by itself, is the same octets twice."""
+        return len({digest for _, digest in self.stages}) == 1
+
+    @property
+    def clean(self) -> bool:
+        return self.fixed and self.glyph == self.expected
+
+
+def _compile_with(compiler: Path, source: str, destination: Path) -> Path:
+    """Runs a compiler that answers with a program, and makes it runnable."""
+    destination.write_bytes(_run_octets(compiler, source))
+    destination.chmod(0o755)
+    return destination
+
+
+def close_the_toolchain(
+    workdir: Path | None = None,
+    opt_level: int = 2,
+    order: int = DEFAULT_LATTICE_ORDER,
+    motif: str = DEFAULT_MOTIF,
+) -> ToolchainReport:
+    """Takes the toolchain out of the chain, and then checks it is out.
+
+    The seed turns the crank once and everything after it is this language
+    compiling itself into machine code: the compiler builds itself, that one
+    builds itself again, and the two are compared octet for octet.  Then the
+    compiler that came out of it builds the front end, and the front end
+    writes the program, and the program is run.  Nothing after the first turn
+    was assembled, optimised or linked by anybody else.
+    """
+    directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-toolchain-"))
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "gslcelf.gsl2").write_text(GSLCELF_GSL2)
+    (directory / "glyphelf.gsl2").write_text(GLYPHELF_GSL2)
+
+    seeded = link_executable(
+        gsl2_compile(GSLCELF_GSL2), directory / "seeded", opt_level
+    )
+    stages: list[Path] = []
+    previous = seeded
+    for turn in range(3):
+        previous = _compile_with(
+            previous, GSLCELF_GSL2, directory / f"gslcelf{turn + 1}"
+        )
+        stages.append(previous)
+
+    front_end = _compile_with(stages[-1], GLYPHELF_GSL2, directory / "glyphelf")
+    source = typing.cast(type, Motif.lookup(motif))().source(order)
+    program = _compile_with(front_end, source, directory / "glyph")
+    return ToolchainReport(
+        workdir=directory,
+        seeded=seeded.stat().st_size,
+        stages=tuple(
+            (stage.stat().st_size, reference_digest(stage.read_bytes().hex()))
+            for stage in stages
+        ),
+        front_end=front_end.stat().st_size,
+        program=program.stat().st_size,
+        glyph=_run(program, "").removesuffix("\n"),
+        expected=synthesize_source(source).unwrap_or_raise().rendering,
     )
 
 
@@ -16658,6 +17352,31 @@ def _emit_bootstrap_report(report: BootstrapReport) -> int:
     return 0 if (report.seed_agrees and report.fixpoint) else 1
 
 
+def _emit_toolchain_report(report: ToolchainReport) -> int:
+    rule = "-" * 60
+    print(rule)
+    def line(step: str, said: str, span: int) -> None:
+        print(f"  {step:<24}{said:<36}{span:>7} octets")
+
+    line("python3   ->  gslcelf", "the seed turns the crank once", report.seeded)
+    for turn, (span, _) in enumerate(report.stages):
+        line("gslcelf   ->  gslcelf",
+             "and from here it builds itself" if turn == 0 else "and again", span)
+    line("gslcelf   ->  glyphelf", "it builds the front end", report.front_end)
+    line("glyphelf  ->  glyph", "and the front end writes a program",
+         report.program)
+    print(rule)
+    fixed = "[ok]  " if report.fixed else "[FAIL]"
+    renders = "[ok]  " if report.glyph == report.expected else "[FAIL]"
+    print(f"  {fixed} the compiler it built is the compiler that built it")
+    print(f"  {renders} and what came out at the end prints this:")
+    print(rule)
+    print(report.glyph)
+    print(rule)
+    print(f"artifacts in {report.workdir}")
+    return 0 if report.clean else 1
+
+
 def _emit_loop_report(report: LoopReport) -> int:
     rule = "-" * 60
     print(rule)
@@ -16764,7 +17483,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot.add_argument("--bootstrap", action="store_true")
     boot.add_argument("--workdir", metavar="DIR")
     boot.add_argument("--emit-gsl2",
-                      choices=("gslc", "glyph", "glyphc", "glyphelf"))
+                      choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf"))
+    boot.add_argument("--close-the-toolchain", action="store_true",
+                      help="build the compiler with itself, and nothing else")
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
 
@@ -16869,6 +17590,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(
             {
                 "gslc": GSLC_GSL2,
+                "gslcelf": GSLCELF_GSL2,
                 "glyph": GLYPH_GSL2,
                 "glyphc": GLYPHC_GSL2,
                 "glyphelf": GLYPHELF_GSL2,
@@ -16892,6 +17614,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit_bootstrap_report(bootstrap(workdir, namespace.opt_level or 2))
         except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
             print(f"bootstrap unavailable: {exc}", file=sys.stderr)
+            return 3
+    if namespace.close_the_toolchain:
+        try:
+            workdir = Path(namespace.workdir) if namespace.workdir else None
+            return _emit_toolchain_report(
+                close_the_toolchain(workdir, namespace.opt_level or 2)
+            )
+        except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
+            print(f"the toolchain cannot be closed here: {exc}", file=sys.stderr)
             return 3
     if namespace.close_the_loop:
         try:

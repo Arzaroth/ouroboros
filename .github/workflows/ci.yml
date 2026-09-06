@@ -258,6 +258,9 @@ jobs:
       - name: the GSL-2 front end agrees with layer 16, byte for byte
         run: python ouroboros.py --close-the-loop
 
+      - name: and the compiler builds itself with nothing else under it
+        run: python ouroboros.py --close-the-toolchain
+
       - name: 120 random programs across every tier there is
         run: |
           python ouroboros.py --fuzz 120 --fuzz-seed ${{ github.run_number }} \
