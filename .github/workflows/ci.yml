@@ -39,17 +39,8 @@ jobs:
       - name: every name resolves and no loop closes over what it will rebind
         run: ruff check --isolated --select E4,E7,E9,F,B ouroboros.py
 
-      # Three rules are set aside, and all three are the same complaint: the
-      # front end hands back the abstract node and every reader of it knows
-      # which one it really is.  Narrowing that is a change to layers 5 to 7
-      # and not to a workflow, so it is written down here rather than hidden
-      # in a config file or waved through with a suppression per line.
       - name: and what it says about itself holds together
-        run: |
-          ty check ouroboros.py \
-            --ignore unresolved-attribute \
-            --ignore too-many-positional-arguments \
-            --ignore invalid-argument-type
+        run: ty check ouroboros.py
 
   bare:
     name: python ${{ matrix.python }}, nothing installed

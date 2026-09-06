@@ -241,18 +241,19 @@ class Sentinel:
     """Interned, falsey, self-describing marker objects."""
 
     _interned: ClassVar[MutableMapping[str, "Sentinel"]] = {}
+    _name: str
 
     def __new__(cls, name: str) -> "Sentinel":
         existing = cls._interned.get(name)
         if existing is not None:
             return existing
         instance = super().__new__(cls)
-        instance._name = name  # type: ignore[attr-defined]
+        instance._name = name
         cls._interned[name] = instance
         return instance
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
-        return f"<{self._name}>"  # type: ignore[attr-defined]
+        return f"<{self._name}>"
 
     def __bool__(self) -> bool:
         return False
@@ -2059,9 +2060,16 @@ class AstVisitor(Generic[_T], abc.ABC):
 
 
 class AstNode(abc.ABC):
-    """Base class of every syntax tree node."""
+    """Base class of every syntax tree node.
+
+    Every node carries where it came from.  That was true of all of them
+    except the root before it was written down here, and the readers below
+    were reaching for it on nodes typed as this one, which nothing checked.
+    """
 
     __slots__ = ()
+
+    position: SourcePosition
 
     @abc.abstractmethod
     def accept(self, visitor: AstVisitor[_T]) -> _T: ...
@@ -2092,6 +2100,21 @@ class AstNode(abc.ABC):
         lines = ["  " * depth + f"{type(self).__name__} {annotation}".rstrip()]
         lines.extend(child.render(depth + 1) for child in self.children)
         return "\n".join(lines)
+
+
+def expect_node(node: AstNode, kind: type[_NodeT]) -> _NodeT:
+    """The node a table said would be here, or a refusal naming both.
+
+    The tables that drive the parser, the analyser and the lowering pair a
+    code with the shape of node it applies to, and nothing but the table says
+    which.  Asking for the shape makes that pairing something checked here
+    rather than something the next attribute access finds out.
+    """
+    if not isinstance(node, kind):
+        raise SemanticError(
+            f"expected {kind.__name__} here, found {type(node).__name__}"
+        )
+    return node
 
 
 @dataclass(frozen=True, slots=True)
@@ -2219,6 +2242,7 @@ class Program(AstNode):
     lattice: LatticeDeclaration
     symmetry: SymmetryDeclaration
     body: tuple[AstNode, ...]
+    position: SourcePosition
 
     def accept(self, visitor: AstVisitor[_T]) -> _T:
         return visitor.visit_program(self)
@@ -2391,11 +2415,13 @@ class RecursiveDescentParser:
     @woven
     def parse(self) -> Program:
         with TRACER.span("parse"):
-            lattice = self._parse_form("lattice")
-            symmetry = self._parse_form("symmetry")
+            lattice = expect_node(self._parse_form("lattice"), LatticeDeclaration)
+            symmetry = expect_node(
+                self._parse_form("symmetry"), SymmetryDeclaration
+            )
             body = self._parse_body(terminator=TokenKind.END_OF_INPUT)
             self._stream.expect(TokenKind.END_OF_INPUT)
-            return Program(lattice, symmetry, body)
+            return Program(lattice, symmetry, body, lattice.position)
 
     def _member(self, names: Sequence[str], token: Token) -> enum.Enum:
         try:
@@ -2820,42 +2846,51 @@ class SemanticAnalyzer(AstVisitor[TypeTerm]):
                     for name in INTRINSIC_NAMES:
                         self._scope.declare(Symbol(name, SymbolKind.INTRINSIC, INT_TYPE))
                 elif code == "order":
-                    order = ConstantEvaluator({}).visit(node.order)
+                    lattice = expect_node(node, LatticeDeclaration)
+                    order = ConstantEvaluator({}).visit(lattice.order)
                     if order <= 0 or order % 2 == 0:
                         self._diagnostics.emit(
                             Severity.FATAL, "SE0003", "diag.bad_order",
-                            node.position, order=order,
+                            lattice.position, order=order,
                         )
                         raise SemanticError(
-                            f"{node.position}: illegal lattice order {order}"
+                            f"{lattice.position}: illegal lattice order {order}"
                         )
                     self._model.order = order
                 elif code == "cardinality":
-                    if node.cardinality != 4:
+                    symmetry = expect_node(node, SymmetryDeclaration)
+                    if symmetry.cardinality != 4:
                         raise SemanticError(
-                            f"{node.position}: this platform only implements 4-fold "
-                            f"symmetry, got {node.cardinality}"
+                            f"{symmetry.position}: this platform only implements "
+                            f"4-fold symmetry, got {symmetry.cardinality}"
                         )
-                    self._model.family = node.family
-                    self._model.cardinality = node.cardinality
+                    self._model.family = symmetry.family
+                    self._model.cardinality = symmetry.cardinality
                 elif code == "strokes":
+                    stroke = expect_node(node, StrokeDeclaration)
                     self._scope.declare(
-                        Symbol(node.name, SymbolKind.STROKE, STROKE_TYPE, run=node.run),
-                        node.position,
+                        Symbol(
+                            stroke.name, SymbolKind.STROKE, STROKE_TYPE, run=stroke.run
+                        ),
+                        stroke.position,
                     )
-                    self._model.strokes[node.name] = node.run
+                    self._model.strokes[stroke.name] = stroke.run
                 elif code == "use":
-                    resolved = self._scope.resolve(node.name, node.position)
+                    named = expect_node(node, Emission)
+                    resolved = self._scope.resolve(named.name, named.position)
                     if resolved.kind is not SymbolKind[arguments[0]]:
                         raise SemanticError(
-                            f"{node.position}: {node.name!r} is not a stroke"
+                            f"{named.position}: {named.name!r} is not a stroke"
                         )
                     self._model.resolutions[id(node)] = resolved
                 elif code == "deny":
-                    resolved = self._scope.resolve(node.name, node.position)
+                    reference = expect_node(node, SymbolReference)
+                    resolved = self._scope.resolve(
+                        reference.name, reference.position
+                    )
                     if resolved.kind is SymbolKind[arguments[0]]:
                         raise SemanticError(
-                            f"{node.position}: strokes are not first-class values"
+                            f"{reference.position}: strokes are not first-class values"
                         )
                     self._model.resolutions[id(node)] = resolved
                 elif code == "answer":
@@ -3169,7 +3204,7 @@ class BytecodeEmitter(AstVisitor[None]):
         return Label(f".{stem}{next(self._labels)}")
 
     @staticmethod
-    def _instruction(name: str) -> type[Instruction]:
+    def _instruction(name: str) -> Callable[..., Instruction]:
         try:
             return INSTRUCTION_BY_NAME[name]
         except KeyError as exc:
@@ -3214,14 +3249,15 @@ class BytecodeEmitter(AstVisitor[None]):
                 )
                 self._emit(self._instruction(head)(getattr(symbol, attribute)))
             elif code == "lowered":
-                resolved = self._model.resolutions.get(id(node))
+                emission = expect_node(node, Emission)
+                resolved = self._model.resolutions.get(id(emission))
                 run = (
                     resolved.run if resolved is not None
-                    else self._model.strokes.get(node.name)
+                    else self._model.strokes.get(emission.name)
                 )
                 if run is None:  # pragma: no cover - defensive
                     raise CodeGenerationError(
-                        f"stroke {node.name!r} has no lowered definition"
+                        f"stroke {emission.name!r} has no lowered definition"
                     )
                 self.visit(run)
             else:  # pragma: no cover - defensive
@@ -3792,16 +3828,19 @@ class ObjectCodec:
             if cls is None:
                 raise ObjectFormatError(f"unknown opcode 0x{op:02X}")
             kind = cls.operand_kind
+            # How many operands the constructor takes is the opcode's business
+            # and not this name's, which is what the cast says.
+            make = typing.cast(Callable[..., Instruction], cls)
             if kind is OperandKind.NONE:
-                instructions.append(cls())  # type: ignore[call-arg]
+                instructions.append(make())
             elif kind is OperandKind.CONSTANT:
-                instructions.append(cls(constants[argument]))  # type: ignore[call-arg]
+                instructions.append(make(constants[argument]))
             elif kind is OperandKind.NAME:
                 raw = names[argument]
                 value = Orientation(raw) if cls is EmitOrientedRun else raw
-                instructions.append(cls(value))  # type: ignore[call-arg]
+                instructions.append(make(value))
             else:
-                instructions.append(cls(argument))  # type: ignore[call-arg]
+                instructions.append(make(argument))
         return ObjectModule(
             order, list(SymmetryFamily)[family_index], cardinality, frame_size, tuple(instructions)
         )
@@ -5828,6 +5867,11 @@ class _VirtualRegisterAllocator:
         return f"%{self._prefix}{next(self._counter)}"
 
 
+LLVM_ARITHMETIC: Final[Mapping[type[Instruction], str]] = {
+    BinaryAdd: "add nsw", BinarySubtract: "sub nsw", BinaryMultiply: "mul nsw",
+}
+
+
 class LlvmLoweringBackend:
     """Translates a linked object module into an LLVM IR translation unit.
 
@@ -6029,11 +6073,7 @@ class LlvmLoweringBackend:
                 address_register = self._frame_slot(body, registers, slot, frame)
                 body.append(f"  store i64 {value}, ptr {address_register}, align 8")
             case BinaryAdd() | BinarySubtract() | BinaryMultiply():
-                mnemonic = {
-                    BinaryAdd: "add nsw",
-                    BinarySubtract: "sub nsw",
-                    BinaryMultiply: "mul nsw",
-                }[type(instruction)]
+                mnemonic = LLVM_ARITHMETIC[type(instruction)]
                 right = self._pop(body, registers)
                 left = self._pop(body, registers)
                 result = registers.fresh()
@@ -19395,6 +19435,11 @@ def run_arm_boot(image: bytes, lines: int, patience: float = 20.0) -> str:
             machine.wait()
 
 
+RISCV_ARITHMETIC: Final[Mapping[type[Instruction], str]] = {
+    BinaryAdd: "add", BinarySubtract: "sub", BinaryMultiply: "mul",
+}
+
+
 class Riscv64CodeBackend:
     """Encodes a linked object module as riscv64 machine code.
 
@@ -19526,12 +19571,7 @@ class Riscv64CodeBackend:
             case BinaryAdd() | BinarySubtract() | BinaryMultiply():
                 text.pop(A1)
                 text.pop(A0)
-                text.arithmetic(
-                    {BinaryAdd: "add", BinarySubtract: "sub", BinaryMultiply: "mul"}[
-                        type(instruction)
-                    ],
-                    A0, A0, A1,
-                )
+                text.arithmetic(RISCV_ARITHMETIC[type(instruction)], A0, A0, A1)
                 text.push(A0)
             case BinaryDivide():
                 self._floor_divide(text, address)
