@@ -101,6 +101,9 @@ jobs:
           python ouroboros.py --fuzz-refusals 100 \
             --fuzz-seed ${{ github.run_number }}
 
+      - name: a program grown until every backend says no, and no other answer
+        run: python ouroboros.py --fuzz-limits
+
       - name: the compiler builds itself, and nothing here could have helped
         run: python ouroboros.py --close-the-toolchain
 

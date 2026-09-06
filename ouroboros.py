@@ -97,6 +97,7 @@
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --explain wasm   say what every instruction of it is
     python3 ouroboros.py --trace-machine  and what each one of them did
+    python3 ouroboros.py --fuzz-limits   grow a program until a backend says no
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -6633,6 +6634,224 @@ def _refusal_there(front_end: Path, source: str) -> tuple[str | None, int]:
         done.stdout.decode(errors="replace").strip() or "(said nothing)",
         done.returncode,
     )
+
+
+# ----------------------------------------------------------------------
+# layer 17c: the half of the claim that is about the edges
+# ----------------------------------------------------------------------
+#
+# The generator writes ordinary programs, so everything above only ever asks
+# the backends what they do in the middle of their range.  What they do at the
+# end of it is where this file has been wrong before: a displacement that was
+# truncated rather than refused, a text past a limit nobody checked, a program
+# too large for a machine that hung instead of being told no.
+#
+# So: take one program and grow it along a dimension until every backend has
+# had enough, and ask at each size for one of exactly two answers.  Either it
+# wrote something, and what it wrote survives being read back and written
+# again, or it refused, and the refusal is one of this file's own with
+# something to say.  A traceback is neither, and that is the finding.
+
+
+LIMIT_HEAD: Final[str] = (
+    "#pragma gsl 2\nlattice order 7 ;\nsymmetry cyclic 4 about centroid ;\n"
+)
+LIMIT_TAIL: Final[str] = "stroke s0 = column at 3 span 0 .. 6 ;\nemit s0 ;\n"
+
+
+def _many_statements(size: int) -> str:
+    return LIMIT_HEAD + "".join(
+        f"paint row at {i % 7} span 0 .. 6 ;\n" for i in range(size)
+    )
+
+
+def _deep_expression(size: int) -> str:
+    inner = "3"
+    for _ in range(size):
+        inner = f"( {inner} + 1 )"
+    return LIMIT_HEAD + f"let v = {inner} ;\n" + LIMIT_TAIL
+
+
+def _wide_literal(size: int) -> str:
+    return LIMIT_HEAD + f"let v = {(1 << size) - 1} ;\n" + LIMIT_TAIL
+
+
+def _many_bindings(size: int) -> str:
+    body = "".join(f"let v{i} = ( {i} + 1 ) ;\n" for i in range(size))
+    return LIMIT_HEAD + body + LIMIT_TAIL
+
+
+def _wide_lattice(size: int) -> str:
+    """An order is odd or it is not an order, so the ladder is made odd here."""
+    order = size | 1
+    return (
+        f"#pragma gsl 2\nlattice order {order} ;\n"
+        "symmetry cyclic 4 about centroid ;\n"
+        f"stroke s0 = column at {order // 2} span 0 .. {order - 1} ;\nemit s0 ;\n"
+    )
+
+
+# Each dimension with the size past which growing it says nothing new.  They
+# are not the same number because they do not cost the same: a lattice is
+# quadratic in its order, and a literal has run out of container long before
+# any of the others has started.
+LIMIT_DIMENSIONS: Final[Mapping[str, tuple[Callable[[int], str], int]]] = {
+    "statements": (_many_statements, 1 << 14),
+    "nesting": (_deep_expression, 1 << 11),
+    "literal": (_wide_literal, 1 << 8),
+    "bindings": (_many_bindings, 1 << 13),
+    "lattice": (_wide_lattice, 1 << 9),
+}
+
+
+def _limit_backends() -> Mapping[str, Callable[[ObjectModule], bytes]]:
+    """Everything that turns a module into octets, and nothing that runs them."""
+    backends: dict[str, Callable[[ObjectModule], bytes]] = {
+        name: functools.partial(machine_code, architecture=name) for name in MACHINES
+    }
+    backends["wasm"] = wasm_module
+    backends["boot"] = boot_image
+    backends["kernel"] = kernel_image
+    backends["efi"] = efi_image
+    return backends
+
+
+def _limit_survives(name: str, blob: bytes) -> str | None:
+    """What is wrong with what a backend wrote, if anything.
+
+    Only the machines can be asked this, since only they have a narrator, but
+    they are the ones where a displacement that quietly wrapped would show:
+    either the octets come back different, or they stop being readable at all,
+    and both of those are the same finding.
+    """
+    if name not in MACHINES:
+        return None
+    prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
+    try:
+        again = reassemble_machine_code(blob, name)
+    except GlyphPlatformError as exc:
+        return f"what it wrote cannot be read back: {exc}"
+    if again != blob[prologue:]:
+        return "what it wrote does not say what it is"
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class LimitCase:
+    """One program pressed against one backend, and which of the two it did."""
+
+    dimension: str
+    size: int
+    backend: str
+    verdict: str
+    detail: str
+
+    @property
+    def clean(self) -> bool:
+        return self.verdict in ("wrote", "refused")
+
+
+@dataclass(frozen=True, slots=True)
+class LimitReport:
+    """Whether every edge any backend has is an edge it says it has."""
+
+    cases: tuple[LimitCase, ...]
+
+    @property
+    def considered(self) -> int:
+        return len(self.cases)
+
+    @property
+    def refused(self) -> int:
+        return sum(1 for case in self.cases if case.verdict == "refused")
+
+    @property
+    def wrote(self) -> int:
+        return sum(1 for case in self.cases if case.verdict == "wrote")
+
+    @property
+    def findings(self) -> tuple[LimitCase, ...]:
+        return tuple(case for case in self.cases if not case.clean)
+
+    @property
+    def clean(self) -> bool:
+        return not self.findings
+
+    def render(self) -> str:
+        edges = sorted({
+            (case.dimension, case.backend, case.size)
+            for case in self.cases if case.verdict == "refused"
+        })
+        lines = [
+            f"{self.considered} case(s): {self.wrote} written, "
+            f"{self.refused} refused, {len(self.findings)} neither"
+        ]
+        for dimension, backend, size in edges:
+            lines.append(f"  [edge] {backend} says no to {dimension} at {size}")
+        for case in self.findings[:8]:
+            lines.append(
+                f"  [FAIL] {case.backend} on {case.dimension} at {case.size}: "
+                f"{case.verdict}: {case.detail}"
+            )
+        lines.append(
+            "  [ok]   every edge is a refusal with something to say"
+            if self.clean else
+            "  [FAIL] a backend did something other than write or say no"
+        )
+        return "\n".join(lines)
+
+
+def fuzz_limits(
+    ceiling: int | None = None, dimensions: Sequence[str] | None = None
+) -> LimitReport:
+    """Grows one program along each dimension until every backend has had enough.
+
+    The ladder doubles, so a dimension costs a dozen tries rather than a
+    thousand, and a dimension stops as soon as nothing is left that will still
+    write something.
+    """
+    cases: list[LimitCase] = []
+    backends = _limit_backends()
+    for dimension in (dimensions or tuple(LIMIT_DIMENSIONS)):
+        make, far = LIMIT_DIMENSIONS[dimension]
+        if ceiling is not None:
+            far = min(far, ceiling)
+        standing = set(backends)
+        size = 1
+        while size <= far and standing:
+            source = make(size)
+            try:
+                module = synthesize_source(source).unwrap_or_raise().module
+            except GlyphPlatformError as exc:
+                cases.append(LimitCase(
+                    dimension, size, "front end", "refused", str(exc)[:120]
+                ))
+                break
+            except Exception as exc:  # noqa: BLE001 - the finding is the type
+                cases.append(LimitCase(
+                    dimension, size, "front end", type(exc).__name__, str(exc)[:120]
+                ))
+                break
+            for name in sorted(standing):
+                try:
+                    blob = backends[name](module)
+                except GlyphPlatformError as exc:
+                    cases.append(LimitCase(dimension, size, name, "refused", str(exc)[:120]))
+                    standing.discard(name)
+                    continue
+                except Exception as exc:  # noqa: BLE001 - the finding is the type
+                    cases.append(LimitCase(
+                        dimension, size, name, type(exc).__name__, str(exc)[:120]
+                    ))
+                    standing.discard(name)
+                    continue
+                wrong = _limit_survives(name, blob)
+                cases.append(LimitCase(
+                    dimension, size, name, "corrupt" if wrong else "wrote",
+                    wrong or f"{len(blob)} octets",
+                ))
+            size *= 2
+    return LimitReport(tuple(cases))
 
 
 def fuzz_refusals(iterations: int = 100, seed: int = 0) -> RefusalReport:
@@ -24241,6 +24460,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          help="keep what is found here, and re-check it first")
     fuzzing.add_argument("--fuzz-refusals", type=int, metavar="N",
                          help="break N programs and check both front ends refuse")
+    fuzzing.add_argument("--fuzz-limits", nargs="?", type=int, const=0,
+                         metavar="CEILING",
+                         help="grow a program until every backend says no, and "
+                              "check that saying no is what they do")
     fuzzing.add_argument("--fuzz-metal", action="store_true",
                          help="also start a machine on each case, twice")
     fuzzing.add_argument("--fuzz-loop", action="store_true",
@@ -24308,7 +24531,8 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
     ):
         if getattr(namespace, flag):
             return f"{mode} chooses what it compiles"
-    if namespace.fuzz is not None or namespace.fuzz_refusals is not None:
+    if (namespace.fuzz is not None or namespace.fuzz_refusals is not None
+            or namespace.fuzz_limits is not None):
         return "--fuzz chooses what it compiles"
     if namespace.carry:
         return "--carry says what goes on the disk, and it is not this"
@@ -24370,6 +24594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         refusals = fuzz_refusals(namespace.fuzz_refusals, namespace.fuzz_seed)
         print(refusals.render())
         return 0 if refusals.clean else 1
+    if namespace.fuzz_limits is not None:
+        limits = fuzz_limits(namespace.fuzz_limits or None)
+        print(limits.render())
+        return 0 if limits.clean else 1
     if namespace.fuzz is not None:
         report = fuzz(
             namespace.fuzz,
