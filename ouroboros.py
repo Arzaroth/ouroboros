@@ -5048,17 +5048,25 @@ class AssuranceSuite:
         """Whether the file can name everything its machine backend wrote.
 
         A walk from the first octet that lands exactly on the last one, with
-        a name for each instruction on the way.  The encoder and the reader
-        agree about where an instruction ends or this does not finish.
+        a name for each instruction on the way, on each of the three machines.
+        The encoder and the reader agree about where an instruction ends or
+        this does not finish.
         """
-        try:
-            said = narrate_machine_code(machine_code(artifacts.module, "x86-64"))
-        except GlyphPlatformError as exc:
-            return CheckResult("every octet of the text is an instruction", False, str(exc))
+        named = 0
+        for architecture in sorted(MACHINES):
+            try:
+                said = narrate_machine_code(
+                    machine_code(artifacts.module, architecture), architecture
+                )
+            except GlyphPlatformError as exc:
+                return CheckResult(
+                    "every octet of the text is an instruction", False, str(exc)
+                )
+            named += len(said.splitlines())
         return CheckResult(
             "every octet of the text is an instruction",
             True,
-            f"{len(said.splitlines())} of them, each one named",
+            f"{named} of them across {len(MACHINES)} machines, each one named",
         )
 
     @staticmethod
@@ -22342,12 +22350,12 @@ REGISTER_NAMES: Final[tuple[str, ...]] = (
 
 
 class MachineNarrator:
-    """Says what the octets are, without running any of them.
+    """Says what the octets of an x86-64 text are, without running any.
 
     A second pass over the same closed vocabulary the reader executes.  The
     two have to agree about where every instruction ends or one of them is
     wrong, and a linear walk that does not land exactly on the end of the text
-    says so.
+    says so.  Only this machine can be walked wrong; the other two are words.
     """
 
     def __init__(self, text: bytes, origin: int) -> None:
@@ -22475,7 +22483,184 @@ class MachineNarrator:
             yield self._origin + start, self._text[start : self._at], said
 
 
-def narrate_machine_code(image: bytes) -> str:
+class WordNarrator:
+    """What naming the octets of the two fixed-width machines has in common.
+
+    There is no walk to get wrong here the way there is on the first machine:
+    an instruction is a word and the next one is the word after it.  What is
+    left is the naming, and a text whose length is not words at all.
+    """
+
+    def __init__(self, text: bytes, origin: int) -> None:
+        self._text = text
+        self._origin = origin
+
+    def _one(self, word: int, at: int) -> str:
+        raise NotImplementedError
+
+    def narrate(self) -> Iterator[tuple[int, bytes, str]]:
+        if len(self._text) % 4:
+            raise MachineDecodeError(
+                f"the text is {len(self._text)} octets, which is not whole words"
+            )
+        for step in range(0, len(self._text), 4):
+            octets = self._text[step : step + 4]
+            at = self._origin + step
+            yield at, octets, self._one(int.from_bytes(octets, "little"), at)
+
+
+ARM_CONDITION_NAMES: Final[Mapping[int, str]] = {
+    0: "eq", 1: "ne", 10: "ge", 11: "lt", 12: "gt", 13: "le",
+}
+
+
+class Aarch64Narrator(WordNarrator):
+    """Says what the octets of an aarch64 text are, without running any.
+
+    The same vocabulary the reader executes, tested against it in the same
+    way: both are handed the whole text and neither may meet a word the other
+    knows and it does not.
+    """
+
+    @staticmethod
+    def _value(field: int) -> str:
+        return "xzr" if field == 31 else f"x{field}"
+
+    @staticmethod
+    def _address(field: int) -> str:
+        return "sp" if field == 31 else f"x{field}"
+
+    def _one(self, word: int, at: int) -> str:
+        rd, rn, rm = word & 0x1F, (word >> 5) & 0x1F, (word >> 16) & 0x1F
+        value, place = self._value, self._address
+        if word == 0xD65F03C0:
+            return "ret"
+        if word == 0xD4000001:
+            return "svc 0"
+        if word == 0xD4200000:
+            return "brk 0"
+        if word & 0xFFE0FFE0 == 0xAA0003E0:
+            return f"mov {value(rd)}, {value(rm)}"
+        head = word & 0xFF800000
+        if head in (0xD2800000, 0xF2800000, 0x92800000):
+            shift = ((word >> 21) & 3) * 16
+            name = {0xD2800000: "movz", 0x92800000: "movn", 0xF2800000: "movk"}[head]
+            said = f"{name} {value(rd)}, {(word >> 5) & 0xFFFF:#x}"
+            return said + (f", lsl {shift}" if shift else "")
+        shifted = word & 0xFFE0FC00
+        if shifted in (0x8B000000, 0xCB000000, 0xCA000000, 0xEB000000):
+            name = {0x8B000000: "add", 0xCB000000: "sub",
+                    0xCA000000: "eor", 0xEB000000: "subs"}[shifted]
+            return f"{name} {value(rd)}, {value(rn)}, {value(rm)}"
+        if head in (0x91000000, 0xD1000000, 0xF1000000):
+            amount = (word >> 10) & 0xFFF
+            name = {0x91000000: "add", 0xD1000000: "sub", 0xF1000000: "subs"}[head]
+            said = (f"{name} {place(rd)}, {place(rn)}, {amount:#x}"
+                    if head == 0x91000000
+                    else f"{name} {value(rd)}, {value(rn)}, {amount:#x}")
+            return said + (", lsl 12" if word & (1 << 22) else "")
+        if shifted == 0x9B007C00:
+            return f"mul {value(rd)}, {value(rn)}, {value(rm)}"
+        if shifted == 0x9AC00C00:
+            return f"sdiv {value(rd)}, {value(rn)}, {value(rm)}"
+        if word & 0xFFE08000 == 0x9B008000:
+            minuend = value((word >> 10) & 0x1F)
+            return f"msub {value(rd)}, {value(rn)}, {value(rm)}, {minuend}"
+        if word & 0xFFFF0FE0 == 0x9A9F07E0:
+            said = ARM_CONDITION_NAMES[((word >> 12) & 0xF) ^ 1]
+            return f"cset {value(rd)}, {said}"
+        scaled = word & 0xFFC00000
+        if scaled in (0xF9400000, 0xF9000000):
+            name = "ldr" if scaled == 0xF9400000 else "str"
+            return f"{name} {value(rd)}, [{place(rn)}, {((word >> 10) & 0xFFF) * 8:#x}]"
+        if shifted in (0x38606800, 0x38206800):
+            name = "ldrb" if shifted == 0x38606800 else "strb"
+            return f"{name} w{rd}, [{place(rn)}, {value(rm)}]"
+        stepped = word & 0xFFE00C00
+        if stepped in (0xF8000C00, 0xF8400400):
+            step = WordReader._signed((word >> 12) & 0x1FF, 9)
+            if stepped == 0xF8000C00:
+                return f"str {value(rd)}, [{place(rn)}, {step:#x}]!"
+            return f"ldr {value(rd)}, [{place(rn)}], {step:#x}"
+        wide = word & 0xFC000000
+        if wide in (0x14000000, 0x94000000):
+            name = "b" if wide == 0x14000000 else "bl"
+            step = WordReader._signed(word & 0x3FFFFFF, 26) * 4
+            return f"{name} {at + step:#x}"
+        if word & 0xFF000010 == 0x54000000:
+            step = WordReader._signed((word >> 5) & 0x7FFFF, 19) * 4
+            return f"b.{ARM_CONDITION_NAMES[word & 0xF]} {at + step:#x}"
+        if word & 0xFF000000 == 0xB4000000:
+            step = WordReader._signed((word >> 5) & 0x7FFFF, 19) * 4
+            return f"cbz {value(rd)}, {at + step:#x}"
+        raise MachineDecodeError(f"the word {word:#010x} is not one this file writes")
+
+
+class Riscv64Narrator(WordNarrator):
+    """Says what the octets of a riscv64 text are, without running any.
+
+    The offset of a branch and of a jump are scattered through the word here,
+    so the address one names is put back together the same way the reader
+    puts it together before jumping to it.
+    """
+
+    def _one(self, word: int, at: int) -> str:
+        opcode = word & 0x7F
+        rd, rs1, rs2 = (word >> 7) & 0x1F, (word >> 15) & 0x1F, (word >> 20) & 0x1F
+        funct3 = (word >> 12) & 7
+        if word == 0x00000073:
+            return "ecall"
+        if word == 0x00100073:
+            return "ebreak"
+        if opcode == 0b0110111:
+            return f"lui x{rd}, {(word >> 12) & 0xFFFFF:#x}"
+        if opcode == 0b0010011:
+            value = WordReader._signed(word >> 20, 12)
+            name = {0b000: "addi", 0b100: "xori"}.get(funct3)
+            if name is None:
+                raise MachineDecodeError(f"an immediate form with funct3 {funct3}")
+            return f"{name} x{rd}, x{rs1}, {value:#x}"
+        if opcode == 0b0110011:
+            name = {
+                (0b0000000, 0b000): "add", (0b0100000, 0b000): "sub",
+                (0b0000000, 0b100): "xor", (0b0000000, 0b010): "slt",
+                (0b0000001, 0b000): "mul", (0b0000001, 0b100): "div",
+                (0b0000001, 0b110): "rem",
+            }.get((word >> 25, funct3))
+            if name is None:
+                raise MachineDecodeError(
+                    f"an operation with {word >> 25:07b}/{funct3:03b}"
+                )
+            return f"{name} x{rd}, x{rs1}, x{rs2}"
+        if opcode == 0b0000011:
+            name = {0b011: "ld", 0b100: "lbu"}.get(funct3)
+            if name is None:
+                raise MachineDecodeError(f"a load with funct3 {funct3}")
+            return f"{name} x{rd}, {WordReader._signed(word >> 20, 12):#x}(x{rs1})"
+        if opcode == 0b0100011:
+            value = WordReader._signed(((word >> 25) << 5) | ((word >> 7) & 0x1F), 12)
+            name = "sd" if funct3 == 0b011 else "sb"
+            return f"{name} x{rs2}, {value:#x}(x{rs1})"
+        if opcode == 0b1100011:
+            name = {0b000: "beq", 0b001: "bne", 0b100: "blt", 0b101: "bge"}[funct3]
+            step = Riscv64Reader._branch_offset(word)
+            return f"{name} x{rs1}, x{rs2}, {at + step:#x}"
+        if opcode == 0b1101111:
+            return f"jal x{rd}, {at + Riscv64Reader._jump_offset(word):#x}"
+        if opcode == 0b1100111:
+            value = WordReader._signed(word >> 20, 12)
+            return f"jalr x{rd}, {value:#x}(x{rs1})"
+        raise MachineDecodeError(f"the word {word:#010x} is not one this file writes")
+
+
+MACHINE_NARRATORS: Final[Mapping[str, type]] = {
+    "x86-64": MachineNarrator,
+    "aarch64": Aarch64Narrator,
+    "riscv64": Riscv64Narrator,
+}
+
+
+def narrate_machine_code(image: bytes, architecture: str = "x86-64") -> str:
     """Every instruction in an executable this file wrote, in order and named.
 
     A linear walk, because layer 18 writes one run of instructions and every
@@ -22487,7 +22672,7 @@ def narrate_machine_code(image: bytes) -> str:
     origin = struct.unpack_from("<Q", image, 24)[0]
     text = image[prologue:]
     lines = []
-    for address, octets, said in MachineNarrator(text, origin).narrate():
+    for address, octets, said in MACHINE_NARRATORS[architecture](text, origin).narrate():
         lines.append(f"  {address:#010x}  {octets.hex(' '):<32}  {said}")
     return "\n".join(lines) + "\n"
 
@@ -23516,11 +23701,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
     if namespace.explain:
-        sys.stdout.write(
-            narrate_machine_code(machine_code(artifacts.module, namespace.machine))
-            if namespace.machine == "x86-64"
-            else "this file can only say what it writes for x86-64\n"
-        )
+        sys.stdout.write(narrate_machine_code(
+            machine_code(artifacts.module, namespace.machine), namespace.machine
+        ))
 
     if namespace.emit_elf:
         blob = machine_code(artifacts.module, namespace.machine)
