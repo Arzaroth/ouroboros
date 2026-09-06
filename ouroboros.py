@@ -11816,6 +11816,594 @@ fn main() {
 '''
 
 GSLC_GSL2: Final[str] = GSL2_LANGUAGE_GSL2 + GSL2_IR_TAIL_GSL2
+
+GSL2_ARM_ADDRESSES_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# the back end that writes for the other machine
+# ----------------------------------------------------------------------
+#
+# The same compiler and a different tail.  What changes is not the language
+# and not the reader, only what comes out at the end and where it is kept
+# while it is being made.
+
+var IMAGE_AT = 990000;
+var TEXT = 990176;
+var LBLOFF = 1330000;
+var FIXAT = 1360000;
+var FIXID = 1390000;
+var FIXKIND = 1420000;
+var FNSTART = 1450000;
+var FNLEN = 1455000;
+var GLBINIT = 1460000;
+
+var TEXT_LIMIT = 339824;
+var LABEL_LIMIT = 30000;
+var FIX_LIMIT = 30000;
+
+var IMAGE_BASE = 4194304;
+var DATA_BASE = 6291456;
+var ELF_ALIGN = 65536;
+var ELF_MACHINE = 183;
+var ELF_HEADER = 64;
+var SEGMENT_HEADER = 56;
+var SEGMENTS = 2;
+
+# On this machine the number of what is being asked for goes in its own
+# register, and the answer comes back in the first.
+var SYS_READ = 63;
+var SYS_WRITE = 64;
+var SYS_EXIT_GROUP = 94;
+var SYS_BECOME = 666;
+var SYSCALL_REG = 8;
+
+var ZERO = 31;
+var STACK = 31;
+var FRAME_BASE = 28;
+var FRAME_POINTER = 29;
+var LINK = 30;
+
+var CC_EQ = 0;
+var CC_NE = 1;
+var CC_GE = 10;
+var CC_LT = 11;
+var CC_GT = 12;
+var CC_LE = 13;
+
+var MAXFN = 4096;
+var MOST_VALUES = 3000;
+
+var L_START = 0;
+var L_PUTCHAR = 1;
+var L_PUTCHAR_DONE = 2;
+var L_FLUSH = 3;
+var L_FLUSH_DONE = 4;
+var L_GETCHAR = 5;
+var L_GETCHAR_FILL = 6;
+var L_GETCHAR_TAKE = 7;
+var L_GETCHAR_ENDED = 8;
+var L_GETCHAR_DONE = 9;
+var L_QUIT = 10;
+var L_COPY = 11;
+var L_COPY_DONE = 12;
+var L_STRDATA = 13;
+var L_MAIN = 14;
+var L_INIT = 15;
+var L_DELIVER = 16;
+var L_DELIVER_PACK = 17;
+var L_DELIVER_PACKED = 18;
+var L_DELIVER_DONE = 19;
+var L_FN = 32;
+var L_BLOCK = 4128;
+
+var MEMORY_AT = 6291456;
+var MEMORY_BYTES = 16000000;
+var GLOBALS_AT = 22291456;
+var OUT_AT = 22293504;
+var OUT_SPAN = 65536;
+var OUT_USED_AT = 22359040;
+var IN_AT = 22359048;
+var IN_SPAN = 65536;
+var IN_TAKEN_AT = 22424584;
+var IN_HELD_AT = 22424592;
+var HAND_AT = 22424600;
+var HAND_SPAN = 1048576;
+var BSS_SPAN = 17181720;
+
+var textlen = 0;
+var nfix = 0;
+var nfn = 0;
+var nblock = 0;
+var framesite = 0;
+'''
+
+GSL2_ARM_TAIL_GSL2: Final[str] = r'''
+# ----------------------------------------------------------------------
+# what a value is, and where it lives
+# ----------------------------------------------------------------------
+#
+# A virtual register becomes a slot in the frame here too.  What differs is
+# that a load on this machine carries an offset that is unsigned and scaled,
+# so the frame is addressed upwards from its own floor rather than downwards
+# from its top, and a register is kept pointing at that floor.
+
+fn slot_at(slot) {
+  return slot * 8;
+}
+
+fn value_at(r) {
+  return (FRAME + r) * 8;
+}
+
+fn take(reg, r) {
+  return ld(reg, FRAME_BASE, value_at(r));
+}
+
+fn give(r, reg) {
+  return st(reg, FRAME_BASE, value_at(r));
+}
+
+fn new_reg() {
+  regcnt = regcnt + 1;
+  if (regcnt >= MOST_VALUES) {
+    fail("too many values at once in one function");
+  }
+  return regcnt - 1;
+}
+
+fn new_label() {
+  nblock = nblock + 1;
+  return L_BLOCK + nblock - 1;
+}
+
+fn fn_id(start, length) {
+  var i = 0;
+  while (i < nfn) {
+    if (mem[FNLEN + i] == length) {
+      var k = 0;
+      var same = 1;
+      while (k < length) {
+        if (mem[SRC + mem[FNSTART + i] + k] != mem[SRC + start + k]) {
+          same = 0;
+        }
+        k = k + 1;
+      }
+      if (same == 1) {
+        return L_FN + i;
+      }
+    }
+    i = i + 1;
+  }
+  if (nfn >= MAXFN) {
+    fail("too many functions");
+  }
+  mem[FNSTART + nfn] = start;
+  mem[FNLEN + nfn] = length;
+  nfn = nfn + 1;
+  return L_FN + nfn - 1;
+}
+
+# ----------------------------------------------------------------------
+# the interface the reader above calls
+# ----------------------------------------------------------------------
+
+fn emit_label(l) {
+  return lab(l);
+}
+
+fn emit_br(l) {
+  return go(l);
+}
+
+fn emit_cond_br(r, a, b) {
+  take(0, r);
+  compare_imm(0, 0);
+  go_when(CC_NE, a);
+  go(b);
+  return 0;
+}
+
+fn gen_const(v) {
+  var r = new_reg();
+  imm(0, v);
+  give(r, 0);
+  return r;
+}
+
+fn gen_slot_addr(slot) {
+  var r = new_reg();
+  alu_imm(0, 0, FRAME_BASE, slot_at(slot));
+  give(r, 0);
+  return r;
+}
+
+fn gen_mem_addr(index_reg) {
+  var r = new_reg();
+  take(0, index_reg);
+  imm(1, 8);
+  mul(0, 0, 1);
+  imm(1, MEMORY_AT);
+  alu(0, 0, 0, 1);
+  give(r, 0);
+  return r;
+}
+
+fn gen_load(addr_reg) {
+  var r = new_reg();
+  take(0, addr_reg);
+  ld(0, 0, 0);
+  give(r, 0);
+  return r;
+}
+
+fn gen_store(value_reg, addr_reg) {
+  take(0, value_reg);
+  take(1, addr_reg);
+  st(0, 1, 0);
+  return 0;
+}
+
+fn gen_store_const(value, addr_reg) {
+  imm(0, value);
+  take(1, addr_reg);
+  st(0, 1, 0);
+  return 0;
+}
+
+fn gen_global_load(start, length) {
+  var r = new_reg();
+  imm(1, GLOBALS_AT + find_global(start, length) * 8);
+  ld(0, 1, 0);
+  give(r, 0);
+  return r;
+}
+
+fn gen_global_store(value_reg, start, length) {
+  take(0, value_reg);
+  imm(1, GLOBALS_AT + find_global(start, length) * 8);
+  st(0, 1, 0);
+  return 0;
+}
+
+fn gen_binary(op, a, b) {
+  var r = new_reg();
+  take(0, a);
+  take(1, b);
+  if (op == T_PLUS) {
+    alu(0, 0, 0, 1);
+  }
+  if (op == T_MINUS) {
+    alu(1, 0, 0, 1);
+  }
+  if (op == T_STAR) {
+    mul(0, 0, 1);
+  }
+  if (op == T_SLASH) {
+    sdiv(0, 0, 1);
+  }
+  if (op == T_PERCENT) {
+    sdiv(2, 0, 1);
+    msub(0, 2, 1, 0);
+  }
+  give(r, 0);
+  return r;
+}
+
+fn condition_of(op) {
+  if (op == T_EQ) { return CC_EQ; }
+  if (op == T_NE) { return CC_NE; }
+  if (op == T_LT) { return CC_LT; }
+  if (op == T_LE) { return CC_LE; }
+  if (op == T_GT) { return CC_GT; }
+  return CC_GE;
+}
+
+fn gen_compare(op, a, b) {
+  var r = new_reg();
+  take(0, a);
+  take(1, b);
+  compare(0, 1);
+  set_when(condition_of(op), 0);
+  give(r, 0);
+  return r;
+}
+
+fn gen_return(r) {
+  take(0, r);
+  alu_imm(0, STACK, FRAME_POINTER, 0);
+  pop_reg(LINK);
+  pop_reg(FRAME_BASE);
+  pop_reg(FRAME_POINTER);
+  ret_now();
+  return 0;
+}
+
+# The convention is this program's own here too, and a push on this machine
+# moves the stack sixteen octets whether eight would have done or not.
+fn gen_call(start, length, base, nargs) {
+  var i = nargs;
+  while (i > 0) {
+    i = i - 1;
+    take(0, mem[ARGS + base + i]);
+    push_reg(0);
+  }
+  call_to(fn_id(start, length));
+  if (nargs > 0) {
+    alu_imm(0, STACK, STACK, 16 * nargs);
+  }
+  var r = new_reg();
+  give(r, 0);
+  return r;
+}
+
+fn gen_function_open(start, length, nparams) {
+  var name = fn_id(start, length);
+  lab(name);
+  if (kw_is(start, length, "main") == 1) {
+    lab(L_MAIN);
+  }
+  push_reg(FRAME_POINTER);
+  push_reg(FRAME_BASE);
+  push_reg(LINK);
+  alu_imm(0, FRAME_POINTER, STACK, 0);
+  framesite = textlen;
+  word(3510632448 + 1023);
+  alu_imm(0, FRAME_BASE, STACK, 0);
+  var i = 0;
+  while (i < nparams) {
+    ld(0, FRAME_POINTER, 48 + 16 * i);
+    st(0, FRAME_BASE, slot_at(i));
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn gen_function_close() {
+  imm(0, 0);
+  alu_imm(0, STACK, FRAME_POINTER, 0);
+  pop_reg(LINK);
+  pop_reg(FRAME_BASE);
+  pop_reg(FRAME_POINTER);
+  ret_now();
+  var pages = align_up((FRAME + regcnt) * 8, 4096) / 4096;
+  if (pages >= 4096) {
+    fail("that function wants more frame than one instruction can reserve");
+  }
+  write_word(framesite, 3510632448 + pages * 1024 + 1023);
+  return 0;
+}
+
+fn gen_global_decl(start, length, v, neg) {
+  if (neg == 1) {
+    v = 0 - v;
+  }
+  mem[GLBINIT + find_global(start, length)] = v;
+  return 0;
+}
+
+# ----------------------------------------------------------------------
+# the three routines a program in this language asks the world for
+# ----------------------------------------------------------------------
+#
+# The same three as on the other machine, and the same buffering, because an
+# octet that leaves on its own costs a call on the world and there are fifty
+# thousand of them in a compilation.
+
+fn runtime_putchar() {
+  lab(L_PUTCHAR);
+  push_reg(LINK);
+  imm(9, OUT_USED_AT);
+  ld(10, 9, 0);
+  imm(11, OUT_AT);
+  st_octet(0, 11, 10);
+  alu_imm(0, 10, 10, 1);
+  st(10, 9, 0);
+  compare_imm(10, OUT_SPAN);
+  go_when(CC_LT, L_PUTCHAR_DONE);
+  call_to(L_FLUSH);
+  lab(L_PUTCHAR_DONE);
+  pop_reg(LINK);
+  ret_now();
+  return 0;
+}
+
+fn runtime_flush() {
+  lab(L_FLUSH);
+  imm(9, OUT_USED_AT);
+  ld(10, 9, 0);
+  compare_imm(10, 0);
+  go_when(CC_EQ, L_FLUSH_DONE);
+  move(2, 10);
+  imm(SYSCALL_REG, SYS_WRITE);
+  imm(0, 1);
+  imm(1, OUT_AT);
+  ask_the_world();
+  imm(9, OUT_USED_AT);
+  imm(10, 0);
+  st(10, 9, 0);
+  lab(L_FLUSH_DONE);
+  ret_now();
+  return 0;
+}
+
+fn runtime_getchar() {
+  lab(L_GETCHAR);
+  imm(9, IN_TAKEN_AT);
+  ld(10, 9, 0);
+  imm(11, IN_HELD_AT);
+  ld(12, 11, 0);
+  compare(10, 12);
+  go_when(CC_LT, L_GETCHAR_TAKE);
+  lab(L_GETCHAR_FILL);
+  imm(SYSCALL_REG, SYS_READ);
+  imm(0, 0);
+  imm(1, IN_AT);
+  imm(2, IN_SPAN);
+  ask_the_world();
+  compare_imm(0, 0);
+  go_when(CC_LE, L_GETCHAR_ENDED);
+  imm(11, IN_HELD_AT);
+  st(0, 11, 0);
+  imm(9, IN_TAKEN_AT);
+  imm(10, 0);
+  st(10, 9, 0);
+  lab(L_GETCHAR_TAKE);
+  imm(11, IN_AT);
+  ld_octet(0, 11, 10);
+  alu_imm(0, 10, 10, 1);
+  imm(9, IN_TAKEN_AT);
+  st(10, 9, 0);
+  go(L_GETCHAR_DONE);
+  lab(L_GETCHAR_ENDED);
+  imm(0, 0 - 1);
+  lab(L_GETCHAR_DONE);
+  ret_now();
+  return 0;
+}
+
+fn runtime_quit() {
+  lab(L_QUIT);
+  move(20, 0);
+  call_to(L_FLUSH);
+  move(0, 20);
+  imm(SYSCALL_REG, SYS_EXIT_GROUP);
+  ask_the_world();
+  return 0;
+}
+
+# Hand octets over: to whatever is underneath if it will take them, and out
+# if it will not.  Nothing that runs on somebody else's kernel will take a
+# program and become it, and this is how it says so.
+fn runtime_deliver() {
+  lab(L_DELIVER);
+  push_reg(LINK);
+  push_reg(0);
+  push_reg(1);
+  call_to(L_FLUSH);
+  pop_reg(1);
+  pop_reg(0);
+  move(20, 0);
+  move(21, 1);
+  imm(22, 0);
+  lab(L_DELIVER_PACK);
+  compare(22, 21);
+  go_when(CC_GE, L_DELIVER_PACKED);
+  alu(0, 9, 20, 22);
+  imm(10, 8);
+  mul(9, 9, 10);
+  imm(10, MEMORY_AT);
+  alu(0, 9, 9, 10);
+  ld_octet(11, 9, ZERO);
+  imm(10, HAND_AT);
+  st_octet(11, 10, 22);
+  alu_imm(0, 22, 22, 1);
+  go(L_DELIVER_PACK);
+  lab(L_DELIVER_PACKED);
+  imm(SYSCALL_REG, SYS_BECOME);
+  imm(0, HAND_AT);
+  move(1, 21);
+  ask_the_world();
+  compare_imm(0, 0);
+  go_when(CC_GE, L_DELIVER_DONE);
+  imm(SYSCALL_REG, SYS_WRITE);
+  imm(0, 1);
+  imm(1, HAND_AT);
+  move(2, 21);
+  ask_the_world();
+  lab(L_DELIVER_DONE);
+  pop_reg(LINK);
+  ret_now();
+  return 0;
+}
+
+fn gen_deliver(where, count) {
+  take(0, where);
+  take(1, count);
+  call_to(L_DELIVER);
+  return gen_const(0);
+}
+
+fn parse_call_builtin(kind, first_arg) {
+  if (kind == 1) {
+    take(0, first_arg);
+    call_to(L_PUTCHAR);
+    var r = new_reg();
+    give(r, 0);
+    return r;
+  }
+  if (kind == 2) {
+    call_to(L_GETCHAR);
+    var r2 = new_reg();
+    give(r2, 0);
+    return r2;
+  }
+  take(0, first_arg);
+  call_to(L_QUIT);
+  return gen_const(0);
+}
+
+# ----------------------------------------------------------------------
+# the two ends of the file
+# ----------------------------------------------------------------------
+
+fn emit_header() {
+  lab(L_START);
+  imm(FRAME_POINTER, 0);
+  imm(FRAME_BASE, 0);
+  call_to(L_INIT);
+  call_to(L_MAIN);
+  call_to(L_FLUSH);
+  imm(SYSCALL_REG, SYS_EXIT_GROUP);
+  imm(0, 0);
+  ask_the_world();
+  runtime_putchar();
+  runtime_flush();
+  runtime_getchar();
+  runtime_quit();
+  runtime_deliver();
+  return 0;
+}
+
+# The strings are put down before the loop that copies them, so that the
+# loop can name where they are.  The other machine reads that address off its
+# own instruction pointer; here it is written out, which a program that is
+# never moved is entitled to do.
+fn emit_trailer() {
+  lab(L_STRDATA);
+  var strdata_at = textlen;
+  var i = 0;
+  while (i < strtop) {
+    emit_wide(mem[STRBUF + i], 8);
+    i = i + 1;
+  }
+
+  lab(L_INIT);
+  i = 0;
+  while (i < nglobals) {
+    imm(9, GLOBALS_AT + i * 8);
+    imm(10, mem[GLBINIT + i]);
+    st(10, 9, 0);
+    i = i + 1;
+  }
+  imm(9, IMAGE_BASE + ELF_HEADER + SEGMENT_HEADER * SEGMENTS + strdata_at);
+  imm(10, MEMORY_AT + STRBASE * 8);
+  imm(11, strtop);
+  lab(L_COPY);
+  compare_imm(11, 0);
+  go_when(CC_EQ, L_COPY_DONE);
+  ld(13, 9, 0);
+  st(13, 10, 0);
+  alu_imm(0, 9, 9, 8);
+  alu_imm(0, 10, 10, 8);
+  alu_imm(1, 11, 11, 1);
+  go(L_COPY);
+  lab(L_COPY_DONE);
+  ret_now();
+  link_text();
+  native_image(BSS_SPAN);
+  return 0;
+}
+'''
+
 GSLCELF_GSL2: Final[str] = (
     GSL2_LANGUAGE_GSL2 + GSL2_NATIVE_ADDRESSES_GSL2 + X86_ENCODER_GSL2
     + ELF_WRITER_GSL2 + GSL2_NATIVE_TAIL_GSL2
@@ -12627,6 +13215,10 @@ GLYPHELF_GSL2: Final[str] = (
 GLYPHARM_GSL2: Final[str] = (
     GSL_FRONT_END_GSL2 + GLYPH_ARM_ADDRESSES_GSL2 + ARM_ENCODER_GSL2
     + ELF_WRITER_GSL2 + GLYPH_ARM_TAIL_GSL2
+)
+GSLCARM_GSL2: Final[str] = (
+    GSL2_LANGUAGE_GSL2 + GSL2_ARM_ADDRESSES_GSL2 + ARM_ENCODER_GSL2
+    + ELF_WRITER_GSL2 + GSL2_ARM_TAIL_GSL2
 )
 
 
@@ -14664,6 +15256,10 @@ class ToolchainReport:
     other_front_end: int
     other_size: int
     other_program: bool
+    elsewhere: tuple[tuple[int, str], ...]
+    elsewhere_front: int
+    elsewhere_program: bool
+    elsewhere_skipped: str
     glyph: str
     expected: str
 
@@ -14671,6 +15267,15 @@ class ToolchainReport:
     def fixed(self) -> bool:
         """Whether the compiler, built by itself, is the same octets twice."""
         return len({digest for _, digest in self.stages}) == 1
+
+    @property
+    def settled_elsewhere(self) -> bool:
+        """Whether the compiler for the other machine is a fixpoint over there.
+
+        Only askable where this host can run that machine's programs, which
+        is what the note says when it cannot.
+        """
+        return bool(self.elsewhere) and len({d for _, d in self.elsewhere}) == 1
 
     @property
     def seeded_matches(self) -> bool:
@@ -14684,10 +15289,12 @@ class ToolchainReport:
 
     @property
     def clean(self) -> bool:
+        settled = self.settled_elsewhere and self.elsewhere_program
         return (
             self.fixed
             and self.seeded_matches
             and self.other_program
+            and (settled or bool(self.elsewhere_skipped))
             and self.glyph == self.expected
         )
 
@@ -14741,10 +15348,39 @@ def close_the_toolchain(
     # And once more for the machine this one is not.  The compiler does not
     # care which; what changes is the tail it is handed.
     other = _compile_with(stages[-1], GLYPHARM_GSL2, directory / "glypharm")
-    elsewhere = _compile_with(other, source, directory / "glyph-aarch64")
-    matches = elsewhere.read_bytes() == machine_code(
+    crossed = _compile_with(other, source, directory / "glyph-aarch64")
+    matches = crossed.read_bytes() == machine_code(
         synthesize_source(source).unwrap_or_raise().module, "aarch64"
     )
+    # And the same again over there, which needs this host to be able to run
+    # that machine's programs, since after the first turn they are what does
+    # the compiling.
+    elsewhere: list[tuple[int, str]] = []
+    elsewhere_front = 0
+    elsewhere_program = False
+    elsewhere_skipped = ""
+    if machine_code_runnable("aarch64"):
+        seeded_there = directory / "seeded-aarch64"
+        seeded_there.write_bytes(gsl2_machine_code(GSLCARM_GSL2))
+        seeded_there.chmod(0o755)
+        previous = seeded_there
+        for turn in range(3):
+            previous = _compile_with(
+                previous, GSLCARM_GSL2, directory / f"gslcarm{turn + 1}"
+            )
+            elsewhere.append(
+                (previous.stat().st_size, reference_digest(previous.read_bytes().hex()))
+            )
+        native = _compile_with(previous, GLYPHARM_GSL2, directory / "glypharm-native")
+        elsewhere_front = native.stat().st_size
+        elsewhere_program = _compile_with(
+            native, source, directory / "glyph-aarch64-native"
+        ).read_bytes() == machine_code(
+            synthesize_source(source).unwrap_or_raise().module, "aarch64"
+        )
+    else:
+        elsewhere_skipped = "this host cannot run that machine's programs"
+
     return ToolchainReport(
         workdir=directory,
         seeded=(
@@ -14758,8 +15394,12 @@ def close_the_toolchain(
         front_end=front_end.stat().st_size,
         program=program.stat().st_size,
         other_front_end=other.stat().st_size,
-        other_size=elsewhere.stat().st_size,
+        other_size=crossed.stat().st_size,
         other_program=matches,
+        elsewhere=tuple(elsewhere),
+        elsewhere_front=elsewhere_front,
+        elsewhere_program=elsewhere_program,
+        elsewhere_skipped=elsewhere_skipped,
         glyph=_run(program, "").removesuffix("\n"),
         expected=synthesize_source(source).unwrap_or_raise().rendering,
     )
@@ -20803,11 +21443,22 @@ def _emit_toolchain_report(report: ToolchainReport) -> int:
          report.other_front_end)
     line("glypharm  ->  glyph", "which writes one for that machine too",
          report.other_size)
+    for turn, (span, _) in enumerate(report.elsewhere):
+        line("gslcarm   ->  gslcarm",
+             "and over there it builds itself" if turn == 0 else "and again", span)
+    if report.elsewhere:
+        line("gslcarm   ->  glypharm", "the front end, over there",
+             report.elsewhere_front)
     print(rule)
     same = "[ok]  " if report.seeded_matches else "[FAIL]"
     print(f"  {same} the seed wrote the compiler the compiler writes")
     other = "[ok]  " if report.other_program else "[FAIL]"
     print(f"  {other} and what it wrote for the other machine is layer 18's")
+    if report.elsewhere_skipped:
+        print(f"  [--]   the other machine was not asked: {report.elsewhere_skipped}")
+    else:
+        there = "[ok]  " if report.settled_elsewhere and report.elsewhere_program else "[FAIL]"
+        print(f"  {there} and the whole of it settles over there as well")
     fixed = "[ok]  " if report.fixed else "[FAIL]"
     renders = "[ok]  " if report.glyph == report.expected else "[FAIL]"
     print(f"  {fixed} the compiler it built is the compiler that built it")
@@ -20930,7 +21581,7 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     boot.add_argument("--workdir", metavar="DIR")
     boot.add_argument("--emit-gsl2",
                       choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf",
-                               "glypharm"))
+                               "glypharm", "gslcarm"))
     boot.add_argument("--close-the-toolchain", action="store_true",
                       help="build the compiler with itself, and nothing else")
     boot.add_argument("--boot-the-compiler", action="store_true",
@@ -21062,6 +21713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "glyphc": GLYPHC_GSL2,
                 "glyphelf": GLYPHELF_GSL2,
                 "glypharm": GLYPHARM_GSL2,
+                "gslcarm": GSLCARM_GSL2,
             }[namespace.emit_gsl2]
         )
         return 0

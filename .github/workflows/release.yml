@@ -82,6 +82,7 @@ jobs:
           python ouroboros.py --emit-gsl2 glyphelf > "dist/glyphelf-$safe.gsl2"
           python ouroboros.py --emit-gsl2 gslcelf > "dist/gslcelf-$safe.gsl2"
           python ouroboros.py --emit-gsl2 glypharm > "dist/glypharm-$safe.gsl2"
+          python ouroboros.py --emit-gsl2 gslcarm > "dist/gslcarm-$safe.gsl2"
 
           # The asset itself, not a sibling build, is what gets checked.
           diff <("./dist/glyph-$safe-linux-x86_64") <(python ouroboros.py)
@@ -148,3 +149,4 @@ jobs:
             dist/glyphelf-*
             dist/glypharm-*
             dist/gslcelf-*
+            dist/gslcarm-*
