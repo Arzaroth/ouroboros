@@ -211,6 +211,7 @@ OBJECT_MAGIC: Final[bytes] = b"GVM\x02"
 OBJECT_FORMAT_VERSION: Final[int] = 2
 DEFAULT_LATTICE_ORDER: Final[int] = 7
 DEFAULT_MOTIF: Final[str] = "primary"
+SOURCE_MOTIF: Final[str] = "<source>"
 JIT_TIER_UP_THRESHOLD: Final[int] = 64
 RASTERIZER_WORKER_COUNT: Final[int] = 4
 
@@ -5096,7 +5097,7 @@ def synthesize_source(
     source: str, order: int = DEFAULT_LATTICE_ORDER, **overrides: Any
 ) -> Result[CompilationArtifacts]:
     """Compiles and renders arbitrary GSL source rather than a registered motif."""
-    entries = {"lattice.order": str(order), "motif": "<source>"}
+    entries = {"lattice.order": str(order), "motif": SOURCE_MOTIF}
     entries.update({key: str(value) for key, value in overrides.items()})
     configuration = (
         ConfigurationBuilder()
@@ -11239,6 +11240,7 @@ def close_the_loop(
     opt_level: int = 2,
     orders: Sequence[int] = (3, 7, 11, 21),
     motifs: Sequence[str] | None = None,
+    program: tuple[str, str] | None = None,
 ) -> LoopReport:
     """Compiles a motif with a front end that Python had no hand in running.
 
@@ -11252,26 +11254,35 @@ def close_the_loop(
     directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-loop-"))
     glyphc, glyphc_ir = build_front_end(directory, opt_level)
 
+    if program is not None:
+        name, text = program
+        wanted = ((name, text),)
+    else:
+        wanted = tuple(
+            (motif, typing.cast(type, Motif.lookup(motif))().source(order))
+            for motif in (motifs if motifs is not None else Motif.catalogue())
+            for order in orders
+        )
+
     cases: list[LoopCase] = []
-    for motif in motifs if motifs is not None else Motif.catalogue():
-        for order in orders:
-            source = typing.cast(type, Motif.lookup(motif))().source(order)
-            stem = f"{motif}-{order}"
-            (directory / f"{stem}.gsl").write_text(source)
-            produced = _run(glyphc, source)
-            (directory / f"{stem}.ll").write_text(produced)
-            artifacts = synthesize_source(source, order).unwrap_or_raise()
-            reference = LlvmLoweringBackend().lower(artifacts.module).text
-            binary = link_executable(produced, directory / stem, opt_level)
-            cases.append(
-                LoopCase(
-                    motif=motif,
-                    order=order,
-                    identical=produced == reference,
-                    glyph=_run(binary, "").removesuffix("\n"),
-                    expected=artifacts.rendering,
-                )
+    for label, source in wanted:
+        artifacts = synthesize_source(source).unwrap_or_raise()
+        order = artifacts.module.order
+        stem = f"{label}-{order}"
+        (directory / f"{stem}.gsl").write_text(source)
+        produced = _run(glyphc, source)
+        (directory / f"{stem}.ll").write_text(produced)
+        reference = LlvmLoweringBackend().lower(artifacts.module).text
+        binary = link_executable(produced, directory / stem, opt_level)
+        cases.append(
+            LoopCase(
+                motif=label,
+                order=order,
+                identical=produced == reference,
+                glyph=_run(binary, "").removesuffix("\n"),
+                expected=artifacts.rendering,
             )
+        )
     return LoopReport(directory, glyphc_ir, tuple(cases))
 
 
@@ -14732,6 +14743,18 @@ def _read_octets(source: str) -> bytes:
     return Path(source).read_bytes()
 
 
+def _read_text(source: str) -> str:
+    """The same, for a file that is meant to be read rather than run."""
+    if source == STREAM:
+        return sys.stdin.read()
+    return Path(source).read_text()
+
+
+def _program_name(source: str) -> str:
+    """What to call a program in a report, given where it was read from."""
+    return "stdin" if source == STREAM else Path(source).stem or "program"
+
+
 def _write_octets(destination: str, blob: bytes, executable: bool = False) -> str:
     """Writes ``blob`` where asked, and answers what to call the place.
 
@@ -14852,11 +14875,16 @@ def _emit_loop_report(report: LoopReport) -> int:
         renders = "[ok]  " if case.renders else "[FAIL]"
         print(f"  {case.motif:<16}{case.order:>4}   {identical:<16}{renders}")
     print(rule)
-    for case in report.cases:
-        if case.motif == DEFAULT_MOTIF and case.order == 7:
-            print(case.glyph)
-            print(rule)
-            break
+    shown = next(
+        (
+            case for case in report.cases
+            if case.motif == DEFAULT_MOTIF and case.order == DEFAULT_LATTICE_ORDER
+        ),
+        report.cases[0] if len(report.cases) == 1 else None,
+    )
+    if shown is not None:
+        print(shown.glyph)
+        print(rule)
     print(f"artifacts in {report.workdir}")
     return 0 if report.clean else 1
 
@@ -14867,6 +14895,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description=f"ouroboros {PLATFORM_VERSION} - the pattern, and everything it grew into",
         epilog="A PATH of - is standard input or standard output, whichever the option takes.",
     )
+    parser.add_argument("program", nargs="?", metavar="PATH",
+                        help="a GSL program to compile instead of a registered motif")
     parser.add_argument("-n", "--order", type=int, help="lattice edge length (odd)")
     parser.add_argument("-m", "--motif", choices=Motif.catalogue(), help="registered motif")
     parser.add_argument("-t", "--theme", choices=Theme.catalogue(), help="rendering theme")
@@ -14983,6 +15013,26 @@ def _run_backend(namespace: argparse.Namespace, artifacts: CompilationArtifacts)
     return 0
 
 
+def _refuses_program(namespace: argparse.Namespace) -> str | None:
+    """Why a program cannot be handed to what was asked for, if it cannot."""
+    if namespace.order is not None:
+        return "a program states its own order; -n has nothing left to substitute into"
+    if namespace.motif is not None:
+        return "-m names a program in the catalogue, and this one came from elsewhere"
+    for flag, mode in (
+        ("selftest", "--selftest"),
+        ("bootstrap", "--bootstrap"),
+        ("run_wasm", "--run-wasm"),
+        ("emit_gsl2", "--emit-gsl2"),
+        ("list_motifs", "--list-motifs"),
+    ):
+        if getattr(namespace, flag):
+            return f"{mode} chooses what it compiles"
+    if namespace.fuzz is not None:
+        return "--fuzz chooses what it compiles"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     global CATALOG, DIAGNOSTICS
     namespace = _parse_arguments(argv)
@@ -14991,6 +15041,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(levelname)s %(name)s %(message)s",
     )
+
+    source: str | None = None
+    if namespace.program is not None:
+        refusal = _refuses_program(namespace)
+        if refusal is not None:
+            print(refusal, file=sys.stderr)
+            return 2
+        source = _read_text(namespace.program)
 
     if namespace.list_motifs:
         for key in Motif.catalogue():
@@ -15026,19 +15084,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.close_the_loop:
         try:
             workdir = Path(namespace.workdir) if namespace.workdir else None
-            return _emit_loop_report(close_the_loop(workdir, namespace.opt_level or 2))
+            program = (
+                None if source is None
+                else (_program_name(namespace.program), source)
+            )
+            return _emit_loop_report(
+                close_the_loop(workdir, namespace.opt_level or 2, program=program)
+            )
         except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
             print(f"the loop cannot be closed here: {exc}", file=sys.stderr)
             return 3
 
     CATALOG = MessageCatalog(namespace.lang or "en")
     DIAGNOSTICS = DiagnosticEngine(CATALOG)
+    overrides = dict(_overrides_from(namespace))
+    if source is not None:
+        overrides["motif"] = SOURCE_MOTIF
     try:
         configuration = (
             ConfigurationBuilder()
             .with_defaults()
             .with_environment()
-            .with_mapping("command-line", _overrides_from(namespace))
+            .with_mapping("command-line", overrides)
             .build()
         )
     except GlyphPlatformError as error:
@@ -15054,7 +15121,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     everything = namespace.emit_everything
-    outcome = Result.attempt(lambda: SynthesisOrchestrator(configuration).run())
+    outcome = Result.attempt(
+        lambda: SynthesisOrchestrator(configuration, source=source).run()
+    )
     if not outcome.is_ok:
         failure = typing.cast(Err, outcome).failure
         print(CATALOG("report.fail", error=failure), file=sys.stderr)
