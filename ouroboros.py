@@ -98,7 +98,7 @@
     python3 ouroboros.py --explain wasm   say what every instruction of it is
     python3 ouroboros.py --trace-machine  and what each one of them did
     python3 ouroboros.py --fuzz-limits   grow a program until a backend says no
-    python3 ouroboros.py --coverage     what the checks actually touched
+    python3 ouroboros.py --coverage FILE what the checks touched, as lcov
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -112,6 +112,7 @@ from __future__ import annotations
 
 import abc
 import argparse
+import ast
 import binascii
 import collections
 import enum
@@ -5266,8 +5267,9 @@ def synthesize_source(
 # which lines ran.
 #
 # There is no coverage library here for the same reason there is no
-# assembler: the interpreter has a tracer of its own, and that is less work
-# than a dependency would be.  The one thing it cannot do from inside is watch its
+# assembler.  The interpreter has a tracer of its own, the format lcov reads
+# is nine kinds of line in a text file, and both of those are less work than
+# a dependency would be.  The one thing it cannot do from inside is watch its
 # own import, since by then the import has happened - so each exercise is a
 # fresh interpreter that arms the tracer and only then loads the file.
 #
@@ -5409,6 +5411,36 @@ class CoverageReport:
     @property
     def portion(self) -> float:
         return 100.0 * self.hit / self.found if self.found else 0.0
+
+    def tracefile(self) -> str:
+        """The same nine kinds of line any other coverage tool would write."""
+        tree = ast.parse(self.path.read_text())
+        functions: list[tuple[int, str]] = []
+
+        def walk(node: ast.AST, prefix: str) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    walk(child, f"{prefix}{child.name}.")
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    functions.append((child.lineno, f"{prefix}{child.name}"))
+                    walk(child, f"{prefix}{child.name}.")
+
+        walk(tree, "")
+        lines = ["TN:", f"SF:{self.path.resolve()}"]
+        for at, name in sorted(functions):
+            lines.append(f"FN:{at},{name}")
+        for at, name in sorted(functions):
+            lines.append(f"FNDA:{self.counts.get(at, 0)},{name}")
+        lines.append(f"FNF:{len(functions)}")
+        lines.append(
+            f"FNH:{sum(1 for at, _ in functions if self.counts.get(at))}"
+        )
+        for line in sorted(self.executable):
+            lines.append(f"DA:{line},{self.counts.get(line, 0)}")
+        lines.append(f"LF:{self.found}")
+        lines.append(f"LH:{self.hit}")
+        lines.append("end_of_record")
+        return "\n".join(lines) + "\n"
 
     def cold(self) -> tuple[tuple[str, int, int], ...]:
         """Which layer each line that never ran belongs to, and how many.
@@ -24659,9 +24691,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="and let it build the front end on the way there")
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
-    boot.add_argument("--coverage", action="store_true",
+    boot.add_argument("--coverage", nargs="?", const="-", metavar="PATH",
                       help="run the checks under a tracer and say what they "
-                           "touched")
+                           "touched, as lcov")
 
     fuzzing = parser.add_argument_group("differential fuzzing")
     fuzzing.add_argument("--fuzz", type=int, metavar="N", help="cross-check N random programs")
@@ -24810,8 +24842,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         limits = fuzz_limits(namespace.fuzz_limits or None)
         print(limits.render())
         return 0 if limits.clean else 1
-    if namespace.coverage:
-        print(measure_coverage().render())
+    if namespace.coverage is not None:
+        covered = measure_coverage()
+        if namespace.coverage != "-":
+            written = _write_octets(namespace.coverage, covered.tracefile().encode())
+            print(f"wrote {written}", file=sys.stderr)
+        print(covered.render())
         return 0
     if namespace.fuzz is not None:
         report = fuzz(
