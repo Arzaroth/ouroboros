@@ -2578,7 +2578,7 @@ class Unifier:
         assert isinstance(left, TypeConstructor) and isinstance(right, TypeConstructor)
         if left.name != right.name or len(left.arguments) != len(right.arguments):
             raise TypeInferenceError(f"cannot unify {left} with {right}")
-        for a, b in zip(left.arguments, right.arguments):
+        for a, b in zip(left.arguments, right.arguments, strict=True):
             self.unify(a, b)
         return left
 
@@ -3447,7 +3447,10 @@ def run_rules(name: str, items: list[IrItem]) -> list[IrItem]:
             window = items[index : index + len(matchers)]
             if len(window) != len(matchers):
                 continue
-            if not all(MATCHERS[code](item) for code, item in zip(matchers, window)):
+            if not all(
+                MATCHERS[code](item)
+                for code, item in zip(matchers, window, strict=True)
+            ):
                 continue
             if not GUARDS[guard](window):
                 continue
@@ -3541,7 +3544,7 @@ class PassManager:
         with TRACER.span("optimise", passes=len(self._passes)):
             working = list(items)
             tally: MutableMapping[str, tuple[int, int]] = collections.defaultdict(lambda: (0, 0))
-            for round_number in range(self._PATIENCE):
+            for _ in range(self._PATIENCE):
                 before = len(working)
                 for optimisation in self._passes:
                     previous = len(working)
@@ -3756,6 +3759,7 @@ class ObjectCodec:
             zip(
                 (source for _, source, _ in CONTAINER_HEADER),
                 self._HEADER.unpack(body[: self._HEADER.size]),
+                strict=True,
             )
         )
         magic, version = header["magic"], header["version"]
@@ -3809,8 +3813,12 @@ class ObjectCodec:
 
 
 @dataclass(frozen=True, slots=True)
-class CanvasCommand(abc.ABC):
-    """The write side of the canvas CQRS split."""
+class CanvasCommand:
+    """The write side of the canvas CQRS split.
+
+    Not an abc: with nothing abstract on it one would not have stopped this
+    being instantiated, so it said something about the class that was not so.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -6590,7 +6598,8 @@ class DifferentialFuzzer:
         toolchain: LlvmToolchainService | None = None
         try:
             toolchain = LlvmToolchainService()
-            toolchain.version
+            # Asked for what asking raises when there is no llvmlite under it.
+            _ = toolchain.version
             tiers.append("jit")
             if self._native:
                 tiers.append("native")
@@ -6661,9 +6670,10 @@ class DifferentialFuzzer:
                     findings.append(
                         FuzzFinding(case, "front-end-ir", source, expected, got, "layer 16")
                     )
-                variants.append(
-                    ("front-end", lambda: self._through_front_end(produced_ir, scratch))
-                )
+                variants.append((
+                    "front-end",
+                    lambda ir=produced_ir: self._through_front_end(ir, scratch),
+                ))
 
             for label, produce in variants:
                 comparisons += 1
@@ -15996,25 +16006,25 @@ def er(r):
     return 0
 
 
-def elabel(l):
+def elabel(label):
     es("L")
-    en(l)
+    en(label)
     return 0
 
 
-def emit_label(l):
+def emit_label(label):
     if _S0_NATIVE:
-        return _na_emit_label(l)
-    elabel(l)
+        return _na_emit_label(label)
+    elabel(label)
     es(":\n")
     return 0
 
 
-def emit_br(l):
+def emit_br(label):
     if _S0_NATIVE:
-        return _na_emit_br(l)
+        return _na_emit_br(label)
     es("  br label %")
-    elabel(l)
+    elabel(label)
     es("\n")
     return 0
 
@@ -16909,15 +16919,15 @@ def _na_new_label():
     return f"b{_S0_BLOCKS}"
 
 
-def _na_emit_label(l):
+def _na_emit_label(label):
     _na_spill()
-    _S0_TEXT.label(l)
+    _S0_TEXT.label(label)
     return 0
 
 
-def _na_emit_br(l):
+def _na_emit_br(label):
     _na_spill()
-    _S0_TEXT.jump(l)
+    _S0_TEXT.jump(label)
     return 0
 
 
@@ -17341,6 +17351,8 @@ def link_executable(ir_text: str, exe_path: Path, opt_level: int = 2) -> Path:
     object_path = exe_path.with_suffix(".o")
     toolchain.emit_object(module, str(object_path))
     linker = shutil.which("gcc") or shutil.which("cc")
+    if linker is None:  # pragma: no cover - the guard above already said so
+        raise LlvmToolchainUnavailable("no system C linker (gcc/cc) on PATH")
     subprocess.run([linker, str(object_path), "-o", str(exe_path)], check=True)
     return exe_path
 
@@ -22472,7 +22484,7 @@ def _resolve(code: list[tuple]) -> list[tuple]:
         raise WasmDecodeError("a structured instruction is never closed")
     return [
         (opcode, tuple(immediate) if isinstance(immediate, list) else immediate)
-        for (opcode, _), immediate in zip(code, resolved)
+        for (opcode, _), immediate in zip(code, resolved, strict=True)
     ]
 
 
@@ -22553,7 +22565,7 @@ def decode_wasm(blob: bytes) -> DecodedModule:
         raise WasmDecodeError("the function and code sections disagree")
     functions = [
         WasmFunction(index, types[index], declared, code)
-        for index, (declared, code) in zip(type_indices, bodies)
+        for index, (declared, code) in zip(type_indices, bodies, strict=True)
     ]
     return DecodedModule(types, functions, pages, globals_, exports)
 
