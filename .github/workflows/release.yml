@@ -140,3 +140,4 @@ jobs:
             dist/ouroboros.py
             dist/glyph-*
             dist/glyphc-*
+            dist/glyphelf-*
