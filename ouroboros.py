@@ -7947,6 +7947,7 @@ var FIXID = 1410000;
 var FNSTART = 1450000;
 var FNLEN = 1460000;
 var GLBINIT = 1470000;
+var SEEN = 1480000;
 
 var RSP = 4;
 var RBP = 5;
@@ -8005,6 +8006,7 @@ var nfix = 0;
 var nfn = 0;
 var nblock = 0;
 var framesite = 0;
+var pending = -1;
 var stringsite = 0;
 '''
 
@@ -8486,6 +8488,16 @@ GSL2_NATIVE_TAIL_GSL2: Final[str] = r'''
 # The frame is the declared locals, then one slot for every virtual register
 # the function turns out to want, which is not known until the body has been
 # read - so the space it takes is written into the prologue afterwards.
+#
+# A value that has just been made is left in the accumulator and not written
+# down.  If the next thing that happens is the read of it, the slot is never
+# touched at all, and a value that is made and used costs no memory.  Anything
+# else that wants the accumulator writes it out first, which is what spill is
+# for, and every place that leaves a block spills before it goes.
+#
+# That is only sound where a value is read once.  Every one of them is, at
+# every place above that makes one, and take says so rather than hoping: a
+# value read twice would be read out of a slot nothing ever wrote.
 
 fn slot_disp(slot) {
   return 0 - 8 * (slot + 1);
@@ -8495,12 +8507,48 @@ fn vreg_disp(r) {
   return 0 - 8 * (FRAME + r + 1);
 }
 
-fn take(reg, r) {
-  return ld_at(reg, RBP, 0 - 1, 1, vreg_disp(r));
+fn spill() {
+  if (pending < 0) {
+    return 0;
+  }
+  var r = pending;
+  pending = 0 - 1;
+  return st_at(RBP, 0 - 1, 1, vreg_disp(r), RAX);
 }
 
 fn give(r, reg) {
+  if (reg == RAX) {
+    pending = r;
+    return 0;
+  }
   return st_at(RBP, 0 - 1, 1, vreg_disp(r), reg);
+}
+
+fn take(reg, r) {
+  mem[SEEN + r] = mem[SEEN + r] + 1;
+  if (mem[SEEN + r] > 1) {
+    fail("a value read more than once");
+  }
+  if (pending == r) {
+    pending = 0 - 1;
+    if (reg == RAX) {
+      return 0;
+    }
+    return ld(reg, RAX);
+  }
+  spill();
+  return ld_at(reg, RBP, 0 - 1, 1, vreg_disp(r));
+}
+
+# The second of the two is the one that was made last, so it is the one that
+# might still be in the accumulator; reading it first is what keeps it there.
+fn use2(a, b) {
+  if (pending == b) {
+    take(RCX, b);
+    return take(RAX, a);
+  }
+  take(RAX, a);
+  return take(RCX, b);
 }
 
 fn patch32(site, value) {
@@ -8518,6 +8566,7 @@ fn new_reg() {
   if (regcnt >= 8192) {
     fail("too many values at once in one function");
   }
+  mem[SEEN + regcnt - 1] = 0;
   return regcnt - 1;
 }
 
@@ -8560,10 +8609,12 @@ fn fn_id(start, length) {
 # ----------------------------------------------------------------------
 
 fn emit_label(l) {
+  spill();
   return lab(l);
 }
 
 fn emit_br(l) {
+  spill();
   return go(l);
 }
 
@@ -8577,6 +8628,7 @@ fn emit_cond_br(r, a, b) {
 
 fn gen_const(v) {
   var r = new_reg();
+  spill();
   imm(RAX, v);
   give(r, RAX);
   return r;
@@ -8584,6 +8636,7 @@ fn gen_const(v) {
 
 fn gen_slot_addr(slot) {
   var r = new_reg();
+  spill();
   lea_at(RAX, RBP, 0 - 1, 1, slot_disp(slot));
   give(r, RAX);
   return r;
@@ -8607,21 +8660,21 @@ fn gen_load(addr_reg) {
 }
 
 fn gen_store(value_reg, addr_reg) {
-  take(RAX, value_reg);
-  take(RCX, addr_reg);
+  use2(value_reg, addr_reg);
   st_at(RCX, 0 - 1, 1, 0, RAX);
   return 0;
 }
 
 fn gen_store_const(value, addr_reg) {
-  imm(RAX, value);
   take(RCX, addr_reg);
+  imm(RAX, value);
   st_at(RCX, 0 - 1, 1, 0, RAX);
   return 0;
 }
 
 fn gen_global_load(start, length) {
   var r = new_reg();
+  spill();
   imm(RCX, GLOBALS_AT + find_global(start, length) * 8);
   ld_at(RAX, RCX, 0 - 1, 1, 0);
   give(r, RAX);
@@ -8637,8 +8690,7 @@ fn gen_global_store(value_reg, start, length) {
 
 fn gen_binary(op, a, b) {
   var r = new_reg();
-  take(RAX, a);
-  take(RCX, b);
+  use2(a, b);
   if (op == T_PLUS) {
     alu(3, RAX, RCX);
   }
@@ -8682,8 +8734,7 @@ fn condition_of(op) {
 
 fn gen_compare(op, a, b) {
   var r = new_reg();
-  take(RAX, a);
-  take(RCX, b);
+  use2(a, b);
   alu(59, RAX, RCX);
   set_when(condition_of(op), RAX);
   widen(RAX, RAX);
@@ -8702,6 +8753,7 @@ fn gen_return(r) {
 # itself and three routines written just below: the arguments go on the
 # stack, nearest first, and the caller takes them off again.
 fn gen_call(start, length, base, nargs) {
+  spill();
   var i = nargs;
   while (i > 0) {
     i = i - 1;
@@ -8718,6 +8770,7 @@ fn gen_call(start, length, base, nargs) {
 }
 
 fn gen_function_open(start, length, nparams) {
+  pending = 0 - 1;
   lab(fn_id(start, length));
   if (kw_is(start, length, "main") == 1) {
     lab(L_MAIN);
@@ -8736,6 +8789,7 @@ fn gen_function_open(start, length, nparams) {
 }
 
 fn gen_function_close() {
+  spill();
   imm(RAX, 0);
   emit(201);
   ret_now();
@@ -8906,6 +8960,7 @@ fn runtime_deliver() {
 }
 
 fn gen_deliver(where, count) {
+  spill();
   take(RDI, where);
   take(RSI, count);
   call_to(L_DELIVER);
@@ -8921,6 +8976,7 @@ fn parse_call_builtin(kind, first_arg) {
     return r;
   }
   if (kind == 2) {
+    spill();
     call_to(L_GETCHAR);
     var r2 = new_reg();
     give(r2, RAX);
@@ -8936,6 +8992,7 @@ fn parse_call_builtin(kind, first_arg) {
 # ----------------------------------------------------------------------
 
 fn emit_header() {
+  pending = 0 - 1;
   lab(L_START);
   call_to(L_INIT);
   call_to(L_MAIN);
@@ -16025,7 +16082,7 @@ def _stage0_run():
 def _stage0_reset() -> None:
     """Return the seed compiler to a pristine state between translation units."""
     global mem, pos, srclen, strtop, nlocals, nglobals, regcnt, labelcnt
-    global line, argsp, _S0_OUT
+    global line, argsp, _S0_OUT, _S0_PENDING, _S0_SEEN
     mem = [0] * 1200000
     pos = 0
     srclen = 0
@@ -16037,6 +16094,8 @@ def _stage0_reset() -> None:
     line = 1
     argsp = 0
     _S0_OUT = []
+    _S0_PENDING = -1
+    _S0_SEEN = {}
 
 
 # ----------------------------------------------------------------------
@@ -16068,6 +16127,8 @@ _S0_TEXT: Any = None
 _S0_BLOCKS: int = 0
 _S0_FRAME_SITE: int = 0
 _S0_INITIAL: list = []
+_S0_PENDING: int = -1
+_S0_SEEN: dict = {}
 
 
 def _na_name(start, length):
@@ -16082,12 +16143,61 @@ def _na_value(r):
     return MemoryOperand(Register.RBP, None, 1, -8 * (GSL2_FRAME_SLOTS + r + 1))
 
 
-def _na_take(register, r):
-    _S0_TEXT.load(register, _na_value(r))
+def _na_spill():
+    """Writes down the value the accumulator is holding on to, if any.
+
+    A value that has just been made is left in the accumulator and not
+    written down, so a value that is made and then read costs no memory at
+    all.  Anything else that wants the accumulator calls this first, and so
+    does every place that leaves a block.
+    """
+    global _S0_PENDING
+    if _S0_PENDING < 0:
+        return 0
+    r, _S0_PENDING = _S0_PENDING, -1
+    _S0_TEXT.store(_na_value(r), Register.RAX)
+    return 0
 
 
 def _na_give(r, register):
+    global _S0_PENDING
+    if register == Register.RAX:
+        _S0_PENDING = r
+        return 0
     _S0_TEXT.store(_na_value(r), register)
+    return 0
+
+
+def _na_take(register, r):
+    """Reads a value, and says so if it is being read a second time.
+
+    Leaving the store out is only sound where a value is read once.  Every
+    one of them is, at every place above that makes one, and this says so
+    rather than hoping: a value read twice would be read out of a slot
+    nothing ever wrote.
+    """
+    global _S0_PENDING
+    _S0_SEEN[r] = _S0_SEEN.get(r, 0) + 1
+    if _S0_SEEN[r] > 1:
+        fail("a value read more than once")
+    if _S0_PENDING == r:
+        _S0_PENDING = -1
+        if register != Register.RAX:
+            _S0_TEXT.load(register, Register.RAX)
+        return 0
+    _na_spill()
+    _S0_TEXT.load(register, _na_value(r))
+    return 0
+
+
+def _na_use2(a, b):
+    """The second was made last, so reading it first is what keeps it where
+    it already is."""
+    if _S0_PENDING == b:
+        _na_take(Register.RCX, b)
+        return _na_take(Register.RAX, a)
+    _na_take(Register.RAX, a)
+    return _na_take(Register.RCX, b)
 
 
 def _na_new_reg():
@@ -16095,6 +16205,7 @@ def _na_new_reg():
     regcnt = regcnt + 1
     if regcnt >= GSL2_MOST_VALUES:
         fail("too many values at once in one function")
+    _S0_SEEN[regcnt - 1] = 0
     return regcnt - 1
 
 
@@ -16105,11 +16216,13 @@ def _na_new_label():
 
 
 def _na_emit_label(l):
+    _na_spill()
     _S0_TEXT.label(l)
     return 0
 
 
 def _na_emit_br(l):
+    _na_spill()
     _S0_TEXT.jump(l)
     return 0
 
@@ -16124,6 +16237,7 @@ def _na_emit_cond_br(r, a, b):
 
 def _na_gen_const(v):
     r = _na_new_reg()
+    _na_spill()
     _S0_TEXT.immediate(Register.RAX, v)
     _na_give(r, Register.RAX)
     return r
@@ -16131,6 +16245,7 @@ def _na_gen_const(v):
 
 def _na_gen_slot_addr(slot):
     r = _na_new_reg()
+    _na_spill()
     _S0_TEXT.address_of(Register.RAX, _na_slot(slot))
     _na_give(r, Register.RAX)
     return r
@@ -16156,21 +16271,21 @@ def _na_gen_load(addr_reg):
 
 
 def _na_gen_store(value_reg, addr_reg):
-    _na_take(Register.RAX, value_reg)
-    _na_take(Register.RCX, addr_reg)
+    _na_use2(value_reg, addr_reg)
     _S0_TEXT.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RAX)
     return 0
 
 
 def _na_gen_store_const(value, addr_reg):
-    _S0_TEXT.immediate(Register.RAX, value)
     _na_take(Register.RCX, addr_reg)
+    _S0_TEXT.immediate(Register.RAX, value)
     _S0_TEXT.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RAX)
     return 0
 
 
 def _na_gen_global_load(start, length):
     r = _na_new_reg()
+    _na_spill()
     _S0_TEXT.immediate(
         Register.RCX, GSL2_GLOBALS_AT + find_global(start, length) * 8
     )
@@ -16190,8 +16305,7 @@ def _na_gen_global_store(value_reg, start, length):
 
 def _na_gen_binary(op, a, b):
     r = _na_new_reg()
-    _na_take(Register.RAX, a)
-    _na_take(Register.RCX, b)
+    _na_use2(a, b)
     if op == T_PLUS:
         _S0_TEXT.arithmetic("add", Register.RAX, Register.RCX)
     if op == T_MINUS:
@@ -16225,8 +16339,7 @@ def _na_condition(op):
 
 def _na_gen_compare(op, a, b):
     r = _na_new_reg()
-    _na_take(Register.RAX, a)
-    _na_take(Register.RCX, b)
+    _na_use2(a, b)
     _S0_TEXT.arithmetic("cmp", Register.RAX, Register.RCX)
     _S0_TEXT.set_if(_na_condition(op), Register.RAX)
     _S0_TEXT.widen_octet(Register.RAX, Register.RAX)
@@ -16242,6 +16355,7 @@ def _na_gen_return(r):
 
 
 def _na_gen_call(start, length, base, nargs):
+    _na_spill()
     for i in range(nargs - 1, -1, -1):
         _na_take(Register.RAX, mem[ARGS + base + i])
         _S0_TEXT.push(Register.RAX)
@@ -16254,7 +16368,8 @@ def _na_gen_call(start, length, base, nargs):
 
 
 def _na_gen_function_open(start, length, nparams):
-    global _S0_FRAME_SITE
+    global _S0_FRAME_SITE, _S0_PENDING
+    _S0_PENDING = -1
     name = _na_name(start, length)
     _S0_TEXT.label("f:" + name)
     if name == "main":
@@ -16272,6 +16387,7 @@ def _na_gen_function_open(start, length, nparams):
 
 
 def _na_gen_function_close():
+    _na_spill()
     _S0_TEXT.immediate(Register.RAX, 0)
     _S0_TEXT.leave()
     _S0_TEXT.ret()
@@ -16290,6 +16406,7 @@ def _na_gen_global_decl(start, length, v, neg):
 
 
 def _na_gen_deliver(where, count):
+    _na_spill()
     _na_take(Register.RDI, where)
     _na_take(Register.RSI, count)
     _S0_TEXT.call("deliver")
@@ -16304,6 +16421,7 @@ def _na_parse_call_builtin(kind, first_arg):
         _na_give(r, Register.RAX)
         return r
     if kind == 2:
+        _na_spill()
         _S0_TEXT.call("getchar")
         r = _na_new_reg()
         _na_give(r, Register.RAX)
@@ -16444,6 +16562,8 @@ def _na_runtime():
 
 
 def _na_emit_header():
+    global _S0_PENDING
+    _S0_PENDING = -1
     text = _S0_TEXT
     text.label("start")
     text.call("init")
