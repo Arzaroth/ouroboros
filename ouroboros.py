@@ -6153,6 +6153,11 @@ class DifferentialFuzzer:
             ("read-back", lambda: self._through_read_back(
                 self._object_for(source, order)))
         )
+        variants.append(
+            ("machine-read-back", lambda: execute_machine_code(
+                machine_code(self._object_for(source, order), "x86-64")
+            ).removesuffix("\n"))
+        )
         return variants
 
     @woven
@@ -6202,6 +6207,7 @@ class DifferentialFuzzer:
         else:
             skipped.append("wasm tier (no WebAssembly host is installed)")
         tiers.append("read-back")
+        tiers.append("machine-read-back")
 
         front_end: Path | None = None
         if self._front_end and toolchain is not None:
@@ -18500,6 +18506,414 @@ def execute_wasm(blob: bytes) -> str:
 
 
 # ======================================================================
+# Layer 21: the machine read back
+# ======================================================================
+#
+# Layer 20 exists because a module that only an engine can run is a module
+# only a machine with an engine can check.  The same is true one tier down
+# and was never acted on: three encoders write machine code, and the only way
+# any of them was ever checked was by finding a processor that would run it.
+# Two of the three are for machines this one is not, so they are checked by
+# an emulator when one is registered and skipped when it is not.
+#
+# So: a reader for exactly the instructions layer 18 writes and no others.
+# It decodes and it executes, because decoding alone would only say the
+# octets are the shape they were written in, and what wants checking is what
+# they mean.  Anything outside that set is refused rather than guessed at:
+# the point is to be a second opinion about a known vocabulary, not a
+# processor.
+
+
+class MachineDecodeError(GlyphPlatformError):
+    """The text held something layer 18 does not write."""
+
+
+class MachineTrap(GlyphPlatformError):
+    """The program did something the machine will not do."""
+
+
+CONDITION_NAMES: Final[Mapping[int, str]] = {
+    code: name for name, code in CONDITION_CODES.items()
+}
+
+STACK_CEILING: Final[int] = 0x7FFF_0000_0000
+STACK_SPAN: Final[int] = 1 << 20
+
+
+class MachineMemory:
+    """The two spans a program of layer 18's asks the loader for, and a stack.
+
+    Everything is addressed absolutely because the text is: layer 18 puts the
+    base of its data in a register in the prologue and never relocates
+    anything, which is what makes an interpreter for it this small.
+    """
+
+    def __init__(self, image: bytes) -> None:
+        self._spans: list[tuple[int, bytearray]] = []
+        entry, segments_at = struct.unpack_from("<QQ", image, ELF_ENTRY)
+        span, count = struct.unpack_from("<HH", image, ELF_SEGMENT_SPAN)
+        for index in range(count):
+            fields = struct.unpack_from("<IIQQQQQQ", image, segments_at + index * span)
+            if fields[0] != SEGMENT_LOADABLE:
+                continue
+            _, _, offset, address, _, on_disk, in_memory, _ = fields
+            room = bytearray(in_memory)
+            room[:on_disk] = image[offset : offset + on_disk]
+            self._spans.append((address, room))
+        self._spans.append((STACK_CEILING - STACK_SPAN, bytearray(STACK_SPAN)))
+        self.entry = entry
+
+    def _span(self, address: int, width: int) -> tuple[bytearray, int]:
+        for base, room in self._spans:
+            if base <= address and address + width <= base + len(room):
+                return room, address - base
+        raise MachineTrap(f"nothing is mapped at {address:#x}")
+
+    def read(self, address: int, width: int) -> int:
+        room, offset = self._span(address, width)
+        return int.from_bytes(room[offset : offset + width], "little")
+
+    def write(self, address: int, width: int, value: int) -> None:
+        room, offset = self._span(address, width)
+        room[offset : offset + width] = (value & ((1 << (8 * width)) - 1)).to_bytes(
+            width, "little"
+        )
+
+    def octets(self, address: int, length: int) -> bytes:
+        room, offset = self._span(address, max(length, 1))
+        return bytes(room[offset : offset + length])
+
+
+@dataclass(slots=True)
+class Operand:
+    """Either a register, or a place in memory reached the one way there is."""
+
+    register: int | None = None
+    address: int | None = None
+
+
+class MachineReader:
+    """Reads and runs the text of an executable layer 18 wrote.
+
+    The vocabulary is closed: every encoding below is one this file emits, and
+    the addressing mode is always the same one, because layer 18 puts every
+    memory operand through a SIB octet with a thirty-two bit displacement and
+    has no special cases to decode.
+    """
+
+    def __init__(self, image: bytes) -> None:
+        self._memory = MachineMemory(image)
+        self._registers = [0] * 16
+        self._rip = self._memory.entry
+        self._zero = False
+        self._sign = False
+        self._overflow = False
+        self._written = bytearray()
+        self._stopped = False
+
+    # -- the octets under the instruction pointer ------------------------
+
+    def _next(self) -> int:
+        octet = self._memory.read(self._rip, 1)
+        self._rip += 1
+        return octet
+
+    def _long(self) -> int:
+        value = self._memory.read(self._rip, 4)
+        self._rip += 4
+        return value - (1 << 32) if value >> 31 else value
+
+    def _quad(self) -> int:
+        value = self._memory.read(self._rip, 8)
+        self._rip += 8
+        return value - (1 << 64) if value >> 63 else value
+
+    def _operand(self, rex: int) -> tuple[int, Operand]:
+        """The ModRM octet, and what it names.
+
+        A register operand is mod three; anything else is the base, index and
+        scale layer 18 always writes, which is the only form there is.
+        """
+        modrm = self._next()
+        reg = ((modrm >> 3) & 7) | (8 if rex & 0x4 else 0)
+        if modrm >> 6 == 3:
+            return reg, Operand(register=(modrm & 7) | (8 if rex & 0x1 else 0))
+        if modrm & 7 != 0b100 or modrm >> 6 != 2:
+            raise MachineDecodeError(
+                f"addressing mode {modrm:#04x} is not one this file writes"
+            )
+        sib = self._next()
+        base = (sib & 7) | (8 if rex & 0x1 else 0)
+        index = ((sib >> 3) & 7) | (8 if rex & 0x2 else 0)
+        scale = 1 << (sib >> 6)
+        address = self._registers[base] + self._long()
+        if (sib >> 3) & 7 != 0b100:
+            address += self._registers[index] * scale
+        return reg, Operand(address=address & MASK64)
+
+    # -- reading and writing what an operand names -----------------------
+
+    def _get(self, operand: Operand, width: int = 8) -> int:
+        if operand.register is not None:
+            return self._registers[operand.register] & ((1 << (8 * width)) - 1)
+        return self._memory.read(typing.cast(int, operand.address), width)
+
+    def _put(self, operand: Operand, value: int, width: int = 8) -> None:
+        if operand.register is not None:
+            if width == 8:
+                self._registers[operand.register] = value & MASK64
+            else:
+                kept = self._registers[operand.register] & ~((1 << (8 * width)) - 1)
+                self._registers[operand.register] = kept | (
+                    value & ((1 << (8 * width)) - 1)
+                )
+            return
+        self._memory.write(typing.cast(int, operand.address), width, value)
+
+    @staticmethod
+    def _signed(value: int) -> int:
+        return value - (1 << 64) if value >> 63 else value
+
+    def _settle(self, result: int, overflow: bool = False) -> int:
+        kept = result & MASK64
+        self._zero = kept == 0
+        self._sign = bool(kept >> 63)
+        self._overflow = overflow
+        return kept
+
+    def _holds(self, condition: str) -> bool:
+        return {
+            "e": self._zero,
+            "ne": not self._zero,
+            "l": self._sign != self._overflow,
+            "ge": self._sign == self._overflow,
+            "le": self._zero or self._sign != self._overflow,
+            "g": not self._zero and self._sign == self._overflow,
+            "s": self._sign,
+            "ns": not self._sign,
+        }[condition]
+
+    # -- one instruction ------------------------------------------------
+
+    ARITHMETIC: ClassVar[Mapping[int, str]] = {
+        0x03: "add", 0x0B: "or", 0x23: "and", 0x2B: "sub", 0x33: "xor",
+        0x3B: "cmp",
+    }
+    EXTENSIONS: ClassVar[Mapping[int, str]] = {
+        0: "add", 1: "or", 4: "and", 5: "sub", 6: "xor", 7: "cmp",
+    }
+
+    def _apply(self, operation: str, left: int, right: int) -> int | None:
+        """The answer, or nothing when the operation only sets the flags."""
+        a, b = self._signed(left), self._signed(right)
+        if operation in ("add", "sub", "cmp"):
+            total = a + b if operation == "add" else a - b
+            self._settle(total, not -(1 << 63) <= total < (1 << 63))
+            return None if operation == "cmp" else total & MASK64
+        answer = {
+            "or": left | right, "and": left & right, "xor": left ^ right,
+        }[operation]
+        self._settle(answer)
+        return answer
+
+    def _step(self) -> None:
+        rex = 0
+        octet = self._next()
+        if 0x40 <= octet <= 0x4F:
+            rex = octet & 0xF
+            octet = self._next()
+
+        if octet == 0x0F:
+            return self._escaped(rex)
+        if 0x50 <= octet <= 0x57:
+            self._push(self._registers[(octet & 7) | (8 if rex & 0x1 else 0)])
+            return
+        if 0x58 <= octet <= 0x5F:
+            self._registers[(octet & 7) | (8 if rex & 0x1 else 0)] = self._pop()
+            return
+        if 0xB8 <= octet <= 0xBF:
+            self._registers[(octet & 7) | (8 if rex & 0x1 else 0)] = (
+                self._quad() & MASK64
+            )
+            return
+        if octet in self.ARITHMETIC:
+            reg, rm = self._operand(rex)
+            answer = self._apply(
+                self.ARITHMETIC[octet], self._registers[reg], self._get(rm)
+            )
+            if answer is not None:
+                self._registers[reg] = answer
+            return
+        if octet == 0x81:
+            reg, rm = self._operand(rex)
+            answer = self._apply(
+                self.EXTENSIONS[reg & 7], self._get(rm), self._long() & MASK64
+            )
+            if answer is not None:
+                self._put(rm, answer)
+            return
+        if octet == 0x80:
+            reg, rm = self._operand(rex)
+            if reg & 7 != 7:
+                raise MachineDecodeError("only a comparison is written this way")
+            self._apply("cmp", self._get(rm, 1), self._next())
+            return
+        if octet == 0x8B:
+            reg, rm = self._operand(rex)
+            self._registers[reg] = self._get(rm)
+            return
+        if octet == 0x89:
+            reg, rm = self._operand(rex)
+            self._put(rm, self._registers[reg])
+            return
+        if octet == 0x8D:
+            reg, rm = self._operand(rex)
+            if rm.address is None:
+                raise MachineDecodeError("an address of a register is not one")
+            self._registers[reg] = rm.address
+            return
+        if octet == 0x8A:
+            reg, rm = self._operand(rex)
+            self._put(Operand(register=reg), self._get(rm, 1), 1)
+            return
+        if octet == 0x88:
+            reg, rm = self._operand(rex)
+            self._put(rm, self._registers[reg] & 0xFF, 1)
+            return
+        if octet == 0xC6:
+            _, rm = self._operand(rex)
+            self._put(rm, self._next(), 1)
+            return
+        if octet == 0x69:
+            reg, rm = self._operand(rex)
+            self._registers[reg] = (
+                self._signed(self._get(rm)) * self._long()
+            ) & MASK64
+            return
+        if octet == 0xF7:
+            reg, rm = self._operand(rex)
+            return self._grouped(reg & 7, rm)
+        if octet == 0xFF:
+            reg, rm = self._operand(rex)
+            if reg & 7 == 0:
+                self._put(rm, self._apply("add", self._get(rm), 1) or 0)
+            elif reg & 7 == 1:
+                self._put(rm, self._apply("sub", self._get(rm), 1) or 0)
+            else:
+                raise MachineDecodeError(f"group five with extension {reg & 7}")
+            return
+        if octet == 0x85:
+            reg, rm = self._operand(rex)
+            self._settle(self._registers[reg] & self._get(rm))
+            return
+        if octet == 0x99:
+            self._registers[Register.RDX] = (
+                MASK64 if self._registers[Register.RAX] >> 63 else 0
+            )
+            return
+        if octet == 0xE9:
+            self._rip = (self._rip + 4 + self._long()) & MASK64
+            return
+        if octet == 0xE8:
+            displacement = self._long()
+            self._push(self._rip)
+            self._rip = (self._rip + displacement) & MASK64
+            return
+        if octet == 0xC3:
+            self._rip = self._pop()
+            return
+        raise MachineDecodeError(f"octet {octet:#04x} is not one this file writes")
+
+    def _escaped(self, rex: int) -> None:
+        octet = self._next()
+        if octet == 0x05:
+            return self._asked()
+        if octet == 0xB6:
+            reg, rm = self._operand(rex)
+            self._registers[reg] = self._get(rm, 1)
+            return
+        if octet == 0xAF:
+            reg, rm = self._operand(rex)
+            self._registers[reg] = (
+                self._signed(self._registers[reg]) * self._signed(self._get(rm))
+            ) & MASK64
+            return
+        if 0x90 <= octet <= 0x9F:
+            _, rm = self._operand(rex)
+            self._put(rm, 1 if self._holds(CONDITION_NAMES[octet & 0xF]) else 0, 1)
+            return
+        if 0x80 <= octet <= 0x8F:
+            displacement = self._long()
+            if self._holds(CONDITION_NAMES[octet & 0xF]):
+                self._rip = (self._rip + displacement) & MASK64
+            return
+        raise MachineDecodeError(f"two-octet {octet:#04x} is not one this file writes")
+
+    def _grouped(self, extension: int, rm: Operand) -> None:
+        if extension == 3:
+            self._put(rm, self._settle(-self._signed(self._get(rm))))
+            return
+        if extension != 7:
+            raise MachineDecodeError(f"group three with extension {extension}")
+        divisor = self._signed(self._get(rm))
+        if divisor == 0:
+            raise MachineTrap("a division by nothing")
+        pair = (self._registers[Register.RDX] << 64) | self._registers[Register.RAX]
+        if pair >> 127:
+            pair -= 1 << 128
+        quotient = abs(pair) // abs(divisor)
+        if (pair < 0) != (divisor < 0):
+            quotient = -quotient
+        self._registers[Register.RAX] = quotient & MASK64
+        self._registers[Register.RDX] = (pair - quotient * divisor) & MASK64
+
+    # -- the stack, and the two things it asks the world for --------------
+
+    def _push(self, value: int) -> None:
+        self._registers[Register.RSP] = (
+            self._registers[Register.RSP] - 8
+        ) & MASK64
+        self._memory.write(self._registers[Register.RSP], 8, value)
+
+    def _pop(self) -> int:
+        value = self._memory.read(self._registers[Register.RSP], 8)
+        self._registers[Register.RSP] = (
+            self._registers[Register.RSP] + 8
+        ) & MASK64
+        return value
+
+    def _asked(self) -> None:
+        number = self._registers[Register.RAX]
+        if number == SYS_WRITE:
+            length = self._registers[Register.RDX]
+            self._written.extend(
+                self._memory.octets(self._registers[Register.RSI], length)
+            )
+            self._registers[Register.RAX] = length
+            return
+        if number == SYS_EXIT_GROUP:
+            self._stopped = True
+            return
+        raise MachineTrap(f"this world was not asked for {number} before")
+
+    def run(self, patience: int = 200_000_000) -> str:
+        """Runs until the program says it is finished, and answers what it wrote."""
+        self._registers[Register.RSP] = STACK_CEILING - 4096
+        steps = 0
+        while not self._stopped:
+            steps += 1
+            if steps > patience:
+                raise MachineTrap("the program did not finish")
+            self._step()
+        return self._written.decode()
+
+
+def execute_machine_code(image: bytes) -> str:
+    """Runs an executable this file wrote, on no processor of that kind."""
+    return MachineReader(image).run()
+
+
+# ======================================================================
 # driver
 # ======================================================================
 
@@ -18579,6 +18993,15 @@ def _selftest(orders: Sequence[int]) -> int:
                     tiers.append((f"elf({architecture})", _run(binary, "").removesuffix("\n")))
             except (GlyphPlatformError, OSError) as exc:
                 print(f"  n={order:<3} elf({architecture}) skipped: {exc}", file=sys.stderr)
+        try:
+            tiers.append((
+                "machine-read-back",
+                execute_machine_code(
+                    machine_code(artifacts.module, "x86-64")
+                ).removesuffix("\n"),
+            ))
+        except GlyphPlatformError as exc:
+            print(f"  n={order:<3} machine read-back skipped: {exc}", file=sys.stderr)
         try:
             if not boot_runnable():
                 raise OSError("no system emulator is installed")
