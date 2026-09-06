@@ -216,6 +216,11 @@ jobs:
           print('a disk with a compiler and a source on it, and nothing else')
           "
 
+      - name: 30 programs nobody wrote, started on a machine, twice each
+        run: |
+          python ouroboros.py --fuzz 30 --fuzz-metal \
+            --fuzz-seed ${{ github.run_number }}
+
       - name: nothing depends on where the kernel decided to put it
         run: |
           python -c "

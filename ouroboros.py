@@ -6054,12 +6054,14 @@ class DifferentialFuzzer:
         native: bool = False,
         front_end: bool = False,
         corpus: Path | None = None,
+        metal: bool = False,
     ) -> None:
         self._entropy = random.Random(seed)
         self._generator = GslProgramGenerator(self._entropy)
         self._native = native
         self._front_end = front_end
         self._corpus = corpus
+        self._metal = metal
 
     def _render(self, source: str, order: int, **flags: Any) -> str:
         return synthesize_source(source, order, **flags).unwrap_or_raise().rendering
@@ -6158,7 +6160,33 @@ class DifferentialFuzzer:
                 machine_code(self._object_for(source, order), "x86-64")
             ).removesuffix("\n"))
         )
+        if self._metal and boot_runnable():
+            variants.append(
+                ("boot", lambda: self._through_metal(
+                    self._object_for(source, order), scratch, boot_image))
+            )
+            variants.append(
+                ("kernel", lambda: self._through_metal(
+                    self._object_for(source, order), scratch, kernel_image))
+            )
         return variants
+
+    def _through_metal(
+        self,
+        module: ObjectModule,
+        scratch: Path,
+        make: Callable[[ObjectModule], bytes],
+    ) -> str:
+        """Starts a machine on a disk, and answers what left the serial port.
+
+        The tiers with nothing underneath them were checked at seven orders on
+        the motifs in the catalogue and never on a program nobody wrote, which
+        is the one thing a fuzzer is for.  A quarter of a second a program is
+        why it is behind a flag.
+        """
+        disk = scratch / "fuzz-metal.img"
+        disk.write_bytes(make(module))
+        return run_boot(disk, module.order, patience=30.0).removesuffix("\n")
 
     @woven
     def run(self, iterations: int = 100) -> FuzzReport:
@@ -6208,6 +6236,11 @@ class DifferentialFuzzer:
             skipped.append("wasm tier (no WebAssembly host is installed)")
         tiers.append("read-back")
         tiers.append("machine-read-back")
+        if self._metal:
+            if boot_runnable():
+                tiers.extend(("boot", "kernel"))
+            else:
+                skipped.append("the tiers with nothing underneath (no emulator)")
 
         front_end: Path | None = None
         if self._front_end and toolchain is not None:
@@ -6301,9 +6334,10 @@ def fuzz(
     native: bool = False,
     front_end: bool = False,
     corpus: Path | None = None,
+    metal: bool = False,
 ) -> FuzzReport:
     """Generates ``iterations`` random programs and cross-checks every tier."""
-    return DifferentialFuzzer(seed, native, front_end, corpus).run(iterations)
+    return DifferentialFuzzer(seed, native, front_end, corpus, metal).run(iterations)
 
 
 # ----------------------------------------------------------------------
@@ -19219,6 +19253,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          help="keep what is found here, and re-check it first")
     fuzzing.add_argument("--fuzz-refusals", type=int, metavar="N",
                          help="break N programs and check both front ends refuse")
+    fuzzing.add_argument("--fuzz-metal", action="store_true",
+                         help="also start a machine on each case, twice")
     fuzzing.add_argument("--fuzz-loop", action="store_true",
                          help="also compile each case with the GSL-2 front end")
     return parser.parse_args(argv)
@@ -19349,6 +19385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             namespace.fuzz_native,
             namespace.fuzz_loop,
             Path(namespace.fuzz_corpus) if namespace.fuzz_corpus else None,
+            namespace.fuzz_metal,
         )
         print(report.render())
         return 0 if report.clean else 1
