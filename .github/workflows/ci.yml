@@ -28,8 +28,11 @@ jobs:
         with:
           python-version: "3.13"
 
+      # llvmlite is here so that ty can resolve the one optional import and
+      # check the tier that uses it.  Unlike the other jobs, nothing here
+      # runs, so having it installed claims nothing about what needs it.
       - name: both of them, pinned the way the actions are
-        run: pip install ruff==0.16.6 ty==0.0.78
+        run: pip install ruff==0.16.6 ty==0.0.78 llvmlite
 
       # --isolated so the rules are the ones written here and not whatever a
       # config file in some parent directory turns out to say.
