@@ -121,6 +121,7 @@ import operator
 import os
 import random
 import re
+import shlex
 import shutil
 import string
 import struct
@@ -11582,6 +11583,18 @@ class X86Assembler:
         """call [mem]: the only way to reach a routine somebody else wrote."""
         self._quad((0xFF,), 2, through)
 
+    def shift_right(self, destination: Register, count: int) -> None:
+        self._quad((0xC1,), 5, destination)
+        self._emit(count & 0xFF)
+
+    def in_octet(self) -> None:
+        """in al, dx: one octet from the port a device is listening on."""
+        self._emit(0xEC)
+
+    def read_port_words(self) -> None:
+        """rep insw: rcx words from port dx, straight into memory at rdi."""
+        self._emit(0xF3, 0x66, 0x6D)
+
     def out(self) -> None:
         """out dx, al: the one way out of a machine with no kernel."""
         self._emit(0xEE)
@@ -13487,7 +13500,7 @@ def run_efi(image: bytes, lines: int, patience: float = 40.0) -> str:
 
 
 # ======================================================================
-# Tier 8: a kernel, and the binary that was never told
+# Tier 8: a kernel, and the binaries that were never told
 # ======================================================================
 #
 # Tier 7 asks for no kernel by making the program into the machine: a payload
@@ -13495,34 +13508,66 @@ def run_efi(image: bytes, lines: int, patience: float = 40.0) -> str:
 # cells because there is no descriptor to write to.  It is bare metal at the
 # cost of being a third build of the same program.
 #
-# So the other way round.  Leave the program exactly as layer 18 emits it for
-# a machine running Linux - the same octets `--emit-elf` writes, the same file
-# a release carries - and put underneath it the least thing that can be said
-# to be underneath it.  What that program asks the world for is two numbers
-# through one instruction, and where its segments go, and that its memory
-# start out zero.  Nothing else.  A kernel is therefore an ELF loader, four
-# writes to model-specific registers, and a routine that turns octets into
-# light.
+# So the other way round.  Leave the program exactly as it was built for a
+# machine running Linux and put underneath it the least thing that can be
+# said to be underneath it.  What a program asks the world for is some
+# numbers through one instruction, and where its segments go, and a stack
+# laid out the way the calling convention says, and that its memory start out
+# zero.  A kernel is therefore a disk driver, an ELF loader, a block of stack
+# prepared in advance, and a table of answers.
 #
-# The point is what is not here.  No scheduler, no interrupts, no descriptor
-# table of its own, no memory it manages, no filesystem to read the program
-# out of - the program is at a known offset on the disk because this put it
-# there.  It is not an operating system.  It is the answer to the question of
-# how little has to exist before the artifact everybody else runs will run.
+# The point is what is not here.  No scheduler, no interrupt, no descriptor
+# table of its own, no process but the one, no filesystem: a program that
+# opens a file is told there is none.  It is not an operating system.  It is
+# the answer to the question of how little has to exist before a binary
+# somebody else compiled will run.
+#
+# The BIOS puts sectors in a sixty-four kilooctet window and there is no BIOS
+# once the machine is in long mode, so a program of a megaoctet cannot arrive
+# the way the sector does.  The kernel reads its own program off the disk
+# instead, one sector at a time, through the ports an IDE controller listens
+# on - which is also the more honest arrangement, since a kernel that is
+# handed its program is a launcher.
 
 KERNEL_BASE: Final[int] = PAYLOAD_BASE
 KERNEL_SPAN: Final[int] = 0x1000
-PROGRAM_BLOB: Final[int] = KERNEL_BASE + KERNEL_SPAN
+KERNEL_CODE_SPAN: Final[int] = 0xA00
+PROGRAM_LBA: Final[int] = 1 + KERNEL_SPAN // SECTOR
+HEADER_SECTORS: Final[int] = 4
+HEADER_SCRATCH: Final[int] = KERNEL_BASE + KERNEL_SPAN
+PREPARED_STACK: Final[int] = KERNEL_BASE + KERNEL_CODE_SPAN
+PREPARED_SPAN: Final[int] = KERNEL_SPAN - KERNEL_CODE_SPAN
+
 PROGRAM_STACK: Final[int] = 0x800000
+PROGRAM_VECTOR: Final[int] = PROGRAM_STACK - 0x800
+PROGRAM_BREAK: Final[int] = 0x1000000
+PROGRAM_MAPPINGS: Final[int] = 0x4000000
 
 EFER_MSR: Final[int] = 0xC0000080
 STAR_MSR: Final[int] = 0xC0000081
 LSTAR_MSR: Final[int] = 0xC0000082
 SFMASK_MSR: Final[int] = 0xC0000084
+FS_BASE_MSR: Final[int] = 0xC0000100
 EFER_SYSCALL: Final[int] = 1
 KERNEL_CODE_SELECTOR: Final[int] = 0x08
 PROGRAM_SELECTOR_BASE: Final[int] = 0x10
-PROGRAM_FLAGS: Final[int] = 0x202
+# The one bit that is always set, and deliberately not the one that lets an
+# interrupt in.  There is no table for a machine to look a handler up in, so
+# the first device to raise its hand would end the program; the disk raises
+# hers the moment the kernel reads a sector.
+PROGRAM_FLAGS: Final[int] = 0x002
+INTERRUPT_MASK_LOW: Final[int] = 0x21
+INTERRUPT_MASK_HIGH: Final[int] = 0xA1
+
+DISK_DATA: Final[int] = 0x1F0
+DISK_COUNT: Final[int] = 0x1F2
+DISK_LBA_LOW: Final[int] = 0x1F3
+DISK_LBA_MID: Final[int] = 0x1F4
+DISK_LBA_HIGH: Final[int] = 0x1F5
+DISK_DRIVE: Final[int] = 0x1F6
+DISK_COMMAND: Final[int] = 0x1F7
+DISK_READ: Final[int] = 0x20
+DISK_HAS_DATA: Final[int] = 0x08
 
 ELF_ENTRY: Final[int] = 24
 ELF_SEGMENTS_AT: Final[int] = 32
@@ -13534,6 +13579,537 @@ SEGMENT_ADDRESS: Final[int] = 16
 SEGMENT_ON_DISK: Final[int] = 32
 SEGMENT_IN_MEMORY: Final[int] = 40
 SEGMENT_LOADABLE: Final[int] = 1
+
+PAGE_SPAN: Final[int] = 0x1000
+
+# What the calling convention calls the vector after the arguments: pairs of
+# a name and a value, ending in a pair of nothing.  A program built against a
+# small libc reads its page size, its own headers and its stack cookie out of
+# here before it reaches main, so a stack without one does not get that far.
+AUX_NULL: Final[int] = 0
+AUX_SEGMENTS: Final[int] = 3
+AUX_SEGMENT_SPAN: Final[int] = 4
+AUX_SEGMENT_COUNT: Final[int] = 5
+AUX_PAGE_SPAN: Final[int] = 6
+AUX_BASE: Final[int] = 7
+AUX_FLAGS: Final[int] = 8
+AUX_ENTRY: Final[int] = 9
+AUX_UID: Final[int] = 11
+AUX_EUID: Final[int] = 12
+AUX_GID: Final[int] = 13
+AUX_EGID: Final[int] = 14
+AUX_CLOCK_TICKS: Final[int] = 17
+AUX_SECURE: Final[int] = 23
+AUX_ENTROPY: Final[int] = 25
+AUX_NAME: Final[int] = 31
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramSegment:
+    """One loadable piece of a program, and where the disk keeps it."""
+
+    offset: int
+    address: int
+    on_disk: int
+    in_memory: int
+
+    @property
+    def skew(self) -> int:
+        """How far into a sector the piece starts."""
+        return self.offset % SECTOR
+
+    @property
+    def landing(self) -> int:
+        """Where a whole number of sectors has to be put for it to line up."""
+        return self.address - self.skew
+
+    @property
+    def sectors(self) -> int:
+        return -(-(self.skew + self.on_disk) // SECTOR)
+
+    @property
+    def ceiling(self) -> int:
+        return self.address + self.in_memory
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramPlan:
+    """What the kernel will find when it reads the program's own headers."""
+
+    entry: int
+    segments_at: int
+    segment_span: int
+    segment_count: int
+    segments: tuple[ProgramSegment, ...]
+
+    @property
+    def headers_in_memory(self) -> int:
+        """Where the headers end up once the segment holding them is loaded."""
+        for segment in self.segments:
+            reach = self.segments_at - segment.offset
+            if 0 <= reach < segment.on_disk:
+                return segment.address + reach
+        raise MachineCodeError("the headers are not in any loadable segment")
+
+    @property
+    def ceiling(self) -> int:
+        return max(segment.ceiling for segment in self.segments)
+
+
+def program_plan(program: bytes) -> ProgramPlan:
+    """Reads a program the way the kernel will, and refuses what it could not.
+
+    Everything here is checked where a mistake is cheap.  The kernel cannot
+    relocate, cannot follow an interpreter and cannot grow the stack out of
+    the way of a program that wants the address the stack is at, so a program
+    that needs any of those is refused now rather than at boot, where the
+    only symptom would be a machine that stops.
+    """
+    if len(program) < 64 or program[:4] != b"\x7fELF":
+        raise MachineCodeError("that is not an executable")
+    kind, machine = struct.unpack_from("<HH", program, 16)
+    if kind != 2:
+        raise MachineCodeError(
+            "this kernel does not relocate, so it wants a fixed executable"
+        )
+    if machine != 0x3E:
+        raise MachineCodeError(f"that executable is not for this machine ({machine:#x})")
+    entry, segments_at = struct.unpack_from("<QQ", program, ELF_ENTRY)
+    span, count = struct.unpack_from("<HH", program, ELF_SEGMENT_SPAN)
+    if segments_at + count * span > HEADER_SECTORS * SECTOR:
+        raise MachineCodeError("the headers are further in than the kernel reads")
+
+    segments: list[ProgramSegment] = []
+    for index in range(count):
+        base = segments_at + index * span
+        fields = struct.unpack_from("<IIQQQQQQ", program, base)
+        if fields[0] == 3:
+            raise MachineCodeError("this kernel is not an interpreter's loader")
+        if fields[0] != SEGMENT_LOADABLE:
+            continue
+        segments.append(
+            ProgramSegment(
+                offset=fields[2], address=fields[3],
+                on_disk=fields[5], in_memory=fields[6],
+            )
+        )
+    if not segments:
+        raise MachineCodeError("there is nothing in that executable to load")
+
+    for segment in segments:
+        if segment.offset + segment.on_disk > len(program):
+            raise MachineCodeError("a segment runs off the end of the file")
+        for other in segments:
+            if other is segment:
+                continue
+            if segment.landing < other.ceiling and other.address < segment.ceiling:
+                raise MachineCodeError(
+                    "two segments would land on each other, sector for sector"
+                )
+    plan = ProgramPlan(entry, segments_at, span, count, tuple(segments))
+    if plan.ceiling > PROGRAM_VECTOR:
+        raise MachineCodeError(
+            f"the program reaches {plan.ceiling:#x} and the stack is at "
+            f"{PROGRAM_VECTOR:#x}"
+        )
+    return plan
+
+
+def initial_stack(plan: ProgramPlan, arguments: Sequence[str]) -> bytes:
+    """The block the program wakes up looking at, laid out here rather than there.
+
+    Every address in it is known before the machine starts, because the stack
+    is at a fixed place and this is what builds the disk.  So the kernel does
+    not assemble a stack: it copies one, which is the difference between a
+    page of code and a memcpy.
+    """
+    if not arguments:
+        raise MachineCodeError("a program is called something")
+    named = [argument.encode() + b"\x00" for argument in arguments]
+    pairs = (
+        (AUX_SEGMENTS, plan.headers_in_memory),
+        (AUX_SEGMENT_SPAN, plan.segment_span),
+        (AUX_SEGMENT_COUNT, plan.segment_count),
+        (AUX_PAGE_SPAN, PAGE_SPAN),
+        (AUX_BASE, 0),
+        (AUX_FLAGS, 0),
+        (AUX_ENTRY, plan.entry),
+        (AUX_UID, 0), (AUX_EUID, 0), (AUX_GID, 0), (AUX_EGID, 0),
+        (AUX_SECURE, 0),
+        (AUX_CLOCK_TICKS, 100),
+    )
+    # argc, the arguments, their terminator, an empty environment's
+    # terminator, the pairs, the entropy pair, the name pair, and the end.
+    words = 1 + len(named) + 1 + 1 + 2 * len(pairs) + 2 + 2 + 2
+    entropy_at = PROGRAM_VECTOR + words * 8
+    strings_at = entropy_at + 16
+
+    places: list[int] = []
+    cursor = strings_at
+    for name in named:
+        places.append(cursor)
+        cursor += len(name)
+
+    vector = [len(named), *places, 0, 0]
+    for name, value in pairs:
+        vector.extend((name, value))
+    vector.extend((AUX_ENTROPY, entropy_at))
+    vector.extend((AUX_NAME, places[0]))
+    vector.extend((AUX_NULL, 0))
+    assert len(vector) == words, (len(vector), words)
+
+    block = b"".join(struct.pack("<Q", value) for value in vector)
+    block += bytes(range(16))
+    block += b"".join(named)
+    if len(block) + 8 > PREPARED_SPAN:
+        raise MachineCodeError(
+            f"the prepared stack wants {len(block) + 8} octets of {PREPARED_SPAN}"
+        )
+    return struct.pack("<Q", len(block)) + block
+
+
+SYS_READ: Final[int] = 0
+SYS_OPEN: Final[int] = 2
+SYS_CLOSE: Final[int] = 3
+SYS_STAT: Final[int] = 4
+SYS_FSTAT: Final[int] = 5
+SYS_LSTAT: Final[int] = 6
+SYS_MMAP: Final[int] = 9
+SYS_MPROTECT: Final[int] = 10
+SYS_MUNMAP: Final[int] = 11
+SYS_BRK: Final[int] = 12
+SYS_SIGACTION: Final[int] = 13
+SYS_SIGPROCMASK: Final[int] = 14
+SYS_IOCTL: Final[int] = 16
+SYS_WRITEV: Final[int] = 20
+SYS_ACCESS: Final[int] = 21
+SYS_GETPID: Final[int] = 39
+SYS_UNAME: Final[int] = 63
+SYS_READLINK: Final[int] = 89
+SYS_GETUID: Final[int] = 102
+SYS_GETGID: Final[int] = 104
+SYS_SETUID: Final[int] = 105
+SYS_SETGID: Final[int] = 106
+SYS_GETEUID: Final[int] = 107
+SYS_GETEGID: Final[int] = 108
+SYS_GETPPID: Final[int] = 110
+SYS_ARCH_PRCTL: Final[int] = 158
+SYS_SET_TID: Final[int] = 218
+SYS_OPENAT: Final[int] = 257
+SYS_FSTATAT: Final[int] = 262
+
+ARCH_SET_FS: Final[int] = 0x1002
+NO_SUCH_FILE: Final[int] = -2
+NOT_A_TERMINAL: Final[int] = -25
+NOT_UNDERSTOOD: Final[int] = -38
+NOT_ALLOWED: Final[int] = -22
+
+# Everything a program may ask that this can answer with a number and no
+# work.  A kernel with one process, no users and no files knows all of these
+# without having to keep anything.
+SETTLED_ANSWERS: Final[tuple[tuple[int, int], ...]] = (
+    (SYS_READ, 0),                  # standard input is at its end
+    (SYS_CLOSE, 0),
+    (SYS_MPROTECT, 0),
+    (SYS_MUNMAP, 0),
+    (SYS_SIGACTION, 0),
+    (SYS_SIGPROCMASK, 0),
+    (SYS_GETUID, 0), (SYS_GETEUID, 0), (SYS_GETGID, 0), (SYS_GETEGID, 0),
+    (SYS_SETUID, 0), (SYS_SETGID, 0),
+    (SYS_GETPID, 1), (SYS_GETPPID, 0), (SYS_SET_TID, 1),
+    (SYS_IOCTL, NOT_A_TERMINAL),
+    (SYS_STAT, NO_SUCH_FILE), (SYS_LSTAT, NO_SUCH_FILE),
+    (SYS_FSTAT, NO_SUCH_FILE), (SYS_FSTATAT, NO_SUCH_FILE),
+    (SYS_OPEN, NO_SUCH_FILE), (SYS_OPENAT, NO_SUCH_FILE),
+    (SYS_ACCESS, NO_SUCH_FILE), (SYS_READLINK, NO_SUCH_FILE),
+    (SYS_UNAME, NOT_UNDERSTOOD),
+)
+
+KERNEL_SCRATCH: Final[Register] = Register.R14
+KERNEL_SPARE: Final[Register] = Register.R15
+
+
+def _port(text: X86Assembler, port: int, value: Register) -> None:
+    """One octet of ``value`` out of ``port``."""
+    text.immediate(Register.RDX, port)
+    text.load(Register.RAX, value)
+    text.out()
+
+
+def _kernel_disk(text: X86Assembler) -> None:
+    """fetch: r13 sectors from r8 onwards, into rdi.
+
+    The controller is addressed the way the oldest of them are, one sector at
+    a time with a poll in between, because there is exactly one thing to read
+    and nothing else waiting to use the machine while it arrives.
+    """
+    text.label("fetch")
+    text.test(Register.R13, Register.R13)
+    text.jump_if("e", "fetch.done")
+
+    text.load(KERNEL_SCRATCH, Register.R8)
+    text.shift_right(KERNEL_SCRATCH, 24)
+    text.arithmetic_immediate("and", KERNEL_SCRATCH, 0x0F)
+    text.arithmetic_immediate("or", KERNEL_SCRATCH, 0xE0)
+    _port(text, DISK_DRIVE, KERNEL_SCRATCH)
+    text.immediate(KERNEL_SCRATCH, 1)
+    _port(text, DISK_COUNT, KERNEL_SCRATCH)
+    text.load(KERNEL_SCRATCH, Register.R8)
+    _port(text, DISK_LBA_LOW, KERNEL_SCRATCH)
+    text.load(KERNEL_SCRATCH, Register.R8)
+    text.shift_right(KERNEL_SCRATCH, 8)
+    _port(text, DISK_LBA_MID, KERNEL_SCRATCH)
+    text.load(KERNEL_SCRATCH, Register.R8)
+    text.shift_right(KERNEL_SCRATCH, 16)
+    _port(text, DISK_LBA_HIGH, KERNEL_SCRATCH)
+    text.immediate(KERNEL_SCRATCH, DISK_READ)
+    _port(text, DISK_COMMAND, KERNEL_SCRATCH)
+
+    text.label("fetch.wait")
+    text.immediate(Register.RDX, DISK_COMMAND)
+    text.in_octet()
+    text.arithmetic_immediate("and", Register.RAX, DISK_HAS_DATA)
+    text.jump_if("e", "fetch.wait")
+
+    text.immediate(Register.RDX, DISK_DATA)
+    text.immediate(Register.RCX, SECTOR // 2)
+    text.read_port_words()
+    text.increment(Register.R8)
+    text.decrement(Register.R13)
+    text.jump("fetch")
+    text.label("fetch.done")
+    text.ret()
+
+
+def _kernel_loader(text: X86Assembler) -> None:
+    """settle: every loadable segment off the disk and into place, entry in rax.
+
+    A segment does not start on a sector boundary, so the sectors holding it
+    are put where the boundary would have been and the segment lands at the
+    address it asked for.  What that overwrites is the few octets in front of
+    it, which is why `program_plan` refuses a program whose segments would
+    reach each other that way.
+    """
+    text.label("settle")
+    text.immediate(Register.RBP, HEADER_SCRATCH)
+    text.load(Register.R9, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENTS_AT))
+    text.arithmetic("add", Register.R9, Register.RBP)
+    text.widen_word(
+        Register.R10, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENT_COUNT)
+    )
+    text.widen_word(
+        Register.R11, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENT_SPAN)
+    )
+
+    text.label("settle.head")
+    text.test(Register.R10, Register.R10)
+    text.jump_if("e", "settle.done")
+    text.widen_long(Register.RAX, MemoryOperand(Register.R9, None, 1, SEGMENT_KIND))
+    text.arithmetic_immediate("cmp", Register.RAX, SEGMENT_LOADABLE)
+    text.jump_if("ne", "settle.next")
+
+    text.load(Register.RBX, MemoryOperand(Register.R9, None, 1, SEGMENT_OFFSET))
+    text.load(Register.R12, Register.RBX)
+    text.arithmetic_immediate("and", Register.RBX, SECTOR - 1)
+    text.load(Register.RDI, MemoryOperand(Register.R9, None, 1, SEGMENT_ADDRESS))
+    text.arithmetic("sub", Register.RDI, Register.RBX)
+    text.load(Register.R8, Register.R12)
+    text.shift_right(Register.R8, 9)
+    text.arithmetic_immediate("add", Register.R8, PROGRAM_LBA)
+    text.load(Register.R13, MemoryOperand(Register.R9, None, 1, SEGMENT_ON_DISK))
+    text.arithmetic("add", Register.R13, Register.RBX)
+    text.arithmetic_immediate("add", Register.R13, SECTOR - 1)
+    text.shift_right(Register.R13, 9)
+    text.call("fetch")
+
+    text.load(Register.RDI, MemoryOperand(Register.R9, None, 1, SEGMENT_ADDRESS))
+    text.load(Register.R12, MemoryOperand(Register.R9, None, 1, SEGMENT_ON_DISK))
+    text.load(KERNEL_SPARE, MemoryOperand(Register.R9, None, 1, SEGMENT_IN_MEMORY))
+    text.arithmetic("add", Register.RDI, Register.R12)
+    text.arithmetic("sub", KERNEL_SPARE, Register.R12)
+    text.label("settle.wipe")
+    text.test(KERNEL_SPARE, KERNEL_SPARE)
+    text.jump_if("e", "settle.next")
+    text.store_octet_immediate(MemoryOperand(Register.RDI, None, 1, 0), 0)
+    text.increment(Register.RDI)
+    text.decrement(KERNEL_SPARE)
+    text.jump("settle.wipe")
+
+    text.label("settle.next")
+    text.arithmetic("add", Register.R9, Register.R11)
+    text.decrement(Register.R10)
+    text.jump("settle.head")
+
+    text.label("settle.done")
+    text.load(Register.RAX, MemoryOperand(Register.RBP, None, 1, ELF_ENTRY))
+    text.ret()
+
+
+def _kernel_console(text: X86Assembler) -> None:
+    """utter: r12 octets at rsi, to the cells and out of the port.
+
+    Where it got to is kept between calls, because a program is entitled to
+    say a line in as many pieces as it likes and a screen that started again
+    each time would show only the last of them.
+    """
+    kept = (
+        Register.RAX, Register.RCX, Register.RDX, Register.R8, Register.R9,
+        Register.R10, Register.R11, KERNEL_SCRATCH,
+    )
+    text.label("utter")
+    for register in kept:
+        text.push(register)
+    text.address_of_label(KERNEL_SCRATCH, "cell.row")
+    text.load(Register.R9, MemoryOperand(KERNEL_SCRATCH, None, 1, 0))
+    text.load(Register.R10, MemoryOperand(KERNEL_SCRATCH, None, 1, 8))
+    text.immediate(Register.R11, VGA_TEXT_BASE)
+    text.arithmetic("xor", Register.R8, Register.R8)
+
+    text.label("utter.head")
+    text.arithmetic("cmp", Register.R8, Register.R12)
+    text.jump_if("ge", "utter.done")
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.load_octet(Register.RAX, MemoryOperand(Register.RSI, Register.R8, 1, 0))
+    text.immediate(Register.RDX, SERIAL_PORT)
+    text.out()
+    text.arithmetic_immediate("cmp", Register.RAX, ord("\n"))
+    text.jump_if("e", "utter.newline")
+    text.multiply_immediate(Register.RCX, Register.R9, VGA_ROW_OCTETS)
+    text.arithmetic("add", Register.RCX, Register.R11)
+    text.store_octet(MemoryOperand(Register.RCX, Register.R10, 2, 0), Register.RAX)
+    text.store_octet_immediate(MemoryOperand(Register.RCX, Register.R10, 2, 1), 0x07)
+    text.increment(Register.R10)
+    text.jump("utter.step")
+    text.label("utter.newline")
+    text.increment(Register.R9)
+    text.arithmetic("xor", Register.R10, Register.R10)
+    text.label("utter.step")
+    text.increment(Register.R8)
+    text.jump("utter.head")
+
+    text.label("utter.done")
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.R9)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 8), Register.R10)
+    for register in reversed(kept):
+        text.pop(register)
+    text.ret()
+
+
+def _kernel_handler(text: X86Assembler) -> None:
+    """attend: what a program asks for, and everything it expects back.
+
+    The calling convention says a program keeps every register across the
+    instruction but two, so all of them are saved and the two are the way
+    back.  Which is also why an arm may use whatever it likes.
+    """
+    kept = (
+        Register.RDI, Register.RSI, Register.RDX, Register.R8, Register.R9,
+        Register.R10, Register.R11, Register.R12, Register.R13,
+        KERNEL_SCRATCH, KERNEL_SPARE,
+    )
+    text.label("attend")
+    text.push(Register.RBX)
+    text.load(Register.RBX, Register.RCX)
+    for register in kept:
+        text.push(register)
+
+    for number, label in (
+        (SYS_WRITE, "attend.write"),
+        (SYS_WRITEV, "attend.gather"),
+        (SYS_BRK, "attend.break"),
+        (SYS_MMAP, "attend.map"),
+        (SYS_ARCH_PRCTL, "attend.thread"),
+        (SYS_EXIT_GROUP, "attend.rest"),
+    ):
+        text.arithmetic_immediate("cmp", Register.RAX, number)
+        text.jump_if("e", label)
+    for number, answer in SETTLED_ANSWERS:
+        text.arithmetic_immediate("cmp", Register.RAX, number)
+        text.jump_if("ne", f"attend.not{number}")
+        text.immediate(Register.RAX, answer)
+        text.jump("attend.leave")
+        text.label(f"attend.not{number}")
+    text.immediate(Register.RAX, NOT_UNDERSTOOD)
+    text.jump("attend.leave")
+
+    text.label("attend.write")
+    text.load(Register.R12, Register.RDX)
+    text.call("utter")
+    text.load(Register.RAX, Register.R12)
+    text.jump("attend.leave")
+
+    text.label("attend.gather")
+    text.load(Register.R9, Register.RSI)
+    text.arithmetic("xor", KERNEL_SPARE, KERNEL_SPARE)
+    text.arithmetic("xor", KERNEL_SCRATCH, KERNEL_SCRATCH)
+    text.label("attend.gather.head")
+    text.arithmetic("cmp", KERNEL_SCRATCH, Register.RDX)
+    text.jump_if("ge", "attend.gather.done")
+    text.multiply_immediate(Register.R13, KERNEL_SCRATCH, 16)
+    text.arithmetic("add", Register.R13, Register.R9)
+    text.load(Register.RSI, MemoryOperand(Register.R13, None, 1, 0))
+    text.load(Register.R12, MemoryOperand(Register.R13, None, 1, 8))
+    text.call("utter")
+    text.arithmetic("add", KERNEL_SPARE, Register.R12)
+    text.increment(KERNEL_SCRATCH)
+    text.jump("attend.gather.head")
+    text.label("attend.gather.done")
+    text.load(Register.RAX, KERNEL_SPARE)
+    text.jump("attend.leave")
+
+    text.label("attend.break")
+    text.address_of_label(KERNEL_SCRATCH, "cell.break")
+    text.load(Register.RAX, MemoryOperand(KERNEL_SCRATCH, None, 1, 0))
+    text.test(Register.RDI, Register.RDI)
+    text.jump_if("e", "attend.leave")
+    text.arithmetic("cmp", Register.RDI, Register.RAX)
+    text.jump_if("l", "attend.leave")
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RDI)
+    text.load(Register.RAX, Register.RDI)
+    text.jump("attend.leave")
+
+    text.label("attend.map")
+    text.address_of_label(KERNEL_SCRATCH, "cell.mapping")
+    text.load(Register.RAX, MemoryOperand(KERNEL_SCRATCH, None, 1, 0))
+    text.load(KERNEL_SPARE, Register.RSI)
+    text.arithmetic_immediate("add", KERNEL_SPARE, PAGE_SPAN - 1)
+    text.arithmetic_immediate("and", KERNEL_SPARE, -PAGE_SPAN)
+    text.load(Register.R13, Register.RAX)
+    text.arithmetic("add", Register.R13, KERNEL_SPARE)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.R13)
+    text.load(Register.R12, Register.RAX)
+    text.arithmetic("xor", Register.RCX, Register.RCX)
+    text.label("attend.map.wipe")
+    text.arithmetic("cmp", Register.RCX, KERNEL_SPARE)
+    text.jump_if("ge", "attend.leave")
+    text.store_octet_immediate(MemoryOperand(Register.R12, Register.RCX, 1, 0), 0)
+    text.increment(Register.RCX)
+    text.jump("attend.map.wipe")
+
+    text.label("attend.thread")
+    text.arithmetic_immediate("cmp", Register.RDI, ARCH_SET_FS)
+    text.jump_if("ne", "attend.thread.no")
+    text.immediate(Register.RCX, FS_BASE_MSR)
+    text.load(Register.RAX, Register.RSI)
+    text.load(Register.RDX, Register.RSI)
+    text.shift_right(Register.RDX, 32)
+    text.write_msr()
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.jump("attend.leave")
+    text.label("attend.thread.no")
+    text.immediate(Register.RAX, NOT_ALLOWED)
+    text.jump("attend.leave")
+
+    text.label("attend.rest")
+    text.halt()
+    text.jump("attend.rest")
+
+    text.label("attend.leave")
+    for register in reversed(kept):
+        text.pop(register)
+    text.load(Register.RCX, Register.RBX)
+    text.pop(Register.RBX)
+    text.system_return()
 
 
 def _kernel_prologue(text: X86Assembler) -> None:
@@ -13565,185 +14141,127 @@ def _kernel_prologue(text: X86Assembler) -> None:
     text.arithmetic("xor", Register.RDX, Register.RDX)
     text.write_msr()
 
+    text.immediate(Register.RAX, 0xFF)
+    for port in (INTERRUPT_MASK_LOW, INTERRUPT_MASK_HIGH):
+        text.immediate(Register.RDX, port)
+        text.out()
 
-def _kernel_loader(text: X86Assembler) -> None:
-    """settle: the segments where the file says they go, and the entry in rax.
+    text.address_of_label(KERNEL_SCRATCH, "cell.break")
+    text.immediate(Register.RAX, PROGRAM_BREAK)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RAX)
+    text.address_of_label(KERNEL_SCRATCH, "cell.mapping")
+    text.immediate(Register.RAX, PROGRAM_MAPPINGS)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RAX)
+    text.address_of_label(KERNEL_SCRATCH, "cell.row")
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RAX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 8), Register.RAX)
 
-    Every loadable segment is copied from the image and then zeroed out to
-    the length it claims in memory, which is the whole of what the program
-    means by expecting its memory to start out empty.
-    """
-    text.label("settle")
-    text.immediate(Register.R8, PROGRAM_BLOB)
-    text.load(Register.R9, MemoryOperand(Register.R8, None, 1, ELF_SEGMENTS_AT))
-    text.arithmetic("add", Register.R9, Register.R8)
-    text.widen_word(
-        Register.R10, MemoryOperand(Register.R8, None, 1, ELF_SEGMENT_COUNT)
-    )
-    text.widen_word(
-        Register.R11, MemoryOperand(Register.R8, None, 1, ELF_SEGMENT_SPAN)
-    )
-
-    text.label("settle.head")
-    text.test(Register.R10, Register.R10)
-    text.jump_if("e", "settle.done")
-    text.widen_long(Register.RAX, MemoryOperand(Register.R9, None, 1, SEGMENT_KIND))
-    text.arithmetic_immediate("cmp", Register.RAX, SEGMENT_LOADABLE)
-    text.jump_if("ne", "settle.next")
-
-    text.load(Register.RSI, MemoryOperand(Register.R9, None, 1, SEGMENT_OFFSET))
-    text.arithmetic("add", Register.RSI, Register.R8)
-    text.load(Register.RDI, MemoryOperand(Register.R9, None, 1, SEGMENT_ADDRESS))
-    text.load(Register.R12, MemoryOperand(Register.R9, None, 1, SEGMENT_ON_DISK))
-    text.load(Register.R13, MemoryOperand(Register.R9, None, 1, SEGMENT_IN_MEMORY))
-    text.arithmetic("xor", Register.RCX, Register.RCX)
-
-    text.label("settle.copy")
-    text.arithmetic("cmp", Register.RCX, Register.R12)
-    text.jump_if("ge", "settle.wipe")
-    text.load_octet(Register.RAX, MemoryOperand(Register.RSI, Register.RCX, 1, 0))
-    text.store_octet(MemoryOperand(Register.RDI, Register.RCX, 1, 0), Register.RAX)
-    text.increment(Register.RCX)
-    text.jump("settle.copy")
-
-    text.label("settle.wipe")
-    text.arithmetic("cmp", Register.RCX, Register.R13)
-    text.jump_if("ge", "settle.next")
-    text.store_octet_immediate(MemoryOperand(Register.RDI, Register.RCX, 1, 0), 0)
-    text.increment(Register.RCX)
-    text.jump("settle.wipe")
-
-    text.label("settle.next")
-    text.arithmetic("add", Register.R9, Register.R11)
-    text.decrement(Register.R10)
-    text.jump("settle.head")
-
-    text.label("settle.done")
-    text.load(Register.RAX, MemoryOperand(Register.R8, None, 1, ELF_ENTRY))
-    text.ret()
-
-
-def _kernel_handler(text: X86Assembler) -> None:
-    """attend: the two numbers, and everything the caller expects back.
-
-    The calling convention says a program keeps every register across the
-    instruction but two, so everything this touches is saved.  The way back
-    is one of the two, which is why it is moved somewhere safe first.
-    """
-    saved = (
-        Register.RDI, Register.RSI, Register.RDX, Register.R8, Register.R9,
-        Register.R10, Register.R11, Register.R12, Register.R13, Register.R14,
-        Register.R15,
-    )
-    text.label("attend")
-    text.push(Register.RBX)
-    text.load(Register.RBX, Register.RCX)
-    for register in saved:
-        text.push(register)
-    text.load(Register.R12, Register.RDX)
-
-    text.arithmetic_immediate("cmp", Register.RAX, SYS_WRITE)
-    text.jump_if("e", "attend.write")
-    text.arithmetic_immediate("cmp", Register.RAX, SYS_EXIT_GROUP)
-    text.jump_if("e", "attend.rest")
-    text.immediate(Register.RAX, -1)
-    text.jump("attend.leave")
-
-    text.label("attend.write")
-    text.call("utter")
-    text.load(Register.RAX, Register.R12)
-    text.jump("attend.leave")
-
-    text.label("attend.rest")
-    text.halt()
-    text.jump("attend.rest")
-
-    text.label("attend.leave")
-    for register in reversed(saved):
-        text.pop(register)
-    text.load(Register.RCX, Register.RBX)
-    text.pop(Register.RBX)
-    text.system_return()
-
-
-def _kernel_console(text: X86Assembler) -> None:
-    """utter: r12 octets at rsi, to the cells and out of the port.
-
-    The same routine tier 7 carries, reading from wherever it is pointed
-    rather than from a buffer at an address it chose itself.
-    """
-    text.label("utter")
     text.immediate(Register.R11, VGA_TEXT_BASE)
     text.arithmetic("xor", Register.RCX, Register.RCX)
-    text.label("utter.clear")
+    text.label("clear")
     text.arithmetic_immediate("cmp", Register.RCX, VGA_CELLS)
-    text.jump_if("ge", "utter.cleared")
+    text.jump_if("ge", "cleared")
     text.store_octet_immediate(
         MemoryOperand(Register.R11, Register.RCX, 2, 0), ord(" ")
     )
     text.store_octet_immediate(MemoryOperand(Register.R11, Register.RCX, 2, 1), 0x07)
     text.increment(Register.RCX)
-    text.jump("utter.clear")
-    text.label("utter.cleared")
-
-    text.arithmetic("xor", Register.R8, Register.R8)
-    text.arithmetic("xor", Register.R9, Register.R9)
-    text.arithmetic("xor", Register.R10, Register.R10)
-    text.label("utter.head")
-    text.arithmetic("cmp", Register.R8, Register.R12)
-    text.jump_if("ge", "utter.done")
-    text.arithmetic("xor", Register.RAX, Register.RAX)
-    text.load_octet(Register.RAX, MemoryOperand(Register.RSI, Register.R8, 1, 0))
-    text.immediate(Register.RDX, SERIAL_PORT)
-    text.out()
-    text.arithmetic_immediate("cmp", Register.RAX, ord("\n"))
-    text.jump_if("e", "utter.newline")
-    text.multiply_immediate(Register.RCX, Register.R9, VGA_ROW_OCTETS)
-    text.arithmetic("add", Register.RCX, Register.R11)
-    text.store_octet(MemoryOperand(Register.RCX, Register.R10, 2, 0), Register.RAX)
-    text.store_octet_immediate(MemoryOperand(Register.RCX, Register.R10, 2, 1), 0x07)
-    text.increment(Register.R10)
-    text.jump("utter.step")
-    text.label("utter.newline")
-    text.increment(Register.R9)
-    text.arithmetic("xor", Register.R10, Register.R10)
-    text.label("utter.step")
-    text.increment(Register.R8)
-    text.jump("utter.head")
-    text.label("utter.done")
-    text.ret()
+    text.jump("clear")
+    text.label("cleared")
 
 
 def kernel_text() -> bytes:
-    """Everything that has to exist before an unmodified binary will run."""
+    """Everything that has to exist before a binary somebody else built runs."""
     text = X86Assembler()
     _kernel_prologue(text)
+
+    text.immediate(Register.R8, PROGRAM_LBA)
+    text.immediate(Register.RDI, HEADER_SCRATCH)
+    text.immediate(Register.R13, HEADER_SECTORS)
+    text.call("fetch")
     text.call("settle")
-    text.immediate(Register.RSP, PROGRAM_STACK)
-    text.load(Register.RCX, Register.RAX)
+    text.load(Register.RBX, Register.RAX)
+
+    text.immediate(Register.RSI, PREPARED_STACK)
+    text.load(Register.R12, MemoryOperand(Register.RSI, None, 1, 0))
+    text.arithmetic_immediate("add", Register.RSI, 8)
+    text.immediate(Register.RDI, PROGRAM_VECTOR)
+    text.arithmetic("xor", Register.RCX, Register.RCX)
+    text.label("lay")
+    text.arithmetic("cmp", Register.RCX, Register.R12)
+    text.jump_if("ge", "laid")
+    text.load_octet(Register.RAX, MemoryOperand(Register.RSI, Register.RCX, 1, 0))
+    text.store_octet(MemoryOperand(Register.RDI, Register.RCX, 1, 0), Register.RAX)
+    text.increment(Register.RCX)
+    text.jump("lay")
+    text.label("laid")
+
+    text.immediate(Register.RSP, PROGRAM_VECTOR)
+    text.load(Register.RCX, Register.RBX)
     text.immediate(Register.R11, PROGRAM_FLAGS)
     text.system_return()
+
+    _kernel_disk(text)
     _kernel_loader(text)
     _kernel_handler(text)
     _kernel_console(text)
+
+    text.label("cell.break")
+    for _ in range(8):
+        text._emit(0)
+    text.label("cell.mapping")
+    for _ in range(8):
+        text._emit(0)
+    text.label("cell.row")
+    for _ in range(16):
+        text._emit(0)
     return text.link()
 
 
-def kernel_carrying(program: bytes) -> bytes:
-    """A disk holding the sector, the kernel, and ``program`` untouched."""
+def kernel_carrying(
+    program: bytes, arguments: Sequence[str] = ("glyph",)
+) -> bytes:
+    """A disk holding the sector, the kernel, its stack, and ``program``."""
+    plan = program_plan(program)
     kernel = kernel_text()
-    if len(kernel) > KERNEL_SPAN:
+    if len(kernel) > KERNEL_CODE_SPAN:
         raise MachineCodeError(
-            f"the kernel wants {len(kernel)} octets of {KERNEL_SPAN}"
+            f"the kernel wants {len(kernel)} octets of {KERNEL_CODE_SPAN}"
         )
-    body = kernel.ljust(KERNEL_SPAN, b"\x00") + program
-    sectors = -(-len(body) // SECTOR)
-    return boot_sector(sectors) + body.ljust(sectors * SECTOR, b"\x00")
+    block = kernel.ljust(KERNEL_CODE_SPAN, b"\x00") + initial_stack(plan, arguments)
+    body = block.ljust(KERNEL_SPAN, b"\x00") + program
+    # The kernel reads a fixed number of sectors looking for the headers, and
+    # a disk that ends before they do leaves it waiting on a drive that will
+    # never answer, so the disk is never shorter than the reading.
+    sectors = max(
+        -(-len(body) // SECTOR),
+        PROGRAM_LBA - 1 + HEADER_SECTORS,
+    )
+    return (
+        boot_sector(KERNEL_SPAN // SECTOR)
+        + body.ljust(sectors * SECTOR, b"\x00")
+    )
 
 
-def kernel_image(module: ObjectModule) -> bytes:
+def kernel_image(
+    module: ObjectModule, arguments: Sequence[str] = ("glyph",)
+) -> bytes:
     """The same, carrying exactly what ``--emit-elf`` would have written."""
-    return kernel_carrying(machine_code(module, "x86-64"))
+    return kernel_carrying(machine_code(module, "x86-64"), arguments)
+
+
+def kernel_passenger(image: bytes, span: int) -> bytes:
+    """The program back out of the disk, to be compared with the one put in.
+
+    Read by length rather than to the end, because a program is entitled to
+    end in as many zero octets as it likes and the sectors after it are zero
+    as well.
+    """
+    riding = image[SECTOR + KERNEL_SPAN:]
+    if riding[span:].strip(b"\x00"):
+        raise MachineCodeError("something is riding along after the program")
+    return riding[:span]
 
 
 def trespassing_program(module: ObjectModule, where: int) -> bytes:
@@ -13767,7 +14285,7 @@ def trespassing_program(module: ObjectModule, where: int) -> bytes:
 
 
 def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
-    """Whether each of the two stores was allowed, the program's and the other.
+    """Whether each of two stores was allowed, the program's and the other.
 
     The first is into a page the program owns and has to be allowed or the
     experiment says nothing; the second is into the page the kernel is in.
@@ -13775,7 +14293,7 @@ def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
     kernel is in, whatever the descriptors say.
     """
     allowed = []
-    for where in (PROGRAM_STACK - HUGE_PAGE, KERNEL_BASE):
+    for where in (PROGRAM_MAPPINGS, KERNEL_BASE):
         image = kernel_carrying(trespassing_program(module, where))
         with tempfile.TemporaryDirectory(prefix="ouroboros-ring-") as scratch:
             disk = Path(scratch) / "kernel.img"
@@ -13787,19 +14305,6 @@ def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
             else:
                 allowed.append(True)
     return allowed[0], allowed[1]
-
-
-def kernel_passenger(image: bytes, span: int) -> bytes:
-    """The executable back out of the disk, to be compared with the one in.
-
-    Read by length rather than to the end, because an executable is entitled
-    to end in as many zero octets as it likes and the sectors after it are
-    zero as well.
-    """
-    riding = image[SECTOR + KERNEL_SPAN:]
-    if riding[span:].strip(b"\x00"):
-        raise MachineCodeError("something is riding along after the executable")
-    return riding[:span]
 
 
 def boot_runnable() -> bool:
@@ -15319,6 +15824,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          help="write a disk image that needs no kernel either")
     machine.add_argument("--emit-kernel", metavar="PATH",
                          help="write a disk that loads an unmodified ELF and runs it")
+    machine.add_argument("--carry", metavar="PATH",
+                         help="an executable to put on that disk instead of this one")
+    machine.add_argument("--carry-as", metavar="WORDS", default="",
+                         help="the words the carried program is called with")
     machine.add_argument("--emit-efi", metavar="PATH",
                          help="write the same text as a UEFI application")
 
@@ -15568,7 +16077,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 
     if namespace.emit_kernel:
-        blob = kernel_image(artifacts.module)
+        if namespace.carry:
+            words = shlex.split(namespace.carry_as) or [_program_name(namespace.carry)]
+            blob = kernel_carrying(_read_octets(namespace.carry), words)
+        else:
+            blob = kernel_image(artifacts.module)
         written = _write_octets(namespace.emit_kernel, blob)
         print(f"wrote {written} ({len(blob)} bytes)", file=sys.stderr)
 

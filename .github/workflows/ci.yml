@@ -164,6 +164,26 @@ jobs:
           print('the kernel booted, loaded it, and it printed it')
           "
 
+      - name: a binary this file did not write, on the kernel this file did
+        run: |
+          curl -sfL -o busybox \
+            https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
+          echo "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348  busybox" \
+            | sha256sum -c -
+          python ouroboros.py --emit-kernel busybox.img --carry busybox \
+            --carry-as "busybox echo it is a kernel then" > /dev/null
+          python ouroboros.py --emit-kernel shell.img --carry busybox \
+            --carry-as "busybox sh -c 'for i in 1 2 3; do echo line \$i; done'" > /dev/null
+          python -c "
+          import pathlib, ouroboros
+          said = ouroboros.run_boot(pathlib.Path('busybox.img'), 1, patience=90.0)
+          assert said == 'it is a kernel then\n', said
+          print('busybox 1.35.0 said:', said.strip())
+          said = ouroboros.run_boot(pathlib.Path('shell.img'), 3, patience=90.0)
+          assert said == 'line 1\nline 2\nline 3\n', said
+          print('and its shell ran a loop with a variable in it')
+          "
+
       - name: and the program it loaded cannot reach the kernel that loaded it
         run: |
           python -c "
