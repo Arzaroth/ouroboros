@@ -6,6 +6,10 @@
 #
 # The fuzz seed is the run number, so consecutive runs explore different
 # programs rather than re-checking the same ones.
+#
+# The third job is the only one that reads the file without running it.  It
+# installs nothing the other two use, which is why it is not folded into
+# either: the first job's whole claim is that nothing is installed.
 
 name: ouroboros
 
@@ -15,6 +19,35 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint:
+    name: read without being run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: both of them, pinned the way the actions are
+        run: pip install ruff==0.16.6 ty==0.0.78
+
+      # --isolated so the rules are the ones written here and not whatever a
+      # config file in some parent directory turns out to say.
+      - name: every name resolves and no loop closes over what it will rebind
+        run: ruff check --isolated --select E4,E7,E9,F,B ouroboros.py
+
+      # Three rules are set aside, and all three are the same complaint: the
+      # front end hands back the abstract node and every reader of it knows
+      # which one it really is.  Narrowing that is a change to layers 5 to 7
+      # and not to a workflow, so it is written down here rather than hidden
+      # in a config file or waved through with a suppression per line.
+      - name: and what it says about itself holds together
+        run: |
+          ty check ouroboros.py \
+            --ignore unresolved-attribute \
+            --ignore too-many-positional-arguments \
+            --ignore invalid-argument-type
+
   bare:
     name: python ${{ matrix.python }}, nothing installed
     runs-on: ubuntu-latest
