@@ -185,6 +185,15 @@ jobs:
           print('and its shell ran a loop with a variable in it')
           "
 
+      - name: the machine reads a program, compiles it, and becomes what it wrote
+        run: |
+          python -c "
+          import ouroboros
+          said, wanted = ouroboros.boot_what_it_compiles()
+          assert said == wanted, said
+          print('a disk with a compiler and a source on it, and nothing else')
+          "
+
       - name: and the program it loaded cannot reach the kernel that loaded it
         run: |
           python -c "

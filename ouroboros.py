@@ -6757,6 +6757,13 @@ fn parse_primary() {
       expect(T_RPAREN, "expected )");
       return parse_call_builtin(3, a2);
     }
+    if (kw_is(start, length, "deliver")) {
+      var a3 = parse_expr();
+      expect(T_COMMA, "expected , between arguments");
+      var a4 = parse_expr();
+      expect(T_RPAREN, "expected )");
+      return gen_deliver(a3, a4);
+    }
     var base = argsp;
     argsp = argsp + 9;
     var nargs = 0;
@@ -7494,6 +7501,30 @@ fn gen_global_decl(start, length, v, neg) {
   es("\n");
   return 0;
 }
+
+# Hand octets over: to whatever is underneath, or failing that, out.
+# Nothing that runs on somebody else's kernel can be handed a program and
+# become it, so where there is one this is the octets going out one at a
+# time, which is what a kernel would have been asked to do with them.
+fn gen_deliver(where, count) {
+  var slot = alloc_temp_slot();
+  gen_store(gen_const(0), gen_slot_addr(slot));
+  var head = new_label();
+  var body = new_label();
+  var done = new_label();
+  emit_br(head);
+  emit_label(head);
+  emit_cond_br(gen_compare(T_LT, gen_load(gen_slot_addr(slot)), count),
+               body, done);
+  emit_label(body);
+  parse_call_builtin(1, gen_load(gen_mem_addr(
+      gen_binary(T_PLUS, where, gen_load(gen_slot_addr(slot))))));
+  gen_store(gen_binary(T_PLUS, gen_load(gen_slot_addr(slot)), gen_const(1)),
+            gen_slot_addr(slot));
+  emit_br(head);
+  emit_label(done);
+  return gen_const(0);
+}
 '''
 
 GSL2_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
@@ -7505,7 +7536,8 @@ GSL2_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
 # 990000 belongs to the compiler above; everything from 1500000 up is where
 # the strings of the program being compiled go.
 
-var TEXT = 990000;
+var IMAGE_AT = 990000;
+var TEXT = 990176;
 var LBLOFF = 1330000;
 var FIXAT = 1370000;
 var FIXID = 1410000;
@@ -7538,8 +7570,12 @@ var L_STRDATA = 12;
 var L_MAIN = 13;
 var L_INIT = 14;
 var L_GETCHAR_DONE = 15;
-var L_FN = 16;
-var L_BLOCK = 4112;
+var L_DELIVER = 16;
+var L_DELIVER_PACK = 17;
+var L_DELIVER_PACKED = 18;
+var L_DELIVER_DONE = 19;
+var L_FN = 32;
+var L_BLOCK = 4128;
 
 # Where the program being compiled keeps what it keeps.  Its flat memory
 # comes first because a literal address into it is what a string is.
@@ -7553,7 +7589,11 @@ var IN_AT = 22359048;
 var IN_SPAN = 65536;
 var IN_TAKEN_AT = 22424584;
 var IN_HELD_AT = 22424592;
-var BSS_SPAN = 16133144;
+var HAND_AT = 22424600;
+var HAND_SPAN = 1048576;
+var BSS_SPAN = 17181720;
+var SYS_READ = 0;
+var SYS_BECOME = 666;
 
 var textlen = 0;
 var nfix = 0;
@@ -7939,16 +7979,22 @@ ELF_WRITER_GSL2: Final[str] = r'''
 # Two loadable segments and nothing else: the headers and the text, mapped
 # read-execute at the image base, and an anonymous read-write span the loader
 # zeroes, which is the whole of the program's data.
+#
+# The headers are put in front of the text where the text already is, so what
+# is handed over at the end is one run of octets and not two.
 
-fn put(b) {
-  putchar(octet_of(b));
+var imglen = 0;
+
+fn place(b) {
+  mem[IMAGE_AT + imglen] = octet_of(b);
+  imglen = imglen + 1;
   return 0;
 }
 
-fn put_wide(v, count) {
+fn place_wide(v, count) {
   var i = 0;
   while (i < count) {
-    put(octet_of(v));
+    place(octet_of(v));
     v = shift_octet(v);
     i = i + 1;
   }
@@ -7958,53 +8004,53 @@ fn put_wide(v, count) {
 fn native_image(bss) {
   var prologue = ELF_HEADER + SEGMENT_HEADER * SEGMENTS;
   var loaded = prologue + textlen;
-  put(127);
-  put(69);
-  put(76);
-  put(70);
-  put(2);
-  put(1);
-  put(1);
-  put(0);
-  put(0);
-  put_wide(0, 7);
-  put_wide(2, 2);
-  put_wide(EM_X86_64, 2);
-  put_wide(1, 4);
-  put_wide(IMAGE_BASE + prologue, 8);
-  put_wide(ELF_HEADER, 8);
-  put_wide(0, 8);
-  put_wide(0, 4);
-  put_wide(ELF_HEADER, 2);
-  put_wide(SEGMENT_HEADER, 2);
-  put_wide(SEGMENTS, 2);
-  put_wide(64, 2);
-  put_wide(0, 2);
-  put_wide(0, 2);
+  imglen = 0;
+  place(127);
+  place(69);
+  place(76);
+  place(70);
+  place(2);
+  place(1);
+  place(1);
+  place(0);
+  place(0);
+  place_wide(0, 7);
+  place_wide(2, 2);
+  place_wide(EM_X86_64, 2);
+  place_wide(1, 4);
+  place_wide(IMAGE_BASE + prologue, 8);
+  place_wide(ELF_HEADER, 8);
+  place_wide(0, 8);
+  place_wide(0, 4);
+  place_wide(ELF_HEADER, 2);
+  place_wide(SEGMENT_HEADER, 2);
+  place_wide(SEGMENTS, 2);
+  place_wide(64, 2);
+  place_wide(0, 2);
+  place_wide(0, 2);
 
-  put_wide(1, 4);
-  put_wide(5, 4);
-  put_wide(0, 8);
-  put_wide(IMAGE_BASE, 8);
-  put_wide(IMAGE_BASE, 8);
-  put_wide(loaded, 8);
-  put_wide(loaded, 8);
-  put_wide(PAGE_SIZE, 8);
+  place_wide(1, 4);
+  place_wide(5, 4);
+  place_wide(0, 8);
+  place_wide(IMAGE_BASE, 8);
+  place_wide(IMAGE_BASE, 8);
+  place_wide(loaded, 8);
+  place_wide(loaded, 8);
+  place_wide(PAGE_SIZE, 8);
 
-  put_wide(1, 4);
-  put_wide(6, 4);
-  put_wide(0, 8);
-  put_wide(DATA_BASE, 8);
-  put_wide(DATA_BASE, 8);
-  put_wide(0, 8);
-  put_wide(bss, 8);
-  put_wide(PAGE_SIZE, 8);
+  place_wide(1, 4);
+  place_wide(6, 4);
+  place_wide(0, 8);
+  place_wide(DATA_BASE, 8);
+  place_wide(DATA_BASE, 8);
+  place_wide(0, 8);
+  place_wide(bss, 8);
+  place_wide(PAGE_SIZE, 8);
 
-  var i = 0;
-  while (i < textlen) {
-    put(mem[TEXT + i]);
-    i = i + 1;
+  if (imglen != prologue) {
+    fail("the headers came out the wrong length");
   }
+  deliver(IMAGE_AT, prologue + textlen);
   return 0;
 }
 '''
@@ -8399,6 +8445,52 @@ fn runtime_quit() {
   return 0;
 }
 
+# Hand octets over: to whatever is underneath, if it will take them, and out
+# if it will not.  A machine with this kernel under it answers by becoming
+# the program and never coming back; anything else says it cannot, and then
+# the octets go where they would have gone anyway.
+fn runtime_deliver() {
+  lab(L_DELIVER);
+  call_to(L_FLUSH);
+  ld(R8, RDI);
+  ld(R9, RSI);
+  alu(51, RCX, RCX);
+  lab(L_DELIVER_PACK);
+  alu(59, RCX, R9);
+  go_when(CC_GE, L_DELIVER_PACKED);
+  ld(RDX, R8);
+  alu(3, RDX, RCX);
+  imm(RSI, MEMORY_AT);
+  alu(51, RAX, RAX);
+  ld_octet(RAX, RSI, RDX, 8, 0);
+  imm(RDI, HAND_AT);
+  st_octet(RDI, RCX, 1, 0, RAX);
+  inc(RCX);
+  go(L_DELIVER_PACK);
+  lab(L_DELIVER_PACKED);
+  imm(RAX, SYS_BECOME);
+  imm(RDI, HAND_AT);
+  ld(RSI, R9);
+  ask_the_world();
+  alu_imm(7, RAX, 0);
+  go_when(CC_GE, L_DELIVER_DONE);
+  imm(RAX, SYS_WRITE);
+  imm(RDI, 1);
+  imm(RSI, HAND_AT);
+  ld(RDX, R9);
+  ask_the_world();
+  lab(L_DELIVER_DONE);
+  ret_now();
+  return 0;
+}
+
+fn gen_deliver(where, count) {
+  take(RDI, where);
+  take(RSI, count);
+  call_to(L_DELIVER);
+  return gen_const(0);
+}
+
 fn parse_call_builtin(kind, first_arg) {
   if (kind == 1) {
     take(RAX, first_arg);
@@ -8434,6 +8526,7 @@ fn emit_header() {
   runtime_flush();
   runtime_getchar();
   runtime_quit();
+  runtime_deliver();
   return 0;
 }
 
@@ -10867,7 +10960,8 @@ GLYPH_NATIVE_ADDRESSES_GSL2: Final[str] = r'''
 # prefix, a ModRM or a SIB octet is disjoint from its neighbours, so the
 # additions below are the same octets the shifts and ors would have made.
 
-var TEXT = 1330000;
+var IMAGE_AT = 1330000;
+var TEXT = 1330176;
 var LBLOFF = 1730000;
 var FIXAT = 1800000;
 var FIXID = 1870000;
@@ -12045,6 +12139,41 @@ def gen_compare(op, a, b):
 # ----------------------------------------------------------------------
 
 
+def gen_deliver(where, count):
+    """Hand octets over: to whatever is underneath, or failing that, out.
+
+    Nothing that runs on somebody else's kernel can be handed a program and
+    become it, so where there is one this is the octets going out one at a
+    time, which is what a kernel would have been asked to do with them.
+    """
+    slot = alloc_temp_slot()
+    gen_store(gen_const(0), gen_slot_addr(slot))
+    head = new_label()
+    body = new_label()
+    done = new_label()
+    emit_br(head)
+    emit_label(head)
+    emit_cond_br(
+        gen_compare(T_LT, gen_load(gen_slot_addr(slot)), count), body, done
+    )
+    emit_label(body)
+    parse_call_builtin(
+        1,
+        gen_load(
+            gen_mem_addr(
+                gen_binary(T_PLUS, where, gen_load(gen_slot_addr(slot)))
+            )
+        ),
+    )
+    gen_store(
+        gen_binary(T_PLUS, gen_load(gen_slot_addr(slot)), gen_const(1)),
+        gen_slot_addr(slot),
+    )
+    emit_br(head)
+    emit_label(done)
+    return gen_const(0)
+
+
 def parse_call_builtin(kind, first_arg):
     if kind == 1:
         t = new_reg()
@@ -12134,6 +12263,12 @@ def parse_primary():
             a = parse_expr()
             expect(T_RPAREN, "expected )")
             return parse_call_builtin(3, a)
+        if kw_is(start, length, "deliver"):
+            a = parse_expr()
+            expect(T_COMMA, "expected , between arguments")
+            b = parse_expr()
+            expect(T_RPAREN, "expected )")
+            return gen_deliver(a, b)
         base = argsp
         argsp = argsp + 9
         nargs = 0
@@ -15128,10 +15263,17 @@ HEADER_SCRATCH: Final[int] = KERNEL_BASE + KERNEL_SPAN
 PREPARED_STACK: Final[int] = KERNEL_BASE + KERNEL_CODE_SPAN
 PREPARED_SPAN: Final[int] = KERNEL_SPAN - KERNEL_CODE_SPAN
 
-PROGRAM_STACK: Final[int] = 0x800000
-PROGRAM_VECTOR: Final[int] = PROGRAM_STACK - 0x800
-PROGRAM_BREAK: Final[int] = 0x1000000
-PROGRAM_MAPPINGS: Final[int] = 0x4000000
+# Where a program's stack, its break and its mappings go is not a constant:
+# a compiler wants sixteen megaoctets of its own and would have had the stack
+# in the middle of them.  All three are placed above whatever the program
+# says it reaches, which is a thing the disk is in a position to know.
+PROGRAM_ROOM: Final[int] = 8 * HUGE_PAGE
+BREAK_ROOM: Final[int] = 4 * HUGE_PAGE
+MAPPING_ROOM: Final[int] = 16 * HUGE_PAGE
+VECTOR_SPAN: Final[int] = 0x800
+
+INPUT_AT: Final[int] = 0x100000
+INPUT_LIMIT: Final[int] = 0x300000
 
 EFER_MSR: Final[int] = 0xC0000080
 STAR_MSR: Final[int] = 0xC0000081
@@ -15223,6 +15365,15 @@ class ProgramSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class ProgramPlaces:
+    """Where the three things a program is given start, once it is placed."""
+
+    vector: int
+    brk: int
+    mappings: int
+
+
+@dataclass(frozen=True, slots=True)
 class ProgramPlan:
     """What the kernel will find when it reads the program's own headers."""
 
@@ -15244,6 +15395,13 @@ class ProgramPlan:
     @property
     def ceiling(self) -> int:
         return max(segment.ceiling for segment in self.segments)
+
+    @property
+    def places(self) -> ProgramPlaces:
+        """Above everything the program asked for, and clear of each other."""
+        vector = _align_up(self.ceiling, HUGE_PAGE) + PROGRAM_ROOM
+        brk = vector + BREAK_ROOM
+        return ProgramPlaces(vector, brk, brk + MAPPING_ROOM)
 
 
 def program_plan(program: bytes) -> ProgramPlan:
@@ -15296,13 +15454,7 @@ def program_plan(program: bytes) -> ProgramPlan:
                 raise MachineCodeError(
                     "two segments would land on each other, sector for sector"
                 )
-    plan = ProgramPlan(entry, segments_at, span, count, tuple(segments))
-    if plan.ceiling > PROGRAM_VECTOR:
-        raise MachineCodeError(
-            f"the program reaches {plan.ceiling:#x} and the stack is at "
-            f"{PROGRAM_VECTOR:#x}"
-        )
-    return plan
+    return ProgramPlan(entry, segments_at, span, count, tuple(segments))
 
 
 def initial_stack(plan: ProgramPlan, arguments: Sequence[str]) -> bytes:
@@ -15331,7 +15483,7 @@ def initial_stack(plan: ProgramPlan, arguments: Sequence[str]) -> bytes:
     # argc, the arguments, their terminator, an empty environment's
     # terminator, the pairs, the entropy pair, the name pair, and the end.
     words = 1 + len(named) + 1 + 1 + 2 * len(pairs) + 2 + 2 + 2
-    entropy_at = PROGRAM_VECTOR + words * 8
+    entropy_at = plan.places.vector + words * 8
     strings_at = entropy_at + 16
 
     places: list[int] = []
@@ -15388,6 +15540,10 @@ SYS_SET_TID: Final[int] = 218
 SYS_OPENAT: Final[int] = 257
 SYS_FSTATAT: Final[int] = 262
 
+# Not a number anybody's kernel uses, for a thing no kernel does: the octets
+# it is handed are a program, and the machine is to be that program instead.
+SYS_BECOME: Final[int] = 666
+
 ARCH_SET_FS: Final[int] = 0x1002
 NO_SUCH_FILE: Final[int] = -2
 NOT_A_TERMINAL: Final[int] = -25
@@ -15398,7 +15554,6 @@ NOT_ALLOWED: Final[int] = -22
 # work.  A kernel with one process, no users and no files knows all of these
 # without having to keep anything.
 SETTLED_ANSWERS: Final[tuple[tuple[int, int], ...]] = (
-    (SYS_READ, 0),                  # standard input is at its end
     (SYS_CLOSE, 0),
     (SYS_MPROTECT, 0),
     (SYS_MUNMAP, 0),
@@ -15585,6 +15740,65 @@ def _kernel_console(text: X86Assembler) -> None:
     text.ret()
 
 
+def _kernel_settle_in_place(text: X86Assembler, places: ProgramPlaces) -> None:
+    """become: the octets at rdi are a program, and the machine is to be it.
+
+    The same loader as the one that reads a disk, except that the segments
+    are already in memory and what they are copied over is whoever asked.
+    Nothing returns from here: the caller stops existing halfway through.
+    """
+    text.label("become")
+    text.load(Register.RBP, Register.RDI)
+    text.load(Register.R9, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENTS_AT))
+    text.arithmetic("add", Register.R9, Register.RBP)
+    text.widen_word(
+        Register.R10, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENT_COUNT)
+    )
+    text.widen_word(
+        Register.R11, MemoryOperand(Register.RBP, None, 1, ELF_SEGMENT_SPAN)
+    )
+
+    text.label("become.head")
+    text.test(Register.R10, Register.R10)
+    text.jump_if("e", "become.done")
+    text.widen_long(Register.RAX, MemoryOperand(Register.R9, None, 1, SEGMENT_KIND))
+    text.arithmetic_immediate("cmp", Register.RAX, SEGMENT_LOADABLE)
+    text.jump_if("ne", "become.next")
+
+    text.load(Register.RSI, MemoryOperand(Register.R9, None, 1, SEGMENT_OFFSET))
+    text.arithmetic("add", Register.RSI, Register.RBP)
+    text.load(Register.RDI, MemoryOperand(Register.R9, None, 1, SEGMENT_ADDRESS))
+    text.load(Register.R12, MemoryOperand(Register.R9, None, 1, SEGMENT_ON_DISK))
+    text.load(Register.R13, MemoryOperand(Register.R9, None, 1, SEGMENT_IN_MEMORY))
+    text.arithmetic("xor", Register.RCX, Register.RCX)
+
+    text.label("become.copy")
+    text.arithmetic("cmp", Register.RCX, Register.R12)
+    text.jump_if("ge", "become.wipe")
+    text.load_octet(Register.RAX, MemoryOperand(Register.RSI, Register.RCX, 1, 0))
+    text.store_octet(MemoryOperand(Register.RDI, Register.RCX, 1, 0), Register.RAX)
+    text.increment(Register.RCX)
+    text.jump("become.copy")
+
+    text.label("become.wipe")
+    text.arithmetic("cmp", Register.RCX, Register.R13)
+    text.jump_if("ge", "become.next")
+    text.store_octet_immediate(MemoryOperand(Register.RDI, Register.RCX, 1, 0), 0)
+    text.increment(Register.RCX)
+    text.jump("become.wipe")
+
+    text.label("become.next")
+    text.arithmetic("add", Register.R9, Register.R11)
+    text.decrement(Register.R10)
+    text.jump("become.head")
+
+    text.label("become.done")
+    text.load(Register.RCX, MemoryOperand(Register.RBP, None, 1, ELF_ENTRY))
+    text.immediate(Register.RSP, places.vector)
+    text.immediate(Register.R11, PROGRAM_FLAGS)
+    text.system_return()
+
+
 def _kernel_handler(text: X86Assembler) -> None:
     """attend: what a program asks for, and everything it expects back.
 
@@ -15606,9 +15820,11 @@ def _kernel_handler(text: X86Assembler) -> None:
     for number, label in (
         (SYS_WRITE, "attend.write"),
         (SYS_WRITEV, "attend.gather"),
+        (SYS_READ, "attend.read"),
         (SYS_BRK, "attend.break"),
         (SYS_MMAP, "attend.map"),
         (SYS_ARCH_PRCTL, "attend.thread"),
+        (SYS_BECOME, "become"),
         (SYS_EXIT_GROUP, "attend.rest"),
     ):
         text.arithmetic_immediate("cmp", Register.RAX, number)
@@ -15645,6 +15861,37 @@ def _kernel_handler(text: X86Assembler) -> None:
     text.jump("attend.gather.head")
     text.label("attend.gather.done")
     text.load(Register.RAX, KERNEL_SPARE)
+    text.jump("attend.leave")
+
+    text.label("attend.read")
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.test(Register.RDI, Register.RDI)
+    text.jump_if("ne", "attend.leave")
+    text.address_of_label(KERNEL_SCRATCH, "cell.read")
+    text.load(KERNEL_SPARE, MemoryOperand(KERNEL_SCRATCH, None, 1, 0))
+    text.load(Register.R13, MemoryOperand(KERNEL_SCRATCH, None, 1, 8))
+    text.arithmetic("sub", Register.R13, KERNEL_SPARE)
+    text.arithmetic_immediate("cmp", Register.R13, 0)
+    text.jump_if("le", "attend.leave")
+    text.arithmetic("cmp", Register.RDX, Register.R13)
+    text.jump_if("le", "attend.read.some")
+    text.load(Register.RDX, Register.R13)
+    text.label("attend.read.some")
+    text.immediate(Register.R8, INPUT_AT)
+    text.arithmetic("add", Register.R8, KERNEL_SPARE)
+    text.arithmetic("xor", Register.RCX, Register.RCX)
+    text.label("attend.read.head")
+    text.arithmetic("cmp", Register.RCX, Register.RDX)
+    text.jump_if("ge", "attend.read.done")
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.load_octet(Register.RAX, MemoryOperand(Register.R8, Register.RCX, 1, 0))
+    text.store_octet(MemoryOperand(Register.RSI, Register.RCX, 1, 0), Register.RAX)
+    text.increment(Register.RCX)
+    text.jump("attend.read.head")
+    text.label("attend.read.done")
+    text.arithmetic("add", KERNEL_SPARE, Register.RDX)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), KERNEL_SPARE)
+    text.load(Register.RAX, Register.RDX)
     text.jump("attend.leave")
 
     text.label("attend.break")
@@ -15702,7 +15949,7 @@ def _kernel_handler(text: X86Assembler) -> None:
     text.system_return()
 
 
-def _kernel_prologue(text: X86Assembler) -> None:
+def _kernel_prologue(text: X86Assembler, places: ProgramPlaces) -> None:
     """The four registers that decide what a program's one instruction does.
 
     A model-specific register is written from a pair of halves, and every
@@ -15737,10 +15984,10 @@ def _kernel_prologue(text: X86Assembler) -> None:
         text.out()
 
     text.address_of_label(KERNEL_SCRATCH, "cell.break")
-    text.immediate(Register.RAX, PROGRAM_BREAK)
+    text.immediate(Register.RAX, places.brk)
     text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RAX)
     text.address_of_label(KERNEL_SCRATCH, "cell.mapping")
-    text.immediate(Register.RAX, PROGRAM_MAPPINGS)
+    text.immediate(Register.RAX, places.mappings)
     text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 0), Register.RAX)
     text.address_of_label(KERNEL_SCRATCH, "cell.row")
     text.arithmetic("xor", Register.RAX, Register.RAX)
@@ -15761,10 +16008,20 @@ def _kernel_prologue(text: X86Assembler) -> None:
     text.label("cleared")
 
 
-def kernel_text() -> bytes:
+def kernel_text(
+    places: ProgramPlaces, input_lba: int, input_span: int
+) -> bytes:
     """Everything that has to exist before a binary somebody else built runs."""
     text = X86Assembler()
-    _kernel_prologue(text)
+    _kernel_prologue(text, places)
+
+    text.immediate(Register.R8, input_lba)
+    text.immediate(Register.RDI, INPUT_AT)
+    text.immediate(Register.R13, -(-input_span // SECTOR))
+    text.call("fetch")
+    text.address_of_label(KERNEL_SCRATCH, "cell.read")
+    text.immediate(Register.RAX, input_span)
+    text.store(MemoryOperand(KERNEL_SCRATCH, None, 1, 8), Register.RAX)
 
     text.immediate(Register.R8, PROGRAM_LBA)
     text.immediate(Register.RDI, HEADER_SCRATCH)
@@ -15776,7 +16033,7 @@ def kernel_text() -> bytes:
     text.immediate(Register.RSI, PREPARED_STACK)
     text.load(Register.R12, MemoryOperand(Register.RSI, None, 1, 0))
     text.arithmetic_immediate("add", Register.RSI, 8)
-    text.immediate(Register.RDI, PROGRAM_VECTOR)
+    text.immediate(Register.RDI, places.vector)
     text.arithmetic("xor", Register.RCX, Register.RCX)
     text.label("lay")
     text.arithmetic("cmp", Register.RCX, Register.R12)
@@ -15787,12 +16044,13 @@ def kernel_text() -> bytes:
     text.jump("lay")
     text.label("laid")
 
-    text.immediate(Register.RSP, PROGRAM_VECTOR)
+    text.immediate(Register.RSP, places.vector)
     text.load(Register.RCX, Register.RBX)
     text.immediate(Register.R11, PROGRAM_FLAGS)
     text.system_return()
 
     _kernel_disk(text)
+    _kernel_settle_in_place(text, places)
     _kernel_loader(text)
     _kernel_handler(text)
     _kernel_console(text)
@@ -15806,21 +16064,41 @@ def kernel_text() -> bytes:
     text.label("cell.row")
     for _ in range(16):
         text._emit(0)
+    text.label("cell.read")
+    for _ in range(16):
+        text._emit(0)
     return text.link()
 
 
 def kernel_carrying(
-    program: bytes, arguments: Sequence[str] = ("glyph",)
+    program: bytes,
+    arguments: Sequence[str] = ("glyph",),
+    reading: bytes = b"",
 ) -> bytes:
-    """A disk holding the sector, the kernel, its stack, and ``program``."""
+    """A disk holding the sector, the kernel, its stack, the program, its input.
+
+    Whatever the program will find when it reads goes on the disk behind it,
+    because a kernel with no filesystem still has a machine that can be told
+    what a program is to be given.
+    """
     plan = program_plan(program)
-    kernel = kernel_text()
+    if len(reading) > INPUT_LIMIT:
+        raise MachineCodeError(
+            f"there are {len(reading)} octets to read and room for {INPUT_LIMIT}"
+        )
+    program_sectors = -(-len(program) // SECTOR)
+    input_lba = PROGRAM_LBA + program_sectors
+    kernel = kernel_text(plan.places, input_lba, len(reading))
     if len(kernel) > KERNEL_CODE_SPAN:
         raise MachineCodeError(
             f"the kernel wants {len(kernel)} octets of {KERNEL_CODE_SPAN}"
         )
     block = kernel.ljust(KERNEL_CODE_SPAN, b"\x00") + initial_stack(plan, arguments)
-    body = block.ljust(KERNEL_SPAN, b"\x00") + program
+    body = (
+        block.ljust(KERNEL_SPAN, b"\x00")
+        + program.ljust(program_sectors * SECTOR, b"\x00")
+        + reading
+    )
     # The kernel reads a fixed number of sectors looking for the headers, and
     # a disk that ends before they do leaves it waiting on a drive that will
     # never answer, so the disk is never shorter than the reading.
@@ -15849,8 +16127,6 @@ def kernel_passenger(image: bytes, span: int) -> bytes:
     as well.
     """
     riding = image[SECTOR + KERNEL_SPAN:]
-    if riding[span:].strip(b"\x00"):
-        raise MachineCodeError("something is riding along after the program")
     return riding[:span]
 
 
@@ -15883,7 +16159,8 @@ def kernel_refusals(module: ObjectModule, lines: int) -> tuple[bool, bool]:
     kernel is in, whatever the descriptors say.
     """
     allowed = []
-    for where in (PROGRAM_MAPPINGS, KERNEL_BASE):
+    somewhere = program_plan(trespassing_program(module, 0)).places.mappings
+    for where in (somewhere, KERNEL_BASE):
         image = kernel_carrying(trespassing_program(module, where))
         with tempfile.TemporaryDirectory(prefix="ouroboros-ring-") as scratch:
             disk = Path(scratch) / "kernel.img"
@@ -15919,6 +16196,39 @@ def boot_what_it_wrote(
         disk = Path(scratch) / "glyph.img"
         disk.write_bytes(kernel_carrying(program))
         said = run_boot(disk, order).removesuffix("\n")
+    return said, synthesize_source(source).unwrap_or_raise().rendering
+
+
+def boot_what_it_compiles(
+    workdir: Path | None = None,
+    opt_level: int = 2,
+    order: int = DEFAULT_LATTICE_ORDER,
+    motif: str = DEFAULT_MOTIF,
+) -> tuple[str, str]:
+    """The machine reads a program, compiles it, and becomes what it compiled.
+
+    The disk carries a compiler and a source and nothing else that runs.  What
+    the compiler writes is not written anywhere: it is handed back through the
+    one number no kernel uses, and the machine stops being the compiler and
+    starts being the program, which is the last thing it does.
+    """
+    directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-metal-"))
+    directory.mkdir(parents=True, exist_ok=True)
+    seeded = link_executable(
+        gsl2_compile(GSLCELF_GSL2), directory / "seeded", opt_level
+    )
+    compiler = _compile_with(seeded, GSLCELF_GSL2, directory / "gslcelf")
+    front_end = _compile_with(compiler, GLYPHELF_GSL2, directory / "glyphelf")
+    source = typing.cast(type, Motif.lookup(motif))().source(order)
+    (directory / "glyph.gsl").write_text(source)
+    image = kernel_carrying(
+        front_end.read_bytes(), ("glyphelf",), source.encode()
+    )
+    (directory / "compile.img").write_bytes(image)
+    with tempfile.TemporaryDirectory(prefix="ouroboros-metal-") as scratch:
+        disk = Path(scratch) / "compile.img"
+        disk.write_bytes(image)
+        said = run_boot(disk, order, patience=60.0).removesuffix("\n")
     return said, synthesize_source(source).unwrap_or_raise().rendering
 
 
@@ -17486,6 +17796,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       choices=("gslc", "gslcelf", "glyph", "glyphc", "glyphelf"))
     boot.add_argument("--close-the-toolchain", action="store_true",
                       help="build the compiler with itself, and nothing else")
+    boot.add_argument("--boot-the-compiler", action="store_true",
+                      help="put the compiler on a disk and let the machine do it")
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
 
@@ -17614,6 +17926,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit_bootstrap_report(bootstrap(workdir, namespace.opt_level or 2))
         except (LlvmToolchainUnavailable, subprocess.CalledProcessError) as exc:
             print(f"bootstrap unavailable: {exc}", file=sys.stderr)
+            return 3
+    if namespace.boot_the_compiler:
+        try:
+            workdir = Path(namespace.workdir) if namespace.workdir else None
+            said, wanted = boot_what_it_compiles(workdir, namespace.opt_level or 2)
+            print(said)
+            if said != wanted:
+                print("that is not the figure", file=sys.stderr)
+                return 1
+            return 0
+        except (LlvmToolchainUnavailable, GlyphPlatformError,
+                subprocess.CalledProcessError) as exc:
+            print(f"no machine here would do that: {exc}", file=sys.stderr)
             return 3
     if namespace.close_the_toolchain:
         try:
