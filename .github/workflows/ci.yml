@@ -82,6 +82,9 @@ jobs:
           print(f'{len(image)} octets, and what it carries is the ELF beside it')
           "
 
+      - name: the compiler builds itself, and nothing here could have helped
+        run: python ouroboros.py --close-the-toolchain
+
       - name: a wasm module, and the five lines of host it asks for
         run: |
           python ouroboros.py --emit-wasm glyph.wasm
@@ -279,9 +282,6 @@ jobs:
 
       - name: the GSL-2 front end agrees with layer 16, byte for byte
         run: python ouroboros.py --close-the-loop
-
-      - name: and the compiler builds itself with nothing else under it
-        run: python ouroboros.py --close-the-toolchain
 
       - name: 120 random programs across every tier there is
         run: |

@@ -11996,6 +11996,8 @@ def new_reg():
 
 
 def new_label():
+    if _S0_NATIVE:
+        return _na_new_label()
     global labelcnt
     labelcnt = labelcnt + 1
     return labelcnt
@@ -12014,12 +12016,16 @@ def elabel(l):
 
 
 def emit_label(l):
+    if _S0_NATIVE:
+        return _na_emit_label(l)
     elabel(l)
     es(":\n")
     return 0
 
 
 def emit_br(l):
+    if _S0_NATIVE:
+        return _na_emit_br(l)
     es("  br label %")
     elabel(l)
     es("\n")
@@ -12027,6 +12033,8 @@ def emit_br(l):
 
 
 def emit_cond_br(r, a, b):
+    if _S0_NATIVE:
+        return _na_emit_cond_br(r, a, b)
     t = new_reg()
     es("  ")
     er(t)
@@ -12044,6 +12052,8 @@ def emit_cond_br(r, a, b):
 
 
 def gen_const(v):
+    if _S0_NATIVE:
+        return _na_gen_const(v)
     r = new_reg()
     es("  ")
     er(r)
@@ -12054,6 +12064,8 @@ def gen_const(v):
 
 
 def gen_slot_addr(slot):
+    if _S0_NATIVE:
+        return _na_gen_slot_addr(slot)
     r = new_reg()
     es("  ")
     er(r)
@@ -12066,6 +12078,8 @@ def gen_slot_addr(slot):
 
 
 def gen_mem_addr(index_reg):
+    if _S0_NATIVE:
+        return _na_gen_mem_addr(index_reg)
     r = new_reg()
     es("  ")
     er(r)
@@ -12078,6 +12092,8 @@ def gen_mem_addr(index_reg):
 
 
 def gen_load(addr_reg):
+    if _S0_NATIVE:
+        return _na_gen_load(addr_reg)
     r = new_reg()
     es("  ")
     er(r)
@@ -12088,6 +12104,8 @@ def gen_load(addr_reg):
 
 
 def gen_store(value_reg, addr_reg):
+    if _S0_NATIVE:
+        return _na_gen_store(value_reg, addr_reg)
     es("  store i64 ")
     er(value_reg)
     es(", ptr ")
@@ -12097,6 +12115,8 @@ def gen_store(value_reg, addr_reg):
 
 
 def gen_global_load(start, length):
+    if _S0_NATIVE:
+        return _na_gen_global_load(start, length)
     r = new_reg()
     es("  ")
     er(r)
@@ -12107,6 +12127,8 @@ def gen_global_load(start, length):
 
 
 def gen_global_store(value_reg, start, length):
+    if _S0_NATIVE:
+        return _na_gen_global_store(value_reg, start, length)
     es("  store i64 ")
     er(value_reg)
     es(", ptr @g_")
@@ -12116,6 +12138,8 @@ def gen_global_store(value_reg, start, length):
 
 
 def gen_binary(op, a, b):
+    if _S0_NATIVE:
+        return _na_gen_binary(op, a, b)
     r = new_reg()
     es("  ")
     er(r)
@@ -12137,6 +12161,8 @@ def gen_binary(op, a, b):
 
 
 def gen_compare(op, a, b):
+    if _S0_NATIVE:
+        return _na_gen_compare(op, a, b)
     c = new_reg()
     es("  ")
     er(c)
@@ -12171,6 +12197,8 @@ def gen_compare(op, a, b):
 
 
 def gen_deliver(where, count):
+    if _S0_NATIVE:
+        return _na_gen_deliver(where, count)
     """Hand octets over: to whatever is underneath, or failing that, out.
 
     Nothing that runs on somebody else's kernel can be handed a program and
@@ -12206,6 +12234,8 @@ def gen_deliver(where, count):
 
 
 def parse_call_builtin(kind, first_arg):
+    if _S0_NATIVE:
+        return _na_parse_call_builtin(kind, first_arg)
     if kind == 1:
         t = new_reg()
         es("  ")
@@ -12248,6 +12278,102 @@ def parse_call_builtin(kind, first_arg):
     er(t)
     es(")\n")
     return gen_const(0)
+
+
+
+def gen_call(start, length, base, nargs):
+    if _S0_NATIVE:
+        return _na_gen_call(start, length, base, nargs)
+    r = new_reg()
+    es("  ")
+    er(r)
+    es(" = call i64 @f_")
+    emit_name(start, length)
+    es("(")
+    i = 0
+    while i < nargs:
+        if i > 0:
+            es(", ")
+        es("i64 ")
+        er(mem[ARGS + base + i])
+        i = i + 1
+    es(")\n")
+    return r
+
+
+def gen_store_const(value, addr_reg):
+    if _S0_NATIVE:
+        return _na_gen_store_const(value, addr_reg)
+    es("  store i64 ")
+    en(value)
+    es(", ptr ")
+    er(addr_reg)
+    es(", align 8\n")
+    return 0
+
+
+def gen_return(r):
+    if _S0_NATIVE:
+        return _na_gen_return(r)
+    es("  ret i64 ")
+    er(r)
+    es("\n")
+    return 0
+
+
+def gen_global_decl(start, length, v, neg):
+    if _S0_NATIVE:
+        return _na_gen_global_decl(start, length, v, neg)
+    es("@g_")
+    emit_name(start, length)
+    es(" = internal global i64 ")
+    if neg == 1:
+        es("-")
+    en(v)
+    es("\n")
+    return 0
+
+
+def gen_function_open(start, length, nparams):
+    if _S0_NATIVE:
+        return _na_gen_function_open(start, length, nparams)
+    es("\ndefine i64 @f_")
+    emit_name(start, length)
+    es("(")
+    i = 0
+    while i < nparams:
+        if i > 0:
+            es(", ")
+        es("i64 %p")
+        en(i)
+        i = i + 1
+    es(") {\nentry:\n")
+    es("  %frame = alloca [")
+    en(FRAME)
+    es(" x i64], align 8\n")
+    i = 0
+    while i < nparams:
+        es("  %a")
+        en(i)
+        es(" = getelementptr inbounds [")
+        en(FRAME)
+        es(" x i64], ptr %frame, i64 0, i64 ")
+        en(i)
+        es("\n")
+        es("  store i64 %p")
+        en(i)
+        es(", ptr %a")
+        en(i)
+        es(", align 8\n")
+        i = i + 1
+    return 0
+
+
+def gen_function_close():
+    if _S0_NATIVE:
+        return _na_gen_function_close()
+    es("  ret i64 0\n}\n")
+    return 0
 
 
 def parse_primary():
@@ -12311,20 +12437,7 @@ def parse_primary():
             if nargs > 8:
                 fail("too many arguments")
         advance()
-        r = new_reg()
-        es("  ")
-        er(r)
-        es(" = call i64 @f_")
-        emit_name(start, length)
-        es("(")
-        i = 0
-        while i < nargs:
-            if i > 0:
-                es(", ")
-            es("i64 ")
-            er(mem[ARGS + base + i])
-            i = i + 1
-        es(")\n")
+        r = gen_call(start, length, base, nargs)
         argsp = base
         return r
     fail("expected an expression")
@@ -12388,10 +12501,7 @@ def parse_and():
     while tk() == T_ANDAND:
         advance()
         slot = alloc_temp_slot()
-        s1 = gen_slot_addr(slot)
-        es("  store i64 0, ptr ")
-        er(s1)
-        es(", align 8\n")
+        gen_store_const(0, gen_slot_addr(slot))
         lrhs = new_label()
         lend = new_label()
         emit_cond_br(a, lrhs, lend)
@@ -12410,10 +12520,7 @@ def parse_or():
     while tk() == T_OROR:
         advance()
         slot = alloc_temp_slot()
-        s1 = gen_slot_addr(slot)
-        es("  store i64 1, ptr ")
-        er(s1)
-        es(", align 8\n")
+        gen_store_const(1, gen_slot_addr(slot))
         lrhs = new_label()
         lend = new_label()
         emit_cond_br(a, lend, lrhs)
@@ -12499,9 +12606,7 @@ def parse_stmt():
         advance()
         r = parse_expr()
         expect(T_SEMI, "expected ;")
-        es("  ret i64 ")
-        er(r)
-        es("\n")
+        gen_return(r)
         emit_label(new_label())
         return 0
     if tk() == T_MEM:
@@ -12557,13 +12662,7 @@ def parse_global_decl():
     advance()
     expect(T_SEMI, "expected ;")
     declare_global(start, length)
-    es("@g_")
-    emit_name(start, length)
-    es(" = internal global i64 ")
-    if neg == 1:
-        es("-")
-    en(v)
-    es("\n")
+    gen_global_decl(start, length, v, neg)
     return 0
 
 
@@ -12589,41 +12688,15 @@ def parse_function():
         nparams = nparams + 1
         advance()
     advance()
-    es("\ndefine i64 @f_")
-    emit_name(start, length)
-    es("(")
-    i = 0
-    while i < nparams:
-        if i > 0:
-            es(", ")
-        es("i64 %p")
-        en(i)
-        i = i + 1
-    es(") {\nentry:\n")
-    es("  %frame = alloca [")
-    en(FRAME)
-    es(" x i64], align 8\n")
-    i = 0
-    while i < nparams:
-        es("  %a")
-        en(i)
-        es(" = getelementptr inbounds [")
-        en(FRAME)
-        es(" x i64], ptr %frame, i64 0, i64 ")
-        en(i)
-        es("\n")
-        es("  store i64 %p")
-        en(i)
-        es(", ptr %a")
-        en(i)
-        es(", align 8\n")
-        i = i + 1
+    gen_function_open(start, length, nparams)
     parse_block()
-    es("  ret i64 0\n}\n")
+    gen_function_close()
     return 0
 
 
 def emit_header():
+    if _S0_NATIVE:
+        return _na_emit_header()
     es("target triple = \"x86_64-unknown-linux-gnu\"\n\n")
     es("@memory = internal global [")
     en(MEMSIZE)
@@ -12635,6 +12708,8 @@ def emit_header():
 
 
 def emit_trailer():
+    if _S0_NATIVE:
+        return _na_emit_trailer()
     es("\n@strdata = internal constant [")
     en(strtop)
     es(" x i64] [")
@@ -12726,6 +12801,469 @@ def _stage0_reset() -> None:
     line = 1
     argsp = 0
     _S0_OUT = []
+
+
+# ----------------------------------------------------------------------
+# the seed's other tail: octets rather than a description of them
+# ----------------------------------------------------------------------
+#
+# The same back end `gslcelf.gsl2` carries, in the language the seed is
+# written in, so that the chain the seed starts needs nothing after it.  What
+# it writes has to equal what that one writes for the same source, and that
+# is the only thing keeping it honest.
+
+GSL2_FRAME_SLOTS: Final[int] = 64
+GSL2_MOST_VALUES: Final[int] = 8192
+GSL2_MEMORY_AT: Final[int] = 6291456
+GSL2_GLOBALS_AT: Final[int] = 22291456
+GSL2_OUT_AT: Final[int] = 22293504
+GSL2_OUT_SPAN: Final[int] = 65536
+GSL2_OUT_USED_AT: Final[int] = 22359040
+GSL2_IN_AT: Final[int] = 22359048
+GSL2_IN_SPAN: Final[int] = 65536
+GSL2_IN_TAKEN_AT: Final[int] = 22424584
+GSL2_IN_HELD_AT: Final[int] = 22424592
+GSL2_HAND_AT: Final[int] = 22424600
+GSL2_BSS_SPAN: Final[int] = 17181720
+GSL2_STRINGS_AT: Final[int] = 1500000
+
+_S0_NATIVE: bool = False
+_S0_TEXT: Any = None
+_S0_BLOCKS: int = 0
+_S0_FRAME_SITE: int = 0
+_S0_INITIAL: list = []
+
+
+def _na_name(start, length):
+    return "".join(chr(mem[SRC + start + i]) for i in range(length))
+
+
+def _na_slot(slot):
+    return MemoryOperand(Register.RBP, None, 1, -8 * (slot + 1))
+
+
+def _na_value(r):
+    return MemoryOperand(Register.RBP, None, 1, -8 * (GSL2_FRAME_SLOTS + r + 1))
+
+
+def _na_take(register, r):
+    _S0_TEXT.load(register, _na_value(r))
+
+
+def _na_give(r, register):
+    _S0_TEXT.store(_na_value(r), register)
+
+
+def _na_new_reg():
+    global regcnt
+    regcnt = regcnt + 1
+    if regcnt >= GSL2_MOST_VALUES:
+        fail("too many values at once in one function")
+    return regcnt - 1
+
+
+def _na_new_label():
+    global _S0_BLOCKS
+    _S0_BLOCKS = _S0_BLOCKS + 1
+    return f"b{_S0_BLOCKS}"
+
+
+def _na_emit_label(l):
+    _S0_TEXT.label(l)
+    return 0
+
+
+def _na_emit_br(l):
+    _S0_TEXT.jump(l)
+    return 0
+
+
+def _na_emit_cond_br(r, a, b):
+    _na_take(Register.RAX, r)
+    _S0_TEXT.test(Register.RAX, Register.RAX)
+    _S0_TEXT.jump_if("ne", a)
+    _S0_TEXT.jump(b)
+    return 0
+
+
+def _na_gen_const(v):
+    r = _na_new_reg()
+    _S0_TEXT.immediate(Register.RAX, v)
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_slot_addr(slot):
+    r = _na_new_reg()
+    _S0_TEXT.address_of(Register.RAX, _na_slot(slot))
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_mem_addr(index_reg):
+    r = _na_new_reg()
+    _na_take(Register.RAX, index_reg)
+    _S0_TEXT.immediate(Register.RCX, GSL2_MEMORY_AT)
+    _S0_TEXT.address_of(
+        Register.RAX, MemoryOperand(Register.RCX, Register.RAX, 8, 0)
+    )
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_load(addr_reg):
+    r = _na_new_reg()
+    _na_take(Register.RAX, addr_reg)
+    _S0_TEXT.load(Register.RAX, MemoryOperand(Register.RAX, None, 1, 0))
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_store(value_reg, addr_reg):
+    _na_take(Register.RAX, value_reg)
+    _na_take(Register.RCX, addr_reg)
+    _S0_TEXT.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RAX)
+    return 0
+
+
+def _na_gen_store_const(value, addr_reg):
+    _S0_TEXT.immediate(Register.RAX, value)
+    _na_take(Register.RCX, addr_reg)
+    _S0_TEXT.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RAX)
+    return 0
+
+
+def _na_gen_global_load(start, length):
+    r = _na_new_reg()
+    _S0_TEXT.immediate(
+        Register.RCX, GSL2_GLOBALS_AT + find_global(start, length) * 8
+    )
+    _S0_TEXT.load(Register.RAX, MemoryOperand(Register.RCX, None, 1, 0))
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_global_store(value_reg, start, length):
+    _na_take(Register.RAX, value_reg)
+    _S0_TEXT.immediate(
+        Register.RCX, GSL2_GLOBALS_AT + find_global(start, length) * 8
+    )
+    _S0_TEXT.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RAX)
+    return 0
+
+
+def _na_gen_binary(op, a, b):
+    r = _na_new_reg()
+    _na_take(Register.RAX, a)
+    _na_take(Register.RCX, b)
+    if op == T_PLUS:
+        _S0_TEXT.arithmetic("add", Register.RAX, Register.RCX)
+    if op == T_MINUS:
+        _S0_TEXT.arithmetic("sub", Register.RAX, Register.RCX)
+    if op == T_STAR:
+        _S0_TEXT.multiply(Register.RAX, Register.RCX)
+    if op == T_SLASH:
+        _S0_TEXT.sign_extend()
+        _S0_TEXT.divide(Register.RCX)
+    if op == T_PERCENT:
+        _S0_TEXT.sign_extend()
+        _S0_TEXT.divide(Register.RCX)
+        _S0_TEXT.load(Register.RAX, Register.RDX)
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_condition(op):
+    if op == T_EQ:
+        return "e"
+    if op == T_NE:
+        return "ne"
+    if op == T_LT:
+        return "l"
+    if op == T_LE:
+        return "le"
+    if op == T_GT:
+        return "g"
+    return "ge"
+
+
+def _na_gen_compare(op, a, b):
+    r = _na_new_reg()
+    _na_take(Register.RAX, a)
+    _na_take(Register.RCX, b)
+    _S0_TEXT.arithmetic("cmp", Register.RAX, Register.RCX)
+    _S0_TEXT.set_if(_na_condition(op), Register.RAX)
+    _S0_TEXT.widen_octet(Register.RAX, Register.RAX)
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_return(r):
+    _na_take(Register.RAX, r)
+    _S0_TEXT.leave()
+    _S0_TEXT.ret()
+    return 0
+
+
+def _na_gen_call(start, length, base, nargs):
+    for i in range(nargs - 1, -1, -1):
+        _na_take(Register.RAX, mem[ARGS + base + i])
+        _S0_TEXT.push(Register.RAX)
+    _S0_TEXT.call("f:" + _na_name(start, length))
+    if nargs > 0:
+        _S0_TEXT.arithmetic_immediate("add", Register.RSP, 8 * nargs)
+    r = _na_new_reg()
+    _na_give(r, Register.RAX)
+    return r
+
+
+def _na_gen_function_open(start, length, nparams):
+    global _S0_FRAME_SITE
+    name = _na_name(start, length)
+    _S0_TEXT.label("f:" + name)
+    if name == "main":
+        _S0_TEXT.label("main")
+    _S0_TEXT.push(Register.RBP)
+    _S0_TEXT.load(Register.RBP, Register.RSP)
+    _S0_TEXT.arithmetic_immediate("sub", Register.RSP, 0)
+    _S0_FRAME_SITE = len(_S0_TEXT) - 4
+    for i in range(nparams):
+        _S0_TEXT.load(
+            Register.RAX, MemoryOperand(Register.RBP, None, 1, 16 + 8 * i)
+        )
+        _S0_TEXT.store(_na_slot(i), Register.RAX)
+    return 0
+
+
+def _na_gen_function_close():
+    _S0_TEXT.immediate(Register.RAX, 0)
+    _S0_TEXT.leave()
+    _S0_TEXT.ret()
+    struct.pack_into(
+        "<i", _S0_TEXT._code, _S0_FRAME_SITE,
+        _align_up(8 * (GSL2_FRAME_SLOTS + regcnt + 1), 16),
+    )
+    return 0
+
+
+def _na_gen_global_decl(start, length, v, neg):
+    if neg == 1:
+        v = -v
+    _S0_INITIAL.append((find_global(start, length), v))
+    return 0
+
+
+def _na_gen_deliver(where, count):
+    _na_take(Register.RDI, where)
+    _na_take(Register.RSI, count)
+    _S0_TEXT.call("deliver")
+    return _na_gen_const(0)
+
+
+def _na_parse_call_builtin(kind, first_arg):
+    if kind == 1:
+        _na_take(Register.RAX, first_arg)
+        _S0_TEXT.call("putchar")
+        r = _na_new_reg()
+        _na_give(r, Register.RAX)
+        return r
+    if kind == 2:
+        _S0_TEXT.call("getchar")
+        r = _na_new_reg()
+        _na_give(r, Register.RAX)
+        return r
+    _na_take(Register.RAX, first_arg)
+    _S0_TEXT.call("quit")
+    return _na_gen_const(0)
+
+
+def _na_runtime():
+    """The three routines a program in this language asks the world for."""
+    text = _S0_TEXT
+    text.label("putchar")
+    for register in (Register.RCX, Register.RDX, Register.RSI, Register.RDI):
+        text.push(register)
+    text.immediate(Register.RDX, GSL2_OUT_USED_AT)
+    text.load(Register.RCX, MemoryOperand(Register.RDX, None, 1, 0))
+    text.immediate(Register.RSI, GSL2_OUT_AT)
+    text.store_octet(
+        MemoryOperand(Register.RSI, Register.RCX, 1, 0), Register.RAX
+    )
+    text.increment(Register.RCX)
+    text.store(MemoryOperand(Register.RDX, None, 1, 0), Register.RCX)
+    text.arithmetic_immediate("cmp", Register.RCX, GSL2_OUT_SPAN)
+    text.jump_if("l", "putchar.done")
+    text.call("flush")
+    text.label("putchar.done")
+    for register in (Register.RDI, Register.RSI, Register.RDX, Register.RCX):
+        text.pop(register)
+    text.ret()
+
+    text.label("flush")
+    for register in (
+        Register.RAX, Register.RCX, Register.RDX, Register.RSI, Register.RDI
+    ):
+        text.push(register)
+    text.immediate(Register.RDX, GSL2_OUT_USED_AT)
+    text.load(Register.RCX, MemoryOperand(Register.RDX, None, 1, 0))
+    text.test(Register.RCX, Register.RCX)
+    text.jump_if("e", "flush.done")
+    text.load(Register.RDX, Register.RCX)
+    text.immediate(Register.RAX, SYS_WRITE)
+    text.immediate(Register.RDI, 1)
+    text.immediate(Register.RSI, GSL2_OUT_AT)
+    text.syscall()
+    text.immediate(Register.RDX, GSL2_OUT_USED_AT)
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.store(MemoryOperand(Register.RDX, None, 1, 0), Register.RAX)
+    text.label("flush.done")
+    for register in (
+        Register.RDI, Register.RSI, Register.RDX, Register.RCX, Register.RAX
+    ):
+        text.pop(register)
+    text.ret()
+
+    text.label("getchar")
+    for register in (Register.RCX, Register.RDX, Register.RSI, Register.RDI):
+        text.push(register)
+    text.immediate(Register.RCX, GSL2_IN_TAKEN_AT)
+    text.load(Register.RDX, MemoryOperand(Register.RCX, None, 1, 0))
+    text.immediate(Register.RSI, GSL2_IN_HELD_AT)
+    text.load(Register.RDI, MemoryOperand(Register.RSI, None, 1, 0))
+    text.arithmetic("cmp", Register.RDX, Register.RDI)
+    text.jump_if("l", "getchar.take")
+    text.label("getchar.fill")
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.arithmetic("xor", Register.RDI, Register.RDI)
+    text.immediate(Register.RSI, GSL2_IN_AT)
+    text.immediate(Register.RDX, GSL2_IN_SPAN)
+    text.syscall()
+    text.arithmetic_immediate("cmp", Register.RAX, 0)
+    text.jump_if("le", "getchar.ended")
+    text.immediate(Register.RSI, GSL2_IN_HELD_AT)
+    text.store(MemoryOperand(Register.RSI, None, 1, 0), Register.RAX)
+    text.immediate(Register.RCX, GSL2_IN_TAKEN_AT)
+    text.arithmetic("xor", Register.RDX, Register.RDX)
+    text.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RDX)
+    text.label("getchar.take")
+    text.immediate(Register.RSI, GSL2_IN_AT)
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.load_octet(
+        Register.RAX, MemoryOperand(Register.RSI, Register.RDX, 1, 0)
+    )
+    text.increment(Register.RDX)
+    text.immediate(Register.RCX, GSL2_IN_TAKEN_AT)
+    text.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RDX)
+    text.jump("getchar.done")
+    text.label("getchar.ended")
+    text.immediate(Register.RAX, -1)
+    text.label("getchar.done")
+    for register in (Register.RDI, Register.RSI, Register.RDX, Register.RCX):
+        text.pop(register)
+    text.ret()
+
+    text.label("quit")
+    text.push(Register.RAX)
+    text.call("flush")
+    text.pop(Register.RDI)
+    text.immediate(Register.RAX, SYS_EXIT_GROUP)
+    text.syscall()
+
+    text.label("deliver")
+    text.call("flush")
+    text.load(Register.R8, Register.RDI)
+    text.load(Register.R9, Register.RSI)
+    text.arithmetic("xor", Register.RCX, Register.RCX)
+    text.label("deliver.pack")
+    text.arithmetic("cmp", Register.RCX, Register.R9)
+    text.jump_if("ge", "deliver.packed")
+    text.load(Register.RDX, Register.R8)
+    text.arithmetic("add", Register.RDX, Register.RCX)
+    text.immediate(Register.RSI, GSL2_MEMORY_AT)
+    text.arithmetic("xor", Register.RAX, Register.RAX)
+    text.load_octet(
+        Register.RAX, MemoryOperand(Register.RSI, Register.RDX, 8, 0)
+    )
+    text.immediate(Register.RDI, GSL2_HAND_AT)
+    text.store_octet(
+        MemoryOperand(Register.RDI, Register.RCX, 1, 0), Register.RAX
+    )
+    text.increment(Register.RCX)
+    text.jump("deliver.pack")
+    text.label("deliver.packed")
+    text.immediate(Register.RAX, SYS_BECOME)
+    text.immediate(Register.RDI, GSL2_HAND_AT)
+    text.load(Register.RSI, Register.R9)
+    text.syscall()
+    text.arithmetic_immediate("cmp", Register.RAX, 0)
+    text.jump_if("ge", "deliver.done")
+    text.immediate(Register.RAX, SYS_WRITE)
+    text.immediate(Register.RDI, 1)
+    text.immediate(Register.RSI, GSL2_HAND_AT)
+    text.load(Register.RDX, Register.R9)
+    text.syscall()
+    text.label("deliver.done")
+    text.ret()
+    return 0
+
+
+def _na_emit_header():
+    text = _S0_TEXT
+    text.label("start")
+    text.call("init")
+    text.call("main")
+    text.call("flush")
+    text.immediate(Register.RAX, SYS_EXIT_GROUP)
+    text.arithmetic("xor", Register.RDI, Register.RDI)
+    text.syscall()
+    _na_runtime()
+    return 0
+
+
+def _na_emit_trailer():
+    text = _S0_TEXT
+    text.label("init")
+    for slot, value in _S0_INITIAL:
+        text.immediate(Register.RCX, GSL2_GLOBALS_AT + slot * 8)
+        text.immediate(Register.RAX, value)
+        text.store(MemoryOperand(Register.RCX, None, 1, 0), Register.RAX)
+    text.address_of_label(Register.RSI, "strdata")
+    text.immediate(Register.RDI, GSL2_MEMORY_AT + GSL2_STRINGS_AT * 8)
+    text.immediate(Register.RCX, strtop)
+    text.label("copy")
+    text.test(Register.RCX, Register.RCX)
+    text.jump_if("e", "copy.done")
+    text.load(Register.RAX, MemoryOperand(Register.RSI, None, 1, 0))
+    text.store(MemoryOperand(Register.RDI, None, 1, 0), Register.RAX)
+    text.arithmetic_immediate("add", Register.RSI, 8)
+    text.arithmetic_immediate("add", Register.RDI, 8)
+    text.decrement(Register.RCX)
+    text.jump("copy")
+    text.label("copy.done")
+    text.ret()
+
+    text.label("strdata")
+    for i in range(strtop):
+        text._code.extend(struct.pack("<q", mem[STRBUF + i]))
+    return 0
+
+
+def gsl2_machine_code(source: str) -> bytes:
+    """Compile GSL-2 straight to a static executable, with nothing after it."""
+    global _S0_SOURCE, _S0_NATIVE, _S0_TEXT, _S0_BLOCKS, _S0_INITIAL
+    _stage0_reset()
+    _S0_SOURCE = source
+    _S0_NATIVE = True
+    _S0_TEXT = X86Assembler()
+    _S0_BLOCKS = 0
+    _S0_INITIAL = []
+    try:
+        _stage0_run()
+        text = _S0_TEXT.link()
+    finally:
+        _S0_NATIVE = False
+        _S0_TEXT = None
+    return elf64_image(text, GSL2_BSS_SPAN, EM_X86_64, PAGE_SIZE)
 
 
 def gsl2_compile(source: str) -> str:
@@ -12921,7 +13459,7 @@ class ToolchainReport:
     """What came out of building the compiler with nothing but itself."""
 
     workdir: Path
-    seeded: int
+    seeded: tuple[int, str]
     stages: tuple[tuple[int, str], ...]
     front_end: int
     program: int
@@ -12934,8 +13472,18 @@ class ToolchainReport:
         return len({digest for _, digest in self.stages}) == 1
 
     @property
+    def seeded_matches(self) -> bool:
+        """Whether the seed already wrote the compiler the compiler writes.
+
+        The seed is a transliteration of the same back end into the language
+        this file is written in, so this says the two of them agree about
+        every octet of a compiler, which is more than the fixpoint says.
+        """
+        return self.seeded[1] == self.stages[0][1]
+
+    @property
     def clean(self) -> bool:
-        return self.fixed and self.glyph == self.expected
+        return self.fixed and self.seeded_matches and self.glyph == self.expected
 
 
 def _compile_with(compiler: Path, source: str, destination: Path) -> Path:
@@ -12966,9 +13514,11 @@ def close_the_toolchain(
     (directory / "gslcelf.gsl2").write_text(GSLCELF_GSL2)
     (directory / "glyphelf.gsl2").write_text(GLYPHELF_GSL2)
 
-    seeded = link_executable(
-        gsl2_compile(GSLCELF_GSL2), directory / "seeded", opt_level
-    )
+    # The seed writes a program rather than a description of one, so there is
+    # nothing under this at all: no assembler, no linker, nothing installed.
+    seeded = directory / "seeded"
+    seeded.write_bytes(gsl2_machine_code(GSLCELF_GSL2))
+    seeded.chmod(0o755)
     stages: list[Path] = []
     previous = seeded
     for turn in range(3):
@@ -12983,7 +13533,10 @@ def close_the_toolchain(
     program = _compile_with(front_end, source, directory / "glyph")
     return ToolchainReport(
         workdir=directory,
-        seeded=seeded.stat().st_size,
+        seeded=(
+            seeded.stat().st_size,
+            reference_digest(seeded.read_bytes().hex()),
+        ),
         stages=tuple(
             (stage.stat().st_size, reference_digest(stage.read_bytes().hex()))
             for stage in stages
@@ -13332,6 +13885,10 @@ class X86Assembler:
 
     def jump_register(self, target: Register) -> None:
         self._quad((0xFF,), 4, target)
+
+    def leave(self) -> None:
+        """The frame back the way it came, in one octet."""
+        self._emit(0xC9)
 
     def halt(self) -> None:
         self._emit(0xF4)
@@ -17770,7 +18327,8 @@ def _emit_toolchain_report(report: ToolchainReport) -> int:
     def line(step: str, said: str, span: int) -> None:
         print(f"  {step:<24}{said:<36}{span:>7} octets")
 
-    line("python3   ->  gslcelf", "the seed turns the crank once", report.seeded)
+    line("python3   ->  gslcelf", "the seed turns the crank once",
+         report.seeded[0])
     for turn, (span, _) in enumerate(report.stages):
         line("gslcelf   ->  gslcelf",
              "and from here it builds itself" if turn == 0 else "and again", span)
@@ -17778,6 +18336,8 @@ def _emit_toolchain_report(report: ToolchainReport) -> int:
     line("glyphelf  ->  glyph", "and the front end writes a program",
          report.program)
     print(rule)
+    same = "[ok]  " if report.seeded_matches else "[FAIL]"
+    print(f"  {same} the seed wrote the compiler the compiler writes")
     fixed = "[ok]  " if report.fixed else "[FAIL]"
     renders = "[ok]  " if report.glyph == report.expected else "[FAIL]"
     print(f"  {fixed} the compiler it built is the compiler that built it")
