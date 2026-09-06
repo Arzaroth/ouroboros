@@ -68,6 +68,20 @@ jobs:
           print(f'{len(image)} octets, {len(image)//512} sectors, signed')
           "
 
+      - name: a disk that loads an executable rather than being one
+        run: |
+          python ouroboros.py --emit-kernel glyph-kernel.img
+          python ouroboros.py --machine x86-64 --emit-elf glyph
+          python -c "
+          import pathlib, ouroboros
+          image = pathlib.Path('glyph-kernel.img').read_bytes()
+          published = pathlib.Path('glyph').read_bytes()
+          assert image[510:512] == b'\x55\xaa', 'the sector is not bootable'
+          carried = ouroboros.kernel_passenger(image, len(published))
+          assert carried == published, 'the disk is carrying a different executable'
+          print(f'{len(image)} octets, and what it carries is the ELF beside it')
+          "
+
       - name: a wasm module, and the five lines of host it asks for
         run: |
           python ouroboros.py --emit-wasm glyph.wasm
@@ -137,6 +151,17 @@ jobs:
           got = ouroboros.run_boot(pathlib.Path('glyph.img'), 7).removesuffix('\n')
           assert got == wanted, got
           print('the disk booted, and printed it')
+          "
+
+      - name: the kernel loads the unmodified executable and prints it too
+        run: |
+          python ouroboros.py --emit-kernel glyph-kernel.img
+          python -c "
+          import pathlib, ouroboros
+          wanted = ouroboros.synthesize(7).unwrap_or_raise().rendering
+          got = ouroboros.run_boot(pathlib.Path('glyph-kernel.img'), 7).removesuffix('\n')
+          assert got == wanted, got
+          print('the kernel booted, loaded it, and it printed it')
           "
 
       - name: the firmware loads the application and prints the same figure

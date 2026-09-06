@@ -73,6 +73,7 @@ jobs:
           python ouroboros.py --machine riscv64 --emit-elf "dist/glyph-$safe-linux-riscv64" > /dev/null
           python ouroboros.py --emit-wasm "dist/glyph-$safe.wasm" > /dev/null
           python ouroboros.py --emit-boot "dist/glyph-$safe.img" > /dev/null
+          python ouroboros.py --emit-kernel "dist/glyph-$safe-kernel.img" > /dev/null
           python ouroboros.py --emit-efi "dist/glyph-$safe.efi" > /dev/null
           python ouroboros.py --emit-llvm > "dist/glyph-$safe.ll"
           python ouroboros.py --emit-gsl2 glyphc > "dist/glyphc-$safe.gsl2"
@@ -87,6 +88,19 @@ jobs:
           file "dist/glyph-$safe-linux-aarch64" | grep -q aarch64
           file "dist/glyph-$safe-linux-riscv64" | grep -q RISC-V
           file "dist/glyph-$safe.img" | grep -q "boot sector"
+
+          # The disk with a kernel on it is checked harder than a shape: the
+          # executable riding on it has to be the one published beside it.
+          python - "dist/glyph-$safe-kernel.img" "dist/glyph-$safe-linux-x86_64" <<'EOF'
+          import pathlib, sys
+          import ouroboros
+          image = pathlib.Path(sys.argv[1]).read_bytes()
+          published = pathlib.Path(sys.argv[2]).read_bytes()
+          assert image[510:512] == b"\x55\xaa", "the sector is not bootable"
+          carried = ouroboros.kernel_passenger(image, len(published))
+          assert carried == published, "the disk is carrying a different executable"
+          print(f"{len(image)} octets, and the passenger is the asset beside it")
+          EOF
           python - "dist/glyph-$safe.efi" <<'EOF'
           import pathlib, sys
           image = pathlib.Path(sys.argv[1]).read_bytes()
