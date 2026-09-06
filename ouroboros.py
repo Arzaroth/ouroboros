@@ -96,6 +96,7 @@
     python3 ouroboros.py --emit-efi PATH  the same text, for UEFI firmware
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --explain wasm   say what every instruction of it is
+    python3 ouroboros.py --trace-machine  and what each one of them did
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -4962,6 +4963,7 @@ class AssuranceSuite:
                 self._event_replay,
                 self._lexer_covers_source,
                 self._every_octet_is_an_instruction,
+                self._every_step_is_named,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
                 self._coordinate_immutable,
@@ -5071,6 +5073,30 @@ class AssuranceSuite:
             True,
             f"{named} of them across {len(MACHINES)} machines and a module, "
             "each one named",
+        )
+
+    @staticmethod
+    def _every_step_is_named(artifacts: CompilationArtifacts) -> CheckResult:
+        """Whether the file can name every instruction it actually runs.
+
+        The check above walks the text from one end; this walks the path the
+        program takes through it, which is not the same walk and can land
+        somewhere the other never looked.  The reader and the narrator
+        disagreeing about where an instruction is stops it.
+        """
+        steps = 0
+        try:
+            for architecture in sorted(MACHINES):
+                said = trace_machine_code(
+                    machine_code(artifacts.module, architecture), architecture
+                )
+                steps += len(said.splitlines())
+        except GlyphPlatformError as exc:
+            return CheckResult("every step it runs is one it can name", False, str(exc))
+        return CheckResult(
+            "every step it runs is one it can name",
+            True,
+            f"{steps} step(s) across {len(MACHINES)} machines",
         )
 
     @staticmethod
@@ -23052,6 +23078,118 @@ def narrate_machine_code(image: bytes, architecture: str = "x86-64") -> str:
     return "\n".join(lines) + "\n"
 
 
+# The names a trace calls the registers by.  The first machine has sixteen
+# with names of their own; the other two have thirty-two numbered ones, and
+# then whatever the reader keeps past them for the two places register
+# thirty-one stands for on the machine that has that trap.
+MACHINE_REGISTER_NAMES: Final[Mapping[str, tuple[str, ...]]] = {
+    "x86-64": REGISTER_NAMES,
+    "aarch64": (*(f"x{n}" for n in range(32)), "xzr", "sp"),
+    "riscv64": tuple(f"x{n}" for n in range(32)),
+}
+
+MACHINE_FLAG_NAMES: Final[tuple[str, ...]] = (
+    "_zero", "_sign", "_negative", "_carry", "_overflow",
+)
+
+
+def _machine_flags(reader: object) -> tuple[tuple[str, bool], ...]:
+    return tuple(
+        (name.lstrip("_"), getattr(reader, name))
+        for name in MACHINE_FLAG_NAMES
+        if hasattr(reader, name)
+    )
+
+
+def trace_machine_code(
+    image: bytes, architecture: str = "x86-64", patience: int = 20_000
+) -> str:
+    """What every instruction does, in the order the machine does it.
+
+    The two halves this file already has, joined: the reader knows what an
+    instruction means and the narrator knows what it is called, and neither
+    on its own says what a program did.  Every fault in an encoder here was
+    found with somebody else's tool for want of this one.
+
+    A step shows the instruction and then only what it altered, because a
+    register file printed whole says nothing and a register that changed says
+    everything.
+
+    It refuses at an address the narrator did not name.  That is the two of
+    them disagreeing about where an instruction is, which is worth stopping
+    on rather than printing past.
+    """
+    reader = MACHINE_READERS[architecture](image)
+    names = MACHINE_REGISTER_NAMES[architecture]
+    prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
+    origin = struct.unpack_from("<Q", image, 24)[0]
+    known = {
+        address: (octets, said)
+        for address, octets, said
+        in MACHINE_NARRATORS[architecture](image[prologue:], origin).narrate()
+    }
+    wide = architecture == "x86-64"
+    if wide:
+        reader._registers[Register.RSP] = STACK_CEILING - 4096
+
+    # A store alters nothing a register file can show, so the one thing that
+    # writes memory is asked to say what it wrote on the way through.
+    put: list[tuple[int, int, int]] = []
+    laid_down = reader._memory.write
+
+    def watched(address: int, width: int, value: int) -> None:
+        put.append((address, width, value))
+        laid_down(address, width, value)
+
+    reader._memory.write = watched
+
+    lines: list[str] = []
+    steps = 0
+    while not reader._stopped:
+        steps += 1
+        if steps > patience:
+            lines.append(f"  ... and it was still going after {patience} of them")
+            break
+        at = reader._rip if wide else reader._at
+        try:
+            octets, said = known[at]
+        except KeyError:
+            raise MachineDecodeError(
+                f"the reader is about to run {at:#x} and the narrator has no "
+                "instruction there"
+            ) from None
+        was, flags = list(reader._registers), _machine_flags(reader)
+        wrote = len(reader._written)
+        put.clear()
+        if wide:
+            reader._step()
+        else:
+            word = reader._memory.read(reader._at, 4)
+            reader._at += 4
+            reader._step(word)
+        changed = [
+            f"{names[i] if i < len(names) else i} = {value:#x}"
+            for i, value in enumerate(reader._registers)
+            if value != was[i]
+        ]
+        changed += [
+            f"{name}={int(value)}" for name, value in _machine_flags(reader)
+            if (name, value) not in flags
+        ]
+        changed += [
+            f"[{address:#x}] = {value & ((1 << (8 * width)) - 1):#x}"
+            for address, width, value in put
+        ]
+        if len(reader._written) > wrote:
+            left = bytes(reader._written[wrote:]).decode(errors="replace")
+            changed.append(f"wrote {left!r}")
+        lines.append(
+            (f"  {at:#010x}  {octets.hex(' '):<32}  {said:<34}"
+             + "  " + ", ".join(changed)).rstrip()
+        )
+    return "\n".join(lines) + "\n"
+
+
 class WordReader:
     """What the two machines whose instructions are all one width share.
 
@@ -23737,6 +23875,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          choices=("machine", "wasm"),
                          help="say what every instruction is, of the text or "
                               "of the module")
+    machine.add_argument("--trace-machine", nargs="?", type=int, const=20000,
+                         metavar="STEPS",
+                         help="run the text and say what each instruction did")
     machine.add_argument("--machine", choices=sorted(MACHINES), default=host_machine(),
                          help="which machine to write for (default: this one)")
 
@@ -24077,6 +24218,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.verbose:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
+    if namespace.trace_machine:
+        sys.stdout.write(trace_machine_code(
+            machine_code(artifacts.module, namespace.machine),
+            namespace.machine, namespace.trace_machine,
+        ))
     if namespace.explain == "wasm":
         sys.stdout.write(narrate_wasm(wasm_module(artifacts.module)))
     elif namespace.explain:
@@ -24133,7 +24279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if backend_requested:
         return _run_backend(namespace, artifacts)
 
-    if namespace.explain:
+    if namespace.explain or namespace.trace_machine:
         return 0
     if STREAM not in (
         namespace.emit_elf, namespace.emit_wasm, namespace.emit_boot,
