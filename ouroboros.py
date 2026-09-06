@@ -98,6 +98,7 @@
     python3 ouroboros.py --explain wasm   say what every instruction of it is
     python3 ouroboros.py --trace-machine  and what each one of them did
     python3 ouroboros.py --fuzz-limits   grow a program until a backend says no
+    python3 ouroboros.py --coverage     what the checks actually touched
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -119,6 +120,7 @@ import hashlib
 import inspect
 import io
 import itertools
+import json
 import logging
 import operator
 import os
@@ -133,6 +135,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import typing
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -5251,6 +5254,211 @@ def synthesize_source(
     return Result.attempt(
         lambda: SynthesisOrchestrator(configuration, source=source).run()
     )
+
+
+# ----------------------------------------------------------------------
+# layer 15b: how much of this the checks above actually touch
+# ----------------------------------------------------------------------
+#
+# Everything above says what it checked.  None of it says what it did not,
+# and the difference between those two is where a claim quietly stops being
+# about the whole file.  So: run the checks under a tracer and write down
+# which lines ran.
+#
+# There is no coverage library here for the same reason there is no
+# assembler: the interpreter has a tracer of its own, and that is less work
+# than a dependency would be.  The one thing it cannot do from inside is watch its
+# own import, since by then the import has happened - so each exercise is a
+# fresh interpreter that arms the tracer and only then loads the file.
+#
+# What it does not measure is itself: an exercise that ran this one would run
+# every other exercise inside it, once per exercise, for as long as anybody
+# was prepared to wait.
+
+COVERAGE_HARNESS: Final[str] = """
+import importlib.util, io, json, sys, threading, contextlib
+path, out, *argv = sys.argv[1:]
+seen = {}
+
+
+def trace(frame, event, arg):
+    if frame.f_code.co_filename != path:
+        return None
+    if event == "line":
+        seen[frame.f_lineno] = seen.get(frame.f_lineno, 0) + 1
+    return trace
+
+
+threading.settrace(trace)
+sys.settrace(trace)
+spec = importlib.util.spec_from_file_location("ouroboros", path)
+module = importlib.util.module_from_spec(spec)
+sys.modules["ouroboros"] = module
+spec.loader.exec_module(module)
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    try:
+        module.main(argv)
+    except BaseException:
+        pass
+sys.settrace(None)
+threading.settrace(None)
+with open(out, "w") as answer:
+    json.dump(seen, answer)
+"""
+
+# What to run under the tracer.  One of everything the file offers that does
+# not need a machine underneath it, since a runner with an emulator is not
+# what this is measuring.
+COVERAGE_EXERCISES: Final[tuple[tuple[str, ...], ...]] = (
+    ("-n", "7"),
+    ("-n", "9", "-j", "4"),
+    ("-n", "5", "-l", "fr", "-v"),
+    ("-n", "5", "-t", "block"),
+    ("-n", "5", "--no-optimise", "--no-jit", "--no-roundtrip"),
+    ("-n", "7", "--emit-everything"),
+    ("--list-motifs",),
+    ("--self-test",),
+    ("--selftest",),
+    ("--fuzz", "20"),
+    ("--fuzz", "5", "--fuzz-native"),
+    ("--fuzz", "5", "--fuzz-loop"),
+    ("--fuzz-refusals", "20"),
+    ("--fuzz-limits", "2048"),
+    ("--bootstrap",),
+    ("--close-the-loop",),
+    ("--close-the-toolchain",),
+    ("-n", "5", "--explain"),
+    ("-n", "5", "--explain", "wasm"),
+    ("-n", "5", "--trace-machine"),
+    ("-n", "5", "--machine", "aarch64", "--emit-machine-code"),
+    ("-n", "5", "--machine", "riscv64", "--emit-machine-code"),
+)
+
+
+def executable_lines(path: Path) -> frozenset[int]:
+    """Every line of a file that could run, asked of the compiler.
+
+    A line is executable when some code object claims it, which is the same
+    question a coverage tool asks and the only one with a defensible answer:
+    the alternative is guessing from the text, and the text of this file is a
+    third string literals.  The answer moves a little between interpreters,
+    since where a line is charged is theirs to decide and they have changed
+    their minds before.
+    """
+    text = path.read_text()
+    code = compile(text, str(path), "exec")
+    found: set[int] = set()
+    pending = [code]
+    while pending:
+        current = pending.pop()
+        found.update(
+            line for _, _, line in current.co_lines() if line is not None
+        )
+        pending.extend(
+            constant for constant in current.co_consts
+            if isinstance(constant, types.CodeType)
+        )
+    # The compiler hangs a line number on the blank line after a call that
+    # spanned several, and on a comment inside one.  Neither is a statement
+    # whatever the tables say, and counting them would put a thousand lines in
+    # the denominator that nobody could write a check for.
+    lines = text.splitlines()
+    return frozenset(
+        at for at in found
+        if 1 <= at <= len(lines)
+        and lines[at - 1].strip()
+        and not lines[at - 1].lstrip().startswith("#")
+    )
+
+
+def _traced(path: Path, argv: Sequence[str], scratch: Path) -> Mapping[int, int]:
+    """One exercise, in an interpreter that was watching before it loaded."""
+    answer = scratch / "lines.json"
+    try:
+        subprocess.run(
+            [sys.executable, "-c", COVERAGE_HARNESS, str(path), str(answer), *argv],
+            capture_output=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+    if not answer.exists():
+        return {}
+    counts = json.loads(answer.read_text())
+    answer.unlink()
+    return {int(line): count for line, count in counts.items()}
+
+
+@dataclass(frozen=True, slots=True)
+class CoverageReport:
+    """Which lines of the file the checks ran, and which they never did."""
+
+    path: Path
+    executable: frozenset[int]
+    counts: Mapping[int, int]
+    exercises: int
+
+    @property
+    def found(self) -> int:
+        return len(self.executable)
+
+    @property
+    def hit(self) -> int:
+        return sum(1 for line in self.executable if self.counts.get(line))
+
+    @property
+    def portion(self) -> float:
+        return 100.0 * self.hit / self.found if self.found else 0.0
+
+    def cold(self) -> tuple[tuple[str, int, int], ...]:
+        """Which layer each line that never ran belongs to, and how many.
+
+        A percentage says how much was missed and nothing about what, which
+        is the half worth knowing: a layer that no check enters is a layer
+        whose claims are made by nobody.
+        """
+        text = self.path.read_text().splitlines()
+        banners = [
+            (at, line[2:].strip()) for at, line in enumerate(text, 1)
+            if line.startswith("# Layer ") or line.startswith("# layer ")
+        ]
+        missed: dict[str, int] = {}
+        total: dict[str, int] = {}
+        where, index = "the preamble", 0
+        for line in sorted(self.executable):
+            while index < len(banners) and banners[index][0] <= line:
+                where = banners[index][1]
+                index += 1
+            total[where] = total.get(where, 0) + 1
+            if not self.counts.get(line):
+                missed[where] = missed.get(where, 0) + 1
+        return tuple(sorted(
+            ((name, missed[name], total[name]) for name in missed),
+            key=lambda entry: -entry[1],
+        ))
+
+    def render(self) -> str:
+        lines = [
+            f"{self.exercises} exercise(s): {self.hit} of {self.found} "
+            f"executable line(s) ran, {self.portion:.1f}%"
+        ]
+        for name, missed, total in self.cold()[:8]:
+            lines.append(f"  {missed:>5} of {total:>5} never ran in {name[:58]}")
+        return "\n".join(lines)
+
+
+def measure_coverage(
+    path: Path | None = None, exercises: Sequence[Sequence[str]] | None = None
+) -> CoverageReport:
+    """Runs the checks under a tracer and answers what they touched."""
+    here = path or Path(__file__)
+    chosen = tuple(exercises or COVERAGE_EXERCISES)
+    counts: dict[int, int] = {}
+    with tempfile.TemporaryDirectory(prefix="ouroboros-coverage-") as scratch:
+        for argv in chosen:
+            for line, count in _traced(here, argv, Path(scratch)).items():
+                counts[line] = counts.get(line, 0) + count
+    return CoverageReport(here, executable_lines(here), counts, len(chosen))
 
 
 # ======================================================================
@@ -24451,6 +24659,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                       help="and let it build the front end on the way there")
     boot.add_argument("--close-the-loop", action="store_true")
     boot.add_argument("--selftest", action="store_true")
+    boot.add_argument("--coverage", action="store_true",
+                      help="run the checks under a tracer and say what they "
+                           "touched")
 
     fuzzing = parser.add_argument_group("differential fuzzing")
     fuzzing.add_argument("--fuzz", type=int, metavar="N", help="cross-check N random programs")
@@ -24527,6 +24738,7 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
         ("bootstrap", "--bootstrap"),
         ("run_wasm", "--run-wasm"),
         ("emit_gsl2", "--emit-gsl2"),
+        ("coverage", "--coverage"),
         ("list_motifs", "--list-motifs"),
     ):
         if getattr(namespace, flag):
@@ -24598,6 +24810,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         limits = fuzz_limits(namespace.fuzz_limits or None)
         print(limits.render())
         return 0 if limits.clean else 1
+    if namespace.coverage:
+        print(measure_coverage().render())
+        return 0
     if namespace.fuzz is not None:
         report = fuzz(
             namespace.fuzz,
