@@ -229,6 +229,7 @@ _LOGGER.addHandler(logging.NullHandler())
 _T = TypeVar("_T")
 _U = TypeVar("_U")
 _NodeT = TypeVar("_NodeT", bound="AstNode")
+_ClassT = TypeVar("_ClassT", bound=type)
 
 
 # ======================================================================
@@ -280,6 +281,11 @@ def _project_arguments(
     return {key: value for key, value in arguments.items() if key in parameters}
 
 
+def _named(function: Callable[..., Any]) -> str:
+    """What to call a function in a message, whatever it turns out to be."""
+    return getattr(function, "__qualname__", repr(function))
+
+
 def requires(predicate: Callable[..., bool], description: str) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
     """Design-by-contract precondition decorator."""
 
@@ -294,7 +300,7 @@ def requires(predicate: Callable[..., bool], description: str) -> Callable[[Call
             bound.apply_defaults()
             if not predicate(**_project_arguments(predicate, bound.arguments)):
                 raise ContractViolation(
-                    f"precondition violated in {function.__qualname__}: {description}"
+                    f"precondition violated in {_named(function)}: {description}"
                 )
             return function(*args, **kwargs)
 
@@ -320,7 +326,7 @@ def ensures(predicate: Callable[..., bool], description: str) -> Callable[[Calla
             projected["result"] = result
             if not predicate(**projected):
                 raise ContractViolation(
-                    f"postcondition violated in {function.__qualname__}: {description}"
+                    f"postcondition violated in {_named(function)}: {description}"
                 )
             return result
 
@@ -329,7 +335,7 @@ def ensures(predicate: Callable[..., bool], description: str) -> Callable[[Calla
     return decorator
 
 
-def invariant(cls: type) -> type:
+def invariant(cls: _ClassT) -> _ClassT:
     """Class decorator weaving ``__invariant__`` around every public method."""
     if not CONTRACTS_ENABLED:
         return cls
@@ -410,7 +416,7 @@ def register_aspect(aspect: Aspect | type) -> Any:
 
 def woven(function: Callable[..., _T]) -> Callable[..., _T]:
     """Weaves every globally registered aspect around ``function``."""
-    join_point = function.__qualname__
+    join_point = _named(function)
 
     @functools.wraps(function)
     def wrapper(*args: Any, **kwargs: Any) -> _T:
@@ -4833,7 +4839,7 @@ class SynthesisOrchestrator:
 
     def _compose(self) -> ServiceContainer:
         container = ServiceContainer()
-        theme_cls = typing.cast(type, Theme.lookup(self._configuration["theme"]))
+        theme_cls = Theme.lookup(self._configuration["theme"])
         container.register_instance(Theme, theme_cls())
         container.register(
             RasterizationStrategy, ConcurrentRasterizer, Lifetime.SINGLETON
@@ -4861,7 +4867,7 @@ class SynthesisOrchestrator:
         if self._source is not None:
             source = self._source
         else:
-            source = typing.cast(type, Motif.lookup(motif_key))().source(order)
+            source = Motif.lookup(motif_key)().source(order)
 
         with self._machine.transition(PipelineStage.PREPROCESSED):
             unit = Preprocessor(source).run()
@@ -17622,7 +17628,7 @@ def close_the_toolchain(
 
     front_end = _compile_with(stages[-1], GLYPHELF_GSL2, directory / "glyphelf")
     if source is None:
-        source = typing.cast(type, Motif.lookup(motif))().source(order)
+        source = Motif.lookup(motif)().source(order)
     program = _compile_with(front_end, source, directory / "glyph")
 
     # And once more for every machine this one is not.  The compiler does not
@@ -17716,7 +17722,7 @@ def close_the_loop(
         wanted = ((name, text),)
     else:
         wanted = tuple(
-            (motif, typing.cast(type, Motif.lookup(motif))().source(order))
+            (motif, Motif.lookup(motif)().source(order))
             for motif in (motifs if motifs is not None else Motif.catalogue())
             for order in orders
         )
@@ -21385,7 +21391,7 @@ def boot_what_it_wrote(
     """
     directory = Path(workdir or tempfile.mkdtemp(prefix="ouroboros-metal-"))
     _, _, glyphelf = build_front_ends(directory, opt_level)
-    source = typing.cast(type, Motif.lookup(motif))().source(order)
+    source = Motif.lookup(motif)().source(order)
     program = _run_octets(glyphelf, source)
     (directory / "written.elf").write_bytes(program)
     with tempfile.TemporaryDirectory(prefix="ouroboros-metal-") as scratch:
@@ -21417,7 +21423,7 @@ def boot_what_it_compiles(
     compiler = _compile_with(seeded, GSLCELF_GSL2, directory / "gslcelf")
     front_end = _compile_with(compiler, GLYPHELF_GSL2, directory / "glyphelf")
     if source is None:
-        source = typing.cast(type, Motif.lookup(motif))().source(order)
+        source = Motif.lookup(motif)().source(order)
     (directory / "glyph.gsl").write_text(source)
     image = kernel_carrying(
         front_end.read_bytes(), ("glyphelf",), source.encode()
@@ -21456,7 +21462,7 @@ def boot_the_whole_way(
     seeded.chmod(0o755)
     compiler = _compile_with(seeded, GSLCELF_GSL2, directory / "gslcelf")
     if source is None:
-        source = typing.cast(type, Motif.lookup(motif))().source(order)
+        source = Motif.lookup(motif)().source(order)
     (directory / "glyph.gsl").write_text(source)
     image = kernel_carrying(
         compiler.read_bytes(),
@@ -24810,7 +24816,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if namespace.list_motifs:
         for key in Motif.catalogue():
-            cls = typing.cast(type, Motif.lookup(key))
+            cls = Motif.lookup(key)
             print(f"{key:<16} {getattr(cls, 'description', '')}")
         print("themes:", ", ".join(Theme.catalogue()))
         return 0
