@@ -7205,6 +7205,15 @@ GSL2_LANGUAGE_GSL2: Final[str] = r'''# gslc.gsl2 - the GSL-2 compiler, written i
 # identical to the stage-0 compiler gsl2c.py: for any accepted input both
 # emit the same bytes, which is what makes the bootstrap fixpoint checkable.
 
+# How deep an expression may nest.  The seed that turns the crank the first
+# time is written in a language with a stack it does not choose, and gives way
+# somewhere past a hundred; this compiler, running as a program, would go
+# thousands deep.  They have to refuse the same programs or the fixpoint
+# between them is comparing two languages, so both stop at the same stated
+# number.  The deepest expression in any source here is seven.
+var MAX_NESTING = 64;
+var nesting = 0;
+
 var MEMSIZE = 2000000;
 var STRBASE = 1500000;
 var STRLIMIT = 490000;
@@ -7903,7 +7912,13 @@ fn parse_or() {
 }
 
 fn parse_expr() {
-  return parse_or();
+  nesting = nesting + 1;
+  if (nesting > MAX_NESTING) {
+    fail("an expression nested deeper than this reads");
+  }
+  var v = parse_or();
+  nesting = nesting - 1;
+  return v;
 }
 
 # ----------------------------------------------------------------------
@@ -9677,6 +9692,13 @@ GSL_FRONT_END_GSL2: Final[str] = r'''# glyphc.gsl2 - the GSL front end, written 
 # transducer, parser, analyser, emitter, pass manager, assembler - and then the
 # tier 2 lowering, all of it a second time, in a language that compiles itself.
 
+# The same number layer 5 refuses at, because these two front ends have to
+# refuse the same programs.  This one is a program and would go far deeper
+# before its stack said anything; that is exactly why the edge is stated
+# rather than discovered.
+var MAX_NESTING = 400;
+var nesting = 0;
+
 var MEM_STRINGS = 1500000;
 
 var SRC = 0;
@@ -10669,10 +10691,15 @@ fn parse_prefix() {
 }
 
 fn parse_expr(minimum) {
+  nesting = nesting + 1;
+  if (nesting > MAX_NESTING) {
+    fail("an expression nested deeper than this reads");
+  }
   parse_prefix();
   while (1) {
     var precedence = infix_precedence(tkind());
     if (precedence < 0 || precedence < minimum) {
+      nesting = nesting - 1;
       return 0;
     }
     var kind = tkind();
@@ -16572,7 +16599,13 @@ def parse_or():
 
 
 def parse_expr():
-    return parse_or()
+    global _S0_NESTING
+    _S0_NESTING += 1
+    if _S0_NESTING > GSL2_MAX_NESTING:
+        fail("an expression nested deeper than this reads")
+    value = parse_or()
+    _S0_NESTING -= 1
+    return value
 
 
 # ----------------------------------------------------------------------
@@ -16826,7 +16859,7 @@ def _stage0_run():
 def _stage0_reset() -> None:
     """Return the seed compiler to a pristine state between translation units."""
     global mem, pos, srclen, strtop, nlocals, nglobals, regcnt, labelcnt
-    global line, argsp, _S0_OUT, _S0_PENDING, _S0_SEEN
+    global line, argsp, _S0_OUT, _S0_PENDING, _S0_SEEN, _S0_NESTING
     mem = [0] * 1200000
     pos = 0
     srclen = 0
@@ -16840,6 +16873,7 @@ def _stage0_reset() -> None:
     _S0_OUT = []
     _S0_PENDING = -1
     _S0_SEEN = {}
+    _S0_NESTING = 0
 
 
 # ----------------------------------------------------------------------
@@ -16871,6 +16905,14 @@ _S0_TEXT: Any = None
 _S0_BLOCKS: int = 0
 _S0_FRAME_SITE: int = 0
 _S0_INITIAL: list = []
+# How deep an expression may nest.  This seed is written in a language whose
+# stack it does not choose and gives way somewhere past a hundred nested
+# parentheses; gslc.gsl2, being a program, would go thousands deep.  The two
+# have to refuse the same programs or the fixpoint between them compares two
+# languages, so both stop at the same stated number.  The deepest expression
+# in any source here is seven.
+GSL2_MAX_NESTING: Final[int] = 64
+_S0_NESTING: int = 0
 _S0_PENDING: int = -1
 _S0_SEEN: dict = {}
 
