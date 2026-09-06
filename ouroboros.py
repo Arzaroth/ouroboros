@@ -13345,6 +13345,7 @@ var FIXID = 1390000;
 var FNSTART = 1450000;
 var FNLEN = 1455000;
 var GLBINIT = 1460000;
+var SEEN = 1470000;
 
 var TEXT_LIMIT = 339824;
 var LABEL_LIMIT = 30000;
@@ -13436,6 +13437,7 @@ var nfix = 0;
 var nfn = 0;
 var nblock = 0;
 var framesite = 0;
+var pending = -1;
 '''
 
 
@@ -13450,6 +13452,16 @@ GSL2_RV_TAIL_GSL2: Final[str] = r'''
 # pointing at the frame points two thousand octets into it, so that both
 # signs of the offset are spent on slots, and only the ones past the reach of
 # an offset have their address worked out into a register of their own.
+#
+# A value that has just been made is left in the accumulator and not written
+# down.  If the next thing that happens is the read of it, the slot is never
+# touched at all, and a value that is made and used costs no memory.  Anything
+# else that wants the accumulator writes it out first, which is what spill is
+# for, and every place that leaves a block spills before it goes.
+#
+# That is only sound where a value is read once.  Every one of them is, at
+# every place above that makes one, and take says so rather than hoping: a
+# value read twice would be read out of a slot nothing ever wrote.
 
 fn slot_at(slot) {
   return slot * 8 - 2048;
@@ -13459,7 +13471,16 @@ fn value_at(r) {
   return (FRAME + r) * 8 - 2048;
 }
 
-fn take(reg, r) {
+fn store_slot(reg, r) {
+  var at = value_at(r);
+  if (at >= 0 - 2048 && at < 2048) {
+    return st(reg, FRAME_BASE, at);
+  }
+  alu_imm(T2, FRAME_BASE, at);
+  return st(reg, T2, 0);
+}
+
+fn load_slot(reg, r) {
   var at = value_at(r);
   if (at >= 0 - 2048 && at < 2048) {
     return ld(reg, FRAME_BASE, at);
@@ -13468,13 +13489,48 @@ fn take(reg, r) {
   return ld(reg, T2, 0);
 }
 
-fn give(r, reg) {
-  var at = value_at(r);
-  if (at >= 0 - 2048 && at < 2048) {
-    return st(reg, FRAME_BASE, at);
+fn spill() {
+  if (pending < 0) {
+    return 0;
   }
-  alu_imm(T2, FRAME_BASE, at);
-  return st(reg, T2, 0);
+  var r = pending;
+  pending = 0 - 1;
+  return store_slot(A0, r);
+}
+
+fn give(r, reg) {
+  if (reg == A0) {
+    pending = r;
+    return 0;
+  }
+  return store_slot(reg, r);
+}
+
+fn take(reg, r) {
+  mem[SEEN + r] = mem[SEEN + r] + 1;
+  if (mem[SEEN + r] > 1) {
+    fail("a value read more than once");
+  }
+  if (pending == r) {
+    pending = 0 - 1;
+    if (reg == A0) {
+      return 0;
+    }
+    return move(reg, A0);
+  }
+  spill();
+  return load_slot(reg, r);
+}
+
+# The second of the two is the one that was made last, so it is the one that
+# might still be in the accumulator; reading it first is what keeps it there.
+fn use2(a, b) {
+  if (pending == b) {
+    take(A1, b);
+    return take(A0, a);
+  }
+  take(A0, a);
+  return take(A1, b);
 }
 
 # One instruction carries twenty bits and another twelve, so a number wider
@@ -13499,6 +13555,7 @@ fn new_reg() {
   if (regcnt >= MOST_VALUES) {
     fail("too many values at once in one function");
   }
+  mem[SEEN + regcnt - 1] = 0;
   return regcnt - 1;
 }
 
@@ -13564,10 +13621,12 @@ fn set_when(cc, d, l, r) {
 # ----------------------------------------------------------------------
 
 fn emit_label(l) {
+  spill();
   return lab(l);
 }
 
 fn emit_br(l) {
+  spill();
   return go(l);
 }
 
@@ -13580,6 +13639,7 @@ fn emit_cond_br(r, a, b) {
 
 fn gen_const(v) {
   var r = new_reg();
+  spill();
   imm_wide(A0, v);
   give(r, A0);
   return r;
@@ -13587,6 +13647,7 @@ fn gen_const(v) {
 
 fn gen_slot_addr(slot) {
   var r = new_reg();
+  spill();
   alu_imm(A0, FRAME_BASE, slot_at(slot));
   give(r, A0);
   return r;
@@ -13612,21 +13673,21 @@ fn gen_load(addr_reg) {
 }
 
 fn gen_store(value_reg, addr_reg) {
-  take(A0, value_reg);
-  take(A1, addr_reg);
+  use2(value_reg, addr_reg);
   st(A0, A1, 0);
   return 0;
 }
 
 fn gen_store_const(value, addr_reg) {
-  imm_wide(A0, value);
   take(A1, addr_reg);
+  imm_wide(A0, value);
   st(A0, A1, 0);
   return 0;
 }
 
 fn gen_global_load(start, length) {
   var r = new_reg();
+  spill();
   imm(A1, GLOBALS_AT + find_global(start, length) * 8);
   ld(A0, A1, 0);
   give(r, A0);
@@ -13642,8 +13703,7 @@ fn gen_global_store(value_reg, start, length) {
 
 fn gen_binary(op, a, b) {
   var r = new_reg();
-  take(A0, a);
-  take(A1, b);
+  use2(a, b);
   if (op == T_PLUS) {
     alu(0, A0, A0, A1);
   }
@@ -13674,8 +13734,7 @@ fn condition_of(op) {
 
 fn gen_compare(op, a, b) {
   var r = new_reg();
-  take(A0, a);
-  take(A1, b);
+  use2(a, b);
   set_when(condition_of(op), A0, A0, A1);
   give(r, A0);
   return r;
@@ -13694,6 +13753,7 @@ fn gen_return(r) {
 # The convention is this program's own here too, and a push on this machine
 # moves the stack sixteen octets whether eight would have done or not.
 fn gen_call(start, length, base, nargs) {
+  spill();
   var i = nargs;
   while (i > 0) {
     i = i - 1;
@@ -13725,6 +13785,7 @@ fn write_reserve(site, bytes) {
 }
 
 fn gen_function_open(start, length, nparams) {
+  pending = 0 - 1;
   var name = fn_id(start, length);
   lab(name);
   if (kw_is(start, length, "main") == 1) {
@@ -13749,6 +13810,7 @@ fn gen_function_open(start, length, nparams) {
 }
 
 fn gen_function_close() {
+  spill();
   imm(A0, 0);
   move(STACK, FRAME_POINTER);
   pop_reg(RETURN);
@@ -13899,8 +13961,7 @@ fn runtime_deliver() {
 }
 
 fn gen_deliver(where, count) {
-  take(A0, where);
-  take(A1, count);
+  use2(where, count);
   call_to(L_DELIVER);
   return gen_const(0);
 }
@@ -13914,6 +13975,7 @@ fn parse_call_builtin(kind, first_arg) {
     return r;
   }
   if (kind == 2) {
+    spill();
     call_to(L_GETCHAR);
     var r2 = new_reg();
     give(r2, A0);
@@ -13929,6 +13991,7 @@ fn parse_call_builtin(kind, first_arg) {
 # ----------------------------------------------------------------------
 
 fn emit_header() {
+  pending = 0 - 1;
   lab(L_START);
   imm(FRAME_POINTER, 0);
   imm(FRAME_BASE, 0);
