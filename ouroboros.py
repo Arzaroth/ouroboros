@@ -95,6 +95,7 @@
     python3 ouroboros.py --emit-boot PATH write a disk that needs no kernel
     python3 ouroboros.py --emit-efi PATH  the same text, for UEFI firmware
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
+    python3 ouroboros.py --explain wasm   say what every instruction of it is
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
 
@@ -5048,25 +5049,28 @@ class AssuranceSuite:
         """Whether the file can name everything its machine backend wrote.
 
         A walk from the first octet that lands exactly on the last one, with
-        a name for each instruction on the way, on each of the three machines.
-        The encoder and the reader agree about where an instruction ends or
-        this does not finish.
+        a name for each instruction on the way, on each of the three machines
+        and through every function of the module.  The encoder and the reader
+        agree about where an instruction ends or this does not finish.
         """
         named = 0
-        for architecture in sorted(MACHINES):
-            try:
+        try:
+            for architecture in sorted(MACHINES):
                 said = narrate_machine_code(
                     machine_code(artifacts.module, architecture), architecture
                 )
-            except GlyphPlatformError as exc:
-                return CheckResult(
-                    "every octet of the text is an instruction", False, str(exc)
-                )
-            named += len(said.splitlines())
+                named += len(said.splitlines())
+            module = narrate_wasm(wasm_module(artifacts.module))
+            named += sum(1 for line in module.splitlines() if line.startswith("  0x"))
+        except GlyphPlatformError as exc:
+            return CheckResult(
+                "every octet of the text is an instruction", False, str(exc)
+            )
         return CheckResult(
             "every octet of the text is an instruction",
             True,
-            f"{named} of them across {len(MACHINES)} machines, each one named",
+            f"{named} of them across {len(MACHINES)} machines and a module, "
+            "each one named",
         )
 
     @staticmethod
@@ -22169,6 +22173,139 @@ class WasmMachine:
         return frame.target
 
 
+# Every opcode the reader above accepts, and what it is called.  The two
+# tables are the same vocabulary read twice: one to run the octets and one to
+# name them, and an opcode in either that is missing from the other is a
+# disagreement about what this file writes.
+WASM_INSTRUCTION_NAMES: Final[Mapping[int, str]] = {
+    0x00: "unreachable", 0x02: "block", 0x03: "loop", 0x04: "if",
+    0x05: "else", 0x0B: "end", 0x0C: "br", 0x0D: "br_if",
+    0x0E: "br_table", 0x0F: "return", 0x10: "call", 0x1A: "drop",
+    0x20: "local.get", 0x21: "local.set", 0x22: "local.tee",
+    0x23: "global.get", 0x24: "global.set",
+    0x28: "i32.load", 0x2D: "i32.load8_u", 0x36: "i32.store",
+    0x3A: "i32.store8", 0x41: "i32.const", 0x42: "i64.const",
+    0x45: "i32.eqz", 0x46: "i32.eq", 0x47: "i32.ne", 0x48: "i32.lt_s",
+    0x4A: "i32.gt_s", 0x4C: "i32.le_s", 0x4E: "i32.ge_s",
+    0x50: "i64.eqz", 0x51: "i64.eq", 0x53: "i64.lt_s", 0x55: "i64.gt_s",
+    0x57: "i64.le_s", 0x59: "i64.ge_s",
+    0x6A: "i32.add", 0x6B: "i32.sub", 0x6C: "i32.mul",
+    0x7C: "i64.add", 0x7D: "i64.sub", 0x7E: "i64.mul", 0x7F: "i64.div_s",
+    0x81: "i64.rem_s", 0x85: "i64.xor",
+    0xA7: "i32.wrap_i64", 0xAC: "i64.extend_i32_s",
+}
+
+WASM_BLOCK_TYPES: Final[Mapping[int, str]] = {0x40: "", 0x7E: " i64", 0x7F: " i32"}
+
+
+class WasmNarrator:
+    """Says what the octets of a function body are, without running any.
+
+    The same walk the decoder above takes and the same refusal at the end of
+    it, because an opcode this cannot name is one layer 19 does not write.
+    What it keeps that the decoder throws away is where each instruction
+    began and how deep in the structure it stands, since a module is a tree
+    written flat and nothing about the octets says so.
+    """
+
+    def __init__(self, body: bytes, origin: int) -> None:
+        self._reader = WasmReader(body)
+        self._body = body
+        self._origin = origin
+        self._depth = 0
+
+    def _one(self, opcode: int) -> str:
+        try:
+            name = WASM_INSTRUCTION_NAMES[opcode]
+        except KeyError:
+            raise WasmDecodeError(
+                f"opcode 0x{opcode:02x} is not one this file writes"
+            ) from None
+        reader = self._reader
+        if opcode in _BLOCK_TYPE:
+            return name + WASM_BLOCK_TYPES.get(reader.octet(), " ?")
+        if opcode in _ONE_INDEX:
+            return f"{name} {reader.uleb()}"
+        if opcode in _MEMARG:
+            align = reader.uleb()
+            return f"{name} offset={reader.uleb()} align={1 << align}"
+        if opcode == 0x41:
+            return f"{name} {reader.sleb()}"
+        if opcode == 0x42:
+            return f"{name} {reader.sleb()}"
+        if opcode == 0x0E:
+            targets = reader.vector(reader.uleb)
+            return f"{name} {' '.join(map(str, targets))} else {reader.uleb()}"
+        return name
+
+    def narrate(self) -> Iterator[tuple[int, bytes, str, int]]:
+        reader = self._reader
+        while not reader.done(len(self._body)):
+            start = reader.at
+            opcode = reader.octet()
+            if opcode in (0x05, 0x0B) and self._depth:
+                self._depth -= 1
+            said = self._one(opcode)
+            depth = self._depth
+            if opcode in _BLOCK_TYPE or opcode == 0x05:
+                self._depth += 1
+            yield (
+                self._origin + start,
+                self._body[start : reader.at],
+                said,
+                depth,
+            )
+
+
+def _wasm_bodies(blob: bytes) -> Iterator[tuple[int, tuple[int, ...], int, bytes]]:
+    """Where each function's instructions start, and what locals precede them."""
+    reader = WasmReader(blob)
+    reader.take(8)
+    while not reader.done(len(blob)):
+        identifier = reader.octet()
+        size = reader.uleb()
+        end = reader.at + size
+        if identifier != 10:
+            reader.take(size)
+            continue
+        for index in range(reader.uleb()):
+            stop = reader.uleb() + reader.at
+            declared: list[int] = []
+            for _ in range(reader.uleb()):
+                count = reader.uleb()
+                kind = reader.octet()
+                declared.extend([kind] * count)
+            yield index, tuple(declared), reader.at, reader.take(stop - reader.at)
+        if reader.at != end:
+            raise WasmDecodeError("the code section does not end where it says")
+        return
+
+
+def narrate_wasm(blob: bytes) -> str:
+    """Every instruction of every function in a module this file wrote.
+
+    Layer 19 writes a tree and the format stores it flat, so the depth is
+    put back here as indentation: a reader that cannot see where a block
+    begins and ends cannot see the shape of what it is reading.
+    """
+    module = decode_wasm(blob)
+    named = {index: name for name, (kind, index) in module.exports.items() if kind == 0}
+    kinds = {0x7F: "i32", 0x7E: "i64"}
+    lines = []
+    for index, declared, origin, body in _wasm_bodies(blob):
+        signature = module.functions[index].signature
+        params = " ".join(kinds.get(kind, "?") for kind in signature.params)
+        results = " ".join(kinds.get(kind, "?") for kind in signature.results)
+        locals_ = " ".join(kinds.get(kind, "?") for kind in declared)
+        title = named.get(index, f"function {index}")
+        lines.append(f"  {title}({params}) -> {results or 'nothing'}"
+                     + (f", locals {locals_}" if locals_ else ""))
+        for address, octets, said, depth in WasmNarrator(body, origin).narrate():
+            lines.append(f"  {address:#08x}  {octets.hex(' '):<20}  "
+                         + "  " * depth + said)
+    return "\n".join(lines) + "\n"
+
+
 def execute_wasm(blob: bytes) -> str:
     """Instantiates a module this file emitted and returns the text it wrote."""
     module = decode_wasm(blob)
@@ -23596,8 +23733,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     machine = parser.add_argument_group("tier 5: machine code, no toolchain")
     machine.add_argument("--emit-elf", metavar="PATH", help="write a static ELF64 executable")
     machine.add_argument("--emit-machine-code", action="store_true")
-    machine.add_argument("--explain", action="store_true",
-                         help="say what every instruction of the text is")
+    machine.add_argument("--explain", nargs="?", const="machine",
+                         choices=("machine", "wasm"),
+                         help="say what every instruction is, of the text or "
+                              "of the module")
     machine.add_argument("--machine", choices=sorted(MACHINES), default=host_machine(),
                          help="which machine to write for (default: this one)")
 
@@ -23938,7 +24077,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.verbose:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
-    if namespace.explain:
+    if namespace.explain == "wasm":
+        sys.stdout.write(narrate_wasm(wasm_module(artifacts.module)))
+    elif namespace.explain:
         sys.stdout.write(narrate_machine_code(
             machine_code(artifacts.module, namespace.machine), namespace.machine
         ))
