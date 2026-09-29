@@ -26054,6 +26054,96 @@ def _disk_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
     )
 
 
+def _made(sector: bytes) -> bytes:
+    """A disk built rather than bent, for what bending cannot reach.
+
+    The written sector stops decoding at its own jump into the payload, a long
+    way before the end, so no change to one octet of it will ever be an
+    instruction that wants more of the sector than is left.  These readers are
+    pointed at images off a disk as well as at ones just written, so what they
+    do with a sector that is neither is worth stating.
+    """
+    room = bytearray(SECTOR)
+    room[: len(sector)] = sector
+    room[SECTOR - 2 :] = b"\x55\xaa"
+    if len(sector) + 6 + GDT_ENTRY <= SECTOR - 2:
+        # A descriptor and a table, so that a sector built to be wrong in one
+        # way is not refused for a second one before the first is reached.
+        struct.pack_into(
+            "<HI", room, len(sector), GDT_ENTRY - 1, BOOT_BASE + len(sector) + 6
+        )
+    return bytes(room) + bytes(SECTOR)
+
+
+def _sector_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
+    """The first sector bent one instruction at a time.
+
+    Where each field is, is read off the decoding of the sector being bent, so
+    these stay pointed at the instruction they mean however the sector is
+    rewritten above them.
+    """
+    steps = read_boot_code(image[:SECTOR])
+
+    def at(kind: str) -> SectorStep:
+        return next(s for s in steps if s.kind == kind)
+
+    reading = at("int")
+    before = [s for s in steps if s.at < reading.at and s.kind == "imm"]
+    request = next(s for s in reversed(before) if s.values[0] == REGISTER_AX)
+    buffer = next(s for s in reversed(before) if s.values[0] == REGISTER_BX)
+    paging = next(s for s in steps if s.kind == "to-control" and s.values[0] == 3)
+    turning = next(
+        s for s in reversed([x for x in steps if x.at < paging.at and x.kind == "imm"])
+        if s.values[0] == REGISTER_AX
+    )
+    far = at("far")
+    selector = next(
+        s for s in steps if s.at > far.at and s.kind == "imm"
+        and s.values[0] == REGISTER_AX
+    )
+    leave = at("leave")
+    return (
+        ("an octet that is not an instruction",
+         _bent(image, (steps[3].at, "<B", 0x6D)), "is not an instruction this reads"),
+        ("an octet no instruction follows",
+         _bent(image, (leave.at, "<H", 0x6D6D)), "is not an instruction this reads"),
+        ("a sector of nothing but the same instruction",
+         _made(b"\xfa" * (SECTOR - 2)), "jumps to what it loaded"),
+        ("an instruction wanting octets the sector has not got",
+         _made(b"\xfa" * (SECTOR - 5) + b"\x66\xc7\x06"), "runs off the sector"),
+        ("a disk service that is not a read",
+         _bent(image, (request.at + 2, "<B", 0x03)), "and not a read"),
+        ("a read of no sectors",
+         _bent(image, (request.at + 1, "<B", 0)), "for no sectors"),
+        ("a read of one sector",
+         _bent(image, (request.at + 1, "<B", 1)), "were written"),
+        ("a buffer that is not what it goes to",
+         _bent(image, (buffer.at + 1, "<H", 0x9000)), "and goes to"),
+        ("a descriptor that is not where its instructions stop",
+         _bent(image, (at("lgdt").at + 4, "<H", BOOT_BASE + 0x40)),
+         "its instructions stop at"),
+        ("long mode entered somewhere else",
+         _bent(image, (far.at + 2, "<I", BOOT_BASE + 0x40)),
+         "the instruction after it is at"),
+        ("paging turned on with a table it never wrote",
+         _bent(image, (turning.at + 2, "<I", 0x9000)), "wrote no table there"),
+        ("a table written outside what it cleared",
+         _bent(image, (at("store").at + 3, "<H", 0x9000)), "outside the"),
+        ("a selector that is not an entry",
+         _bent(image, (selector.at + 2, "<H", 0x14)), "which is not an entry"),
+        ("a selector past the end of the table",
+         _bent(image, (selector.at + 2, "<H", 0x80)), "octets long"),
+        ("something written in the nothing after its table",
+         _bent(image, (SECTOR - 4, "<H", 0x1234)), "neither instruction nor table"),
+        ("tables filled that were never cleared",
+         _bent(image, (next(s for s in steps if s.said == "rep stosw").at, "<H", 0xC031)),
+         "never cleared"),
+        ("a sector that never goes to sixty-four bits",
+         _made(b"\x66\x0f\x01\x16" + struct.pack("<H", BOOT_BASE + 8) + b"\xff\xe0"),
+         "goes to sixty-four bits"),
+    )
+
+
 def container_strains(module: ObjectModule) -> int:
     """How many ways of bending a container there are to be noticed."""
     return sum(
@@ -26061,6 +26151,7 @@ def container_strains(module: ObjectModule) -> int:
             _elf_strains(machine_code(module, "x86-64")),
             _pe_strains(efi_image(module)),
             _disk_strains(boot_image(module)),
+            _sector_strains(boot_image(module)),
         )
     )
 
@@ -26084,6 +26175,7 @@ def container_strain(module: ObjectModule) -> tuple[str, ...]:
         ("an executable", _elf_strains(elf), lambda b: elf64_complaints(b, EM_X86_64)),
         ("an application", _pe_strains(application), pe_complaints),
         ("a disk", _disk_strains(disk), lambda b: disk_complaints(b, wanted)),
+        ("a sector", _sector_strains(disk), lambda b: disk_complaints(b, wanted)),
     )
     for article, strains, ask in asked:
         for what, bent, expected in strains:
