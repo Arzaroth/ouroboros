@@ -100,6 +100,7 @@
     python3 ouroboros.py --trace-wasm    the same, for the module
     python3 ouroboros.py --fuzz-limits   grow a program until a backend says no
     python3 ouroboros.py --fuzz-gsl2 N   one program, every compiler for it
+    python3 ouroboros.py --fuzz-mutants  break it and see what notices
     python3 ouroboros.py --coverage FILE what the checks touched, as lcov
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
@@ -138,6 +139,7 @@ import sys
 import tempfile
 import threading
 import time
+import tokenize
 import types
 import typing
 import weakref
@@ -24519,6 +24521,197 @@ def _emitters(name: str) -> tuple[str, ...]:
     )
 
 
+# ----------------------------------------------------------------------
+# layer 15c: whether the checks would notice
+# ----------------------------------------------------------------------
+#
+# Everything above says what it checked and the layer before this says how
+# much of the file it touched.  Neither says whether any of it would catch
+# anything, and a check that cannot fail is a check that is not there.
+#
+# So: break the file on purpose, one small change at a time, and see what the
+# checks make of it.  This reports rather than passes or fails, because a
+# change nothing notices is one of two things and telling them apart wants a
+# reader: a check that is missing, or a change that does not change anything.
+# An encoder that writes a different but equally correct encoding is the second
+# kind, and no amount of running will say so.
+#
+# The changes are made to the text rather than to the objects, because the
+# thing being tested is the file as it ships, and each one runs in its own
+# interpreter for the same reason the coverage walk does.
+
+# Where it is worth breaking: the encoders and the readers, which is where
+# being wrong is quiet.  Breaking the scenery would only report that the
+# scenery is scenery.
+MUTABLE_CLASSES: Final[tuple[str, ...]] = (
+    "X86Assembler", "Aarch64Assembler", "Riscv64Assembler", "WasmAssembler",
+    "MachineReader", "Aarch64Reader", "Riscv64Reader", "WordReader",
+    "MachineNarrator", "Aarch64Narrator", "Riscv64Narrator", "WasmNarrator",
+)
+
+# One small wrong thing each.  A comparison that lets one more value through,
+# a number that is one out, a shift that moves one bit too far: the mistakes
+# that get made, rather than the ones that are easy to generate.
+MUTATIONS: Final[tuple[tuple[str, str], ...]] = (
+    (" < ", " <= "),
+    (" <= ", " < "),
+    (" > ", " >= "),
+    (" >= ", " > "),
+    (" == ", " != "),
+    (" != ", " == "),
+    (" and ", " or "),
+    (" + 1", " + 2"),
+    (" - 1", " - 2"),
+    (" << ", " >> "),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Mutant:
+    """One deliberate mistake, and whether anything said so."""
+
+    where: str
+    line: int
+    was: str
+    became: str
+    verdict: str
+
+    @property
+    def caught(self) -> bool:
+        return self.verdict == "caught"
+
+
+@dataclass(frozen=True, slots=True)
+class MutantReport:
+    """Whether the battery notices the file being wrong."""
+
+    mutants: tuple[Mutant, ...]
+    checked_with: str
+
+    @property
+    def considered(self) -> int:
+        return len(self.mutants)
+
+    @property
+    def survivors(self) -> tuple[Mutant, ...]:
+        return tuple(one for one in self.mutants if one.verdict == "survived")
+
+    @property
+    def broke(self) -> int:
+        return sum(1 for one in self.mutants if one.verdict == "broke")
+
+    @property
+    def clean(self) -> bool:
+        return not self.survivors
+
+    def render(self) -> str:
+        caught = sum(1 for one in self.mutants if one.caught)
+        lines = [
+            f"{self.considered} deliberate mistake(s) under {self.checked_with}: "
+            f"{caught} caught, {len(self.survivors)} unnoticed, "
+            f"{self.broke} stopped it being a program"
+        ]
+        for one in self.survivors:
+            lines.append(
+                f"  [look] {one.where}:{one.line} "
+                f"{one.was.strip()!r} -> {one.became.strip()!r}"
+            )
+        if self.survivors:
+            lines.append(
+                "  Each of those is one of two things and only a reader can say "
+                "which: a check that is missing, or a change that does not "
+                "change anything."
+            )
+        return "\n".join(lines)
+
+
+def _prose_columns(text: str) -> Mapping[int, set[int]]:
+    """Which columns of each line are inside a string or a comment.
+
+    Changing a word in a docstring changes nothing, so a mutant that does it
+    survives and reads as a check nobody wrote.  It is not: it is a mistake in
+    the thing making the mistakes.
+    """
+    masked: dict[int, set[int]] = {}
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if token.type not in (tokenize.STRING, tokenize.COMMENT):
+            continue
+        (first, start), (last, stop) = token.start, token.end
+        for line in range(first, last + 1):
+            columns = masked.setdefault(line, set())
+            begins = start if line == first else 0
+            ends = stop if line == last else 1 << 20
+            columns.update(range(begins, min(ends, 1 << 12)))
+    return masked
+
+
+def _mutable_lines(path: Path) -> list[tuple[str, int, str, set[int]]]:
+    """Every line inside the classes worth breaking, with where it came from."""
+    text = path.read_text()
+    tree = ast.parse(text)
+    lines = text.splitlines()
+    prose = _prose_columns(text)
+    found: list[tuple[str, int, str, set[int]]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name not in MUTABLE_CLASSES:
+            continue
+        for at in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+            body = lines[at - 1]
+            if body.strip() and not body.lstrip().startswith("#"):
+                found.append((node.name, at, body, prose.get(at, set())))
+    return found
+
+
+def fuzz_mutants(count: int = 40, seed: int = 0) -> MutantReport:
+    """Breaks the file one small way at a time and asks the battery about it."""
+    entropy = random.Random(seed)
+    here = Path(__file__)
+    candidates = _mutable_lines(here)
+    wanted: list[tuple[str, int, int, str, str]] = []
+    seen: set[tuple[int, str]] = set()
+    while len(wanted) < count and len(seen) < len(candidates) * len(MUTATIONS):
+        where, at, body, prose = entropy.choice(candidates)
+        was, becomes = entropy.choice(MUTATIONS)
+        if (at, was) in seen:
+            continue
+        seen.add((at, was))
+        column = body.find(was)
+        while column >= 0 and column in prose:
+            column = body.find(was, column + 1)
+        if column < 0:
+            continue
+        wanted.append((where, at, column, was, becomes))
+
+    original = here.read_text().splitlines(keepends=True)
+    verdicts: list[Mutant] = []
+    with tempfile.TemporaryDirectory(prefix="ouroboros-mutants-") as scratch:
+        for turn, (where, at, column, was, becomes) in enumerate(wanted):
+            broken = list(original)
+            line = broken[at - 1]
+            broken[at - 1] = line[:column] + becomes + line[column + len(was):]
+            candidate = Path(scratch) / f"m{turn}.py"
+            candidate.write_text("".join(broken))
+            verdict = "survived"
+            # Cheapest first, and the fuzzer last: a mistake it notices sends
+            # it off to shrink the program that showed it, which costs more
+            # than the two checks in front of it put together.
+            for asked in (["--self-test"], ["--selftest"], ["--fuzz", "20"]):
+                try:
+                    done = subprocess.run(
+                        [sys.executable, str(candidate), *asked],
+                        capture_output=True, timeout=90,
+                    )
+                except subprocess.TimeoutExpired:
+                    # A mistake that will not finish is not a silent one.
+                    verdict = "caught"
+                    break
+                if done.returncode:
+                    verdict = "broke" if b"Traceback" in done.stderr else "caught"
+                    break
+            verdicts.append(Mutant(where, at, was, becomes, verdict))
+    return MutantReport(tuple(verdicts), "the battery, the fuzzer and the tiers")
+
+
 def unreached_emitters() -> tuple[str, ...]:
     """Everything the encoders can write that nothing this file builds asks for.
 
@@ -25392,6 +25585,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          help="keep what is found here, and re-check it first")
     fuzzing.add_argument("--fuzz-refusals", type=int, metavar="N",
                          help="break N programs and check both front ends refuse")
+    fuzzing.add_argument("--fuzz-mutants", nargs="?", type=int, const=24,
+                         metavar="N",
+                         help="break the file N small ways and say which the "
+                              "checks did not notice")
     fuzzing.add_argument("--fuzz-gsl2", type=int, metavar="N",
                          help="compile N generated GSL-2 programs with every "
                               "compiler there is for them, and compare")
@@ -25469,7 +25666,8 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
             return f"{mode} chooses what it compiles"
     if (namespace.fuzz is not None or namespace.fuzz_refusals is not None
             or namespace.fuzz_limits is not None
-            or namespace.fuzz_gsl2 is not None):
+            or namespace.fuzz_gsl2 is not None
+            or namespace.fuzz_mutants is not None):
         return "--fuzz chooses what it compiles"
     if namespace.carry:
         return "--carry says what goes on the disk, and it is not this"
@@ -25531,6 +25729,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         refusals = fuzz_refusals(namespace.fuzz_refusals, namespace.fuzz_seed)
         print(refusals.render())
         return 0 if refusals.clean else 1
+    if namespace.fuzz_mutants is not None:
+        # It reports; it does not pass or fail.  Judging a survivor is a
+        # reader's job and not a runner's.
+        print(fuzz_mutants(namespace.fuzz_mutants, namespace.fuzz_seed).render())
+        return 0
     if namespace.fuzz_gsl2 is not None:
         agreed = fuzz_gsl2(namespace.fuzz_gsl2, namespace.fuzz_seed)
         print(agreed.render())
