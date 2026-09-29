@@ -5055,6 +5055,7 @@ class AssuranceSuite:
                 self._every_step_is_named,
                 self._narration_writes_it_again,
                 self._the_module_writes_itself_again,
+                self._the_ir_agrees_with_the_interpreter,
                 self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
@@ -5253,6 +5254,32 @@ class AssuranceSuite:
         )
 
     @staticmethod
+    def _the_ir_agrees_with_the_interpreter(
+        artifacts: CompilationArtifacts,
+    ) -> CheckResult:
+        """Whether the IR, read back here, writes what the interpreter wrote.
+
+        Every other tier is checked against tier 0 by something in this file.
+        Tier 2 was checked by llvmlite, which is to say by agreeing with the
+        thing it was handed to.
+        """
+        lines = 0
+        try:
+            dividing = synthesize_source(DIVIDING_SOURCE).unwrap_or_raise()
+            for one in (artifacts, dividing):
+                text = LlvmLoweringBackend().lower(one.module).text
+                lines += len(text.splitlines())
+                if execute_llvm(text).removesuffix("\n") != one.rendering:
+                    return CheckResult(
+                        "the IR read back here agrees", False, "it wrote something else"
+                    )
+        except (GlyphPlatformError, RecursionError) as exc:
+            return CheckResult("the IR read back here agrees", False, str(exc))
+        return CheckResult(
+            "the IR read back here agrees", True, f"{lines} lines over 2 programs"
+        )
+
+    @staticmethod
     def _every_emitter_is_reached(artifacts: CompilationArtifacts) -> CheckResult:
         """Whether anything this file builds asks for every instruction it writes.
 
@@ -5376,6 +5403,7 @@ COVERAGE_FLOORS: Final[Mapping[str, int]] = {
     "Layer 18 drops the toolchain": 85,  # 92
     "layer 18 once more": 90,            # 96
     "Layer 19": 88,                      # 95
+    "Layer 16b: the IR read back": 85,   # 89
     "Layer 20: the module read back": 85,  # 90
     "Layer 20 exists because": 85,       # 92
     "Layer 22": 78,                      # 84
@@ -6686,6 +6714,9 @@ class DifferentialFuzzer:
                     self._object_for(source, order), scratch))
             )
         variants.append(
+            ("read-ir", lambda: self._through_ir(self._object_for(source, order)))
+        )
+        variants.append(
             ("read-back", lambda: self._through_read_back(
                 self._object_for(source, order)))
         )
@@ -6770,6 +6801,7 @@ class DifferentialFuzzer:
                 skipped.append(f"wasm tier ({exc})")
         else:
             skipped.append("wasm tier (no WebAssembly host is installed)")
+        tiers.append("read-ir")
         tiers.append("read-back")
         tiers.extend(f"read({name})" for name in MACHINE_READERS)
         if self._metal:
@@ -6843,6 +6875,11 @@ class DifferentialFuzzer:
 
     def _through_wasm(self, module: ObjectModule, scratch: Path) -> str:
         return run_wasm(write_wasm(module, scratch / "case.wasm")).removesuffix("\n")
+
+    def _through_ir(self, module: ObjectModule) -> str:
+        return execute_llvm(
+            LlvmLoweringBackend().lower(module).text
+        ).removesuffix("\n")
 
     def _through_read_back(self, module: ObjectModule) -> str:
         return execute_wasm(wasm_module(module)).removesuffix("\n")
