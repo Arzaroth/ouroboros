@@ -42,6 +42,23 @@ jobs:
       - name: and what it says about itself holds together
         run: ty check ouroboros.py
 
+  reached:
+    name: what the checks still reach
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - run: pip install llvmlite
+
+      # Per layer rather than one number for the file: a single floor lets a
+      # machine backend go dark behind a hundred lines of something else that
+      # is easy to run.  The report names what fell short and by how much,
+      # which is what a failing run needs to say.
+      - name: every layer with a floor is above it
+        run: python ouroboros.py --coverage
+
   bare:
     name: python ${{ matrix.python }}, nothing installed
     runs-on: ubuntu-latest

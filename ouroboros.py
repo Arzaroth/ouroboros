@@ -5365,6 +5365,23 @@ def synthesize_source(
 # every other exercise inside it, once per exercise, for as long as anybody
 # was prepared to wait.
 
+# What each of the load-bearing layers has to keep reaching.  The numbers are
+# the ones it reaches now, less a little, and they are per layer on purpose: a
+# floor on the whole file lets a machine backend rot quietly behind a hundred
+# lines of something else that is easy to run.  The layers with no floor are
+# the ones where being wrong is loud, or where there is nothing to measure -
+# this layer does not measure itself.
+COVERAGE_FLOORS: Final[Mapping[str, int]] = {
+    "Layer 16": 85,                     # reaches 91
+    "Layer 18 drops the toolchain": 85,  # 92
+    "layer 18 once more": 90,            # 96
+    "Layer 19": 88,                      # 95
+    "Layer 20: the module read back": 85,  # 90
+    "Layer 20 exists because": 85,       # 92
+    "Layer 22": 78,                      # 84
+}
+
+
 COVERAGE_HARNESS: Final[str] = """
 import importlib.util, io, json, sys, threading, contextlib
 path, out, *argv = sys.argv[1:]
@@ -5422,6 +5439,7 @@ COVERAGE_EXERCISES: Final[tuple[tuple[str, ...], ...]] = (
     ("-n", "5", "--trace-machine"),
     ("-n", "5", "--machine", "aarch64", "--emit-machine-code"),
     ("-n", "5", "--machine", "riscv64", "--emit-machine-code"),
+    ("--fuzz-gsl2", "6"),
 )
 
 
@@ -5530,6 +5548,45 @@ class CoverageReport:
         lines.append("end_of_record")
         return "\n".join(lines) + "\n"
 
+    def by_layer(self) -> tuple[tuple[str, int, int], ...]:
+        """Every layer, what of it ran, and how much there was of it."""
+        text = self.path.read_text().splitlines()
+        banners = [
+            (at, line[2:].strip()) for at, line in enumerate(text, 1)
+            if line.startswith("# Layer ") or line.startswith("# layer ")
+        ]
+        hit: dict[str, int] = {}
+        total: dict[str, int] = {}
+        order: list[str] = []
+        where, index = "the preamble", 0
+        for line in sorted(self.executable):
+            while index < len(banners) and banners[index][0] <= line:
+                where = banners[index][1]
+                index += 1
+            if where not in total:
+                order.append(where)
+            total[where] = total.get(where, 0) + 1
+            if self.counts.get(line):
+                hit[where] = hit.get(where, 0) + 1
+        return tuple((name, hit.get(name, 0), total[name]) for name in order)
+
+    def below(self) -> tuple[tuple[str, int, int], ...]:
+        """The layers that are under the floor written down for them.
+
+        Only the layers where being wrong is quiet have one.  A floor on the
+        scenery would say nothing, and a floor on the whole file would let a
+        machine backend rot behind a hundred lines of something else.
+        """
+        short: list[tuple[str, int, int]] = []
+        for name, hit, total in self.by_layer():
+            for prefix, floor in COVERAGE_FLOORS.items():
+                if name.startswith(prefix):
+                    portion = 100 * hit // total if total else 100
+                    if portion < floor:
+                        short.append((name, portion, floor))
+                    break
+        return tuple(short)
+
     def cold(self) -> tuple[tuple[str, int, int], ...]:
         """Which layer each line that never ran belongs to, and how many.
 
@@ -5564,6 +5621,13 @@ class CoverageReport:
         ]
         for name, missed, total in self.cold()[:8]:
             lines.append(f"  {missed:>5} of {total:>5} never ran in {name[:58]}")
+        for name, portion, floor in self.below():
+            lines.append(f"  [FAIL] {name[:44]} reaches {portion}%, not {floor}%")
+        lines.append(
+            f"  [ok]   every layer with a floor is above it ({len(COVERAGE_FLOORS)} of them)"
+            if not self.below() else
+            "  [FAIL] a layer nothing enters is a layer whose claims nobody makes"
+        )
         return "\n".join(lines)
 
 
@@ -25748,7 +25812,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             written = _write_octets(namespace.coverage, covered.tracefile().encode())
             print(f"wrote {written}", file=sys.stderr)
         print(covered.render())
-        return 0
+        return 0 if not covered.below() else 1
     if namespace.fuzz is not None:
         report = fuzz(
             namespace.fuzz,
