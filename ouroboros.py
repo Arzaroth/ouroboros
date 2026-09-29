@@ -26001,6 +26001,8 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     backend.add_argument("--emit-native-assembly", action="store_true")
     backend.add_argument("--emit-object", metavar="PATH")
     backend.add_argument("--verify-llvm", action="store_true")
+    backend.add_argument("--run-llvm", metavar="PATH",
+                         help="run one, reading it back here")
     backend.add_argument("--jit", action="store_true")
     backend.add_argument("-O", "--opt-level", type=int, choices=range(4), default=0)
     backend.add_argument("--triple", default=TargetProfile().triple)
@@ -26137,6 +26139,7 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
         ("selftest", "--selftest"),
         ("bootstrap", "--bootstrap"),
         ("run_wasm", "--run-wasm"),
+        ("run_llvm", "--run-llvm"),
         ("emit_gsl2", "--emit-gsl2"),
         ("coverage", "--coverage"),
         ("list_motifs", "--list-motifs"),
@@ -26201,6 +26204,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if namespace.run_wasm:
         sys.stdout.write(execute_wasm(_read_octets(namespace.run_wasm)))
+        return 0
+    if namespace.run_llvm:
+        sys.stdout.write(execute_llvm(_read_text(namespace.run_llvm)))
         return 0
     if namespace.selftest:
         return _selftest((3, 5, 7, 9, 11, 15, 21))
