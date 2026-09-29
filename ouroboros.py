@@ -25037,6 +25037,211 @@ def _emitters(name: str) -> tuple[str, ...]:
     )
 
 
+# ======================================================================
+# Layer 21b: the containers read back
+# ======================================================================
+#
+# Every representation this file writes is now read back by something in it
+# except the outermost one.  The three texts are decoded instruction by
+# instruction, the module is decoded and run, the IR is read and run, and each
+# of them sits inside a container that nothing here ever looks at again.
+#
+# The machine readers are not the gap.  They take an image apart properly:
+# ``MachineMemory`` reads the entry, walks the program headers and maps what
+# they say to map.  What it does not do is disbelieve any of it.  Every field
+# is taken as given, the permission bits are not read at all, and a header
+# naming a segment that runs off the end of the file would be mapped as
+# cheerfully as a correct one.  The loader that would refuse it is the kernel,
+# on a host that has one, and the firmware, on a machine that has that.
+#
+# So: readers that take each container apart and say what is wrong with it.
+# They share no constant with the writers - the entry is found through the
+# headers rather than at a fixed distance, and every span is checked against
+# the length of the file it claims to be inside.
+
+
+class ContainerError(GlyphPlatformError):
+    """A container this file wrote cannot be read back."""
+
+
+SEGMENT_READABLE: Final[int] = 4
+SEGMENT_WRITABLE: Final[int] = 2
+SEGMENT_EXECUTABLE: Final[int] = 1
+
+
+@dataclass(frozen=True, slots=True)
+class ElfSegment:
+    """One program header, as the loader would read it."""
+
+    kind: int
+    flags: int
+    offset: int
+    address: int
+    physical: int
+    on_disk: int
+    in_memory: int
+    align: int
+
+    @property
+    def loadable(self) -> bool:
+        return self.kind == SEGMENT_LOADABLE
+
+    @property
+    def executable(self) -> bool:
+        return bool(self.flags & SEGMENT_EXECUTABLE)
+
+    @property
+    def writable(self) -> bool:
+        return bool(self.flags & SEGMENT_WRITABLE)
+
+    def holds(self, address: int) -> bool:
+        return self.address <= address < self.address + self.in_memory
+
+    def says(self) -> str:
+        letters = "".join(
+            letter for bit, letter in (
+                (SEGMENT_READABLE, "r"), (SEGMENT_WRITABLE, "w"),
+                (SEGMENT_EXECUTABLE, "x"),
+            ) if self.flags & bit
+        )
+        return (
+            f"{self.address:#x}+{self.in_memory:#x} {letters or '-'} "
+            f"from {self.offset:#x}+{self.on_disk:#x} by {self.align:#x}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Elf64Container:
+    """What the header of an executable this file wrote says it is."""
+
+    machine: int
+    entry: int
+    segments_at: int
+    segment_span: int
+    segments: tuple[ElfSegment, ...]
+    span: int
+
+    @property
+    def text_at(self) -> int:
+        """The offset in the file the entry point stands at.
+
+        Through the headers, which is the point: the writer puts the text
+        straight after the prologue and every reader that knows that shares
+        the writer's arithmetic instead of checking it.
+        """
+        for segment in self.segments:
+            if segment.loadable and segment.holds(self.entry):
+                return segment.offset + (self.entry - segment.address)
+        raise ContainerError(f"nothing loadable holds the entry {self.entry:#x}")
+
+    def says(self) -> str:
+        lines = [
+            f"ELF64 for machine {self.machine}, entry {self.entry:#x} "
+            f"at offset {self.text_at:#x} of {self.span}"
+        ]
+        lines.extend(f"  segment {n}: {s.says()}" for n, s in enumerate(self.segments))
+        return "\n".join(lines)
+
+
+def read_elf64(image: bytes) -> Elf64Container:
+    """Takes an ELF64 header and its program headers apart.
+
+    Refuses anything it cannot read rather than guessing, because a container
+    that has to be guessed at is the thing being checked.
+    """
+    if len(image) < ELF_HEADER_SIZE:
+        raise ContainerError(f"{len(image)} octets is shorter than a header")
+    if image[:4] != b"\x7fELF":
+        raise ContainerError("this does not begin with an ELF magic")
+    identity = image[4:16]
+    for place, want, what in (
+        (0, 2, "a class other than 64-bit"),
+        (1, 1, "a byte order other than little-endian"),
+        (2, 1, "an identification version other than one"),
+    ):
+        if identity[place] != want:
+            raise ContainerError(f"the header names {what}")
+    kind, machine, version = struct.unpack_from("<HHI", image, 16)
+    if kind != 2:
+        raise ContainerError(f"this is type {kind} and not an executable")
+    if version != 1:
+        raise ContainerError(f"the header names object version {version}")
+    entry, segments_at, sections_at = struct.unpack_from("<QQQ", image, 24)
+    header_span, segment_span, count = struct.unpack_from("<HHH", image, 52)
+    if header_span != ELF_HEADER_SIZE:
+        raise ContainerError(f"the header says it is {header_span} octets long")
+    if segment_span < PROGRAM_HEADER_SIZE:
+        raise ContainerError(f"a program header of {segment_span} octets holds nothing")
+    end = segments_at + count * segment_span
+    if end > len(image):
+        raise ContainerError(f"the program headers end at {end} of {len(image)}")
+    segments = tuple(
+        ElfSegment(*struct.unpack_from("<IIQQQQQQ", image, segments_at + n * segment_span))
+        for n in range(count)
+    )
+    if sections_at:
+        raise ContainerError("this carries a section table and nothing here writes one")
+    return Elf64Container(machine, entry, segments_at, segment_span, segments, len(image))
+
+
+def elf64_complaints(image: bytes, machine: int | None = None) -> tuple[str, ...]:
+    """Everything wrong with an executable this file wrote, or nothing.
+
+    A loader refuses on the first thing it finds; this answers all of them,
+    because the reason to ask is to be told what to fix.
+    """
+    try:
+        container = read_elf64(image)
+    except ContainerError as exc:
+        return (str(exc),)
+    said: list[str] = []
+    if machine is not None and container.machine != machine:
+        said.append(f"the header names machine {container.machine}, not {machine}")
+    loadable = [segment for segment in container.segments if segment.loadable]
+    if not loadable:
+        said.append("nothing in it is loadable")
+    for number, segment in enumerate(container.segments):
+        if not segment.loadable:
+            continue
+        if segment.on_disk > segment.in_memory:
+            said.append(
+                f"segment {number} is {segment.on_disk} octets of file in "
+                f"{segment.in_memory} of memory"
+            )
+        if segment.offset + segment.on_disk > container.span:
+            said.append(
+                f"segment {number} reads to {segment.offset + segment.on_disk} "
+                f"of a file {container.span} long"
+            )
+        if segment.align > 1 and (segment.address - segment.offset) % segment.align:
+            said.append(
+                f"segment {number} maps {segment.address:#x} from {segment.offset:#x}, "
+                f"which no loader can do at an alignment of {segment.align:#x}"
+            )
+        if segment.physical != segment.address:
+            said.append(f"segment {number} asks for two different addresses")
+        if segment.writable and segment.executable:
+            said.append(f"segment {number} is both writable and executable")
+    for (one, first), (two, second) in itertools.combinations(
+        [(n, s) for n, s in enumerate(container.segments) if s.loadable], 2
+    ):
+        if (first.address < second.address + second.in_memory
+                and second.address < first.address + first.in_memory):
+            said.append(f"segments {one} and {two} want the same addresses")
+    try:
+        offset = container.text_at
+    except ContainerError as exc:
+        said.append(str(exc))
+        return tuple(said)
+    holding = next(s for s in loadable if s.holds(container.entry))
+    if not holding.executable:
+        said.append(f"the entry {container.entry:#x} is in a segment nothing may run")
+    wanted = container.segments_at + len(container.segments) * container.segment_span
+    if offset != wanted:
+        said.append(f"the entry stands at {offset:#x} and the headers end at {wanted:#x}")
+    return tuple(said)
+
+
 # ----------------------------------------------------------------------
 # layer 15c: whether the checks would notice
 # ----------------------------------------------------------------------
