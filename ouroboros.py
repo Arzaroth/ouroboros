@@ -5051,6 +5051,7 @@ class AssuranceSuite:
                 self._every_octet_is_an_instruction,
                 self._every_step_is_named,
                 self._narration_writes_it_again,
+                self._the_module_writes_itself_again,
                 self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
@@ -5216,6 +5217,29 @@ class AssuranceSuite:
             "what it says the octets are writes them again",
             True,
             f"{octets} octets across {len(MACHINES)} machines",
+        )
+
+    @staticmethod
+    def _the_module_writes_itself_again(artifacts: CompilationArtifacts) -> CheckResult:
+        """Whether what the file says the module is will write it again.
+
+        The same claim the three machines make about their texts, one tier up.
+        The walk over a module already had to land where the module stops;
+        this is about the names rather than the lengths, and a branch depth
+        taken apart wrongly comes back as different octets.
+        """
+        try:
+            blob = wasm_module(artifacts.module)
+            again = reassemble_wasm(blob)
+            written = wasm_bodies_as_written(blob)
+        except GlyphPlatformError as exc:
+            return CheckResult(
+                "what it says the module is writes it again", False, str(exc)
+            )
+        return CheckResult(
+            "what it says the module is writes it again",
+            again == written,
+            f"{len(written)} octets of function bodies",
         )
 
     @staticmethod
@@ -23233,6 +23257,11 @@ WASM_INSTRUCTION_NAMES: Final[Mapping[int, str]] = {
 WASM_BLOCK_TYPES: Final[Mapping[int, str]] = {0x40: "", 0x7E: " i64", 0x7F: " i32"}
 
 
+# What a wasm narrator hands back besides the name: the way to write the same
+# instruction again, through the encoder that wrote it the first time.
+WasmRedo = Callable[[Any], Any]
+
+
 class WasmNarrator:
     """Says what the octets of a function body are, without running any.
 
@@ -23248,8 +23277,23 @@ class WasmNarrator:
         self._body = body
         self._origin = origin
         self._depth = 0
+        self._open: list[str] = []
+        self._named = itertools.count()
 
-    def _one(self, opcode: int) -> str:
+    def _target(self, leaving: int) -> str:
+        """What a branch that leaves ``leaving`` structures is aiming at.
+
+        The format says how many to leave and the encoder above wants to be
+        told which, so the walk keeps the stack of what is open and looks the
+        name up rather than counting twice.
+        """
+        if leaving >= len(self._open):
+            raise WasmDecodeError(
+                f"a branch leaving {leaving} structures with {len(self._open)} open"
+            )
+        return self._open[-1 - leaving]
+
+    def _one(self, opcode: int) -> tuple[str, WasmRedo]:
         try:
             name = WASM_INSTRUCTION_NAMES[opcode]
         except KeyError:
@@ -23258,37 +23302,82 @@ class WasmNarrator:
             ) from None
         reader = self._reader
         if opcode in _BLOCK_TYPE:
-            return name + WASM_BLOCK_TYPES.get(reader.octet(), " ?")
+            result = reader.octet()
+            said = name + WASM_BLOCK_TYPES.get(result, " ?")
+            if opcode == 0x04:
+                return said, lambda text: text.if_(result)
+            label = f"s{next(self._named)}"
+            self._open.append(label)
+            if opcode == 0x02:
+                return said, lambda text: text.block(label, result)
+            return said, lambda text: text.loop(label, result)
         if opcode in _ONE_INDEX:
-            return f"{name} {reader.uleb()}"
+            operand = reader.uleb()
+            if opcode in (0x0C, 0x0D):
+                aim = self._target(operand)
+                if opcode == 0x0C:
+                    return f"{name} {operand}", lambda text: text.br(aim)
+                return f"{name} {operand}", lambda text: text.br_if(aim)
+            doers: Mapping[int, WasmRedo] = {
+                0x10: lambda text: text.call(operand),
+                0x20: lambda text: text.get(operand),
+                0x21: lambda text: text.set(operand),
+            }
+            if opcode not in doers:
+                raise WasmDecodeError(f"{name} is not one this file writes")
+            return f"{name} {operand}", doers[opcode]
         if opcode in _MEMARG:
             align = reader.uleb()
-            return f"{name} offset={reader.uleb()} align={1 << align}"
-        if opcode == 0x41:
-            return f"{name} {reader.sleb()}"
-        if opcode == 0x42:
-            return f"{name} {reader.sleb()}"
+            offset = reader.uleb()
+            said = f"{name} offset={offset} align={1 << align}"
+            if opcode == 0x2D:
+                return said, lambda text: text.load8(offset)
+            if opcode == 0x3A:
+                return said, lambda text: text.store8(offset)
+            raise WasmDecodeError(f"{name} is not one this file writes")
+        if opcode in (0x41, 0x42):
+            value = reader.sleb()
+            if opcode == 0x41:
+                return f"{name} {value}", lambda text: text.i32(value)
+            return f"{name} {value}", lambda text: text.i64(value)
         if opcode == 0x0E:
-            targets = reader.vector(reader.uleb)
-            return f"{name} {' '.join(map(str, targets))} else {reader.uleb()}"
-        return name
+            leaving = reader.vector(reader.uleb)
+            fallback = reader.uleb()
+            aims = [self._target(one) for one in leaving]
+            other = self._target(fallback)
+            return (
+                f"{name} {' '.join(map(str, leaving))} else {fallback}",
+                lambda text: text.br_table(aims, other),
+            )
+        if opcode == 0x00:
+            return name, lambda text: text.unreachable()
+        if opcode == 0x05:
+            return name, lambda text: text.else_()
+        if opcode == 0x0B:
+            return name, lambda text: text.end()
+        return name, lambda text: text.op(name)
 
-    def narrate(self) -> Iterator[tuple[int, bytes, str, int]]:
+    def narrate(self) -> Iterator[tuple[int, bytes, str, int, WasmRedo]]:
         reader = self._reader
         while not reader.done(len(self._body)):
             start = reader.at
             opcode = reader.octet()
             if opcode in (0x05, 0x0B) and self._depth:
                 self._depth -= 1
-            said = self._one(opcode)
+            if opcode == 0x0B and self._open:
+                self._open.pop()
+            said, redo = self._one(opcode)
             depth = self._depth
             if opcode in _BLOCK_TYPE or opcode == 0x05:
                 self._depth += 1
+            if opcode == 0x04:
+                self._open.append("if")
             yield (
                 self._origin + start,
                 self._body[start : reader.at],
                 said,
                 depth,
+                redo,
             )
 
 
@@ -23316,6 +23405,59 @@ def _wasm_bodies(blob: bytes) -> Iterator[tuple[int, tuple[int, ...], int, bytes
         return
 
 
+def reassemble_wasm(blob: bytes) -> bytes:
+    """Writes every body again from what the narrator says it is.
+
+    The three machines got this a while ago and the module did not, which left
+    the one tier whose narration nothing checked beyond its length.  The
+    encoder is told which structure a branch aims at and works the depth out
+    again itself, so a depth this took apart wrongly comes back as different
+    octets rather than as a name nobody reads.
+
+    The answer is the code section's bodies, each with its length and its
+    locals, which is what the encoder's own ``body`` returns.
+    """
+    written: list[bytes] = []
+    for _, declared, origin, body in _wasm_bodies(blob):
+        said = list(WasmNarrator(body, origin).narrate())
+        # The last instruction of a body is the end that closes the function,
+        # and that one the encoder writes itself.
+        text = WasmAssembler()
+        for _, _, _, _, redo in said[:-1]:
+            redo(text)
+        counted: list[tuple[int, int]] = []
+        for kind in declared:
+            if counted and counted[-1][1] == kind:
+                counted[-1] = (counted[-1][0] + 1, kind)
+            else:
+                counted.append((1, kind))
+        written.append(text.body(tuple(counted)))
+    return b"".join(written)
+
+
+def wasm_bodies_as_written(blob: bytes) -> bytes:
+    """The same octets, taken straight out of the module for comparing."""
+    written: list[bytes] = []
+    reader = WasmReader(blob)
+    reader.take(8)
+    while not reader.done(len(blob)):
+        identifier = reader.octet()
+        size = reader.uleb()
+        end = reader.at + size
+        if identifier != 10:
+            reader.take(size)
+            continue
+        for _ in range(reader.uleb()):
+            start = reader.at
+            stop = reader.uleb() + reader.at
+            written.append(blob[start:stop])
+            reader.take(stop - reader.at)
+        if reader.at != end:
+            raise WasmDecodeError("the code section does not end where it says")
+        return b"".join(written)
+    return b""
+
+
 def narrate_wasm(blob: bytes) -> str:
     """Every instruction of every function in a module this file wrote.
 
@@ -23335,7 +23477,7 @@ def narrate_wasm(blob: bytes) -> str:
         title = named.get(index, f"function {index}")
         lines.append(f"  {title}({params}) -> {results or 'nothing'}"
                      + (f", locals {locals_}" if locals_ else ""))
-        for address, octets, said, depth in WasmNarrator(body, origin).narrate():
+        for address, octets, said, depth, _ in WasmNarrator(body, origin).narrate():
             lines.append(f"  {address:#08x}  {octets.hex(' '):<20}  "
                          + "  " * depth + said)
     return "\n".join(lines) + "\n"
