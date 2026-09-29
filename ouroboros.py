@@ -25406,6 +25406,134 @@ def pe_complaints(image: bytes) -> tuple[str, ...]:
     return tuple(said)
 
 
+BIOS_READ: Final[int] = 0x13
+GDT_ENTRY: Final[int] = 8
+
+
+@dataclass(frozen=True, slots=True)
+class DiskImage:
+    """What the first sector of a disk this file wrote asks for.
+
+    Not a decoding of the sector: the code in it is sixteen bits wide and
+    hand-written, and the only thing here that reads instructions reads the
+    other width.  These are the three numbers the sector states about the disk
+    around it, found by looking for the instruction that carries each.
+    """
+
+    span: int
+    sectors: int
+    asked: int
+    table_at: int
+    table_span: int
+    jump_to: int
+
+    def says(self) -> str:
+        return (
+            f"a disk of {self.sectors} sector(s), the first asking for "
+            f"{self.asked} more, a descriptor table of {self.table_span} "
+            f"octets at {self.table_at:#x}, long mode entered at {self.jump_to:#x}"
+        )
+
+
+def _carried(sector: bytes, opening: bytes, width: int) -> int | None:
+    """The number an instruction carries, or nothing if it is not there."""
+    at = sector.find(opening)
+    if at < 0 or at + len(opening) + width > len(sector):
+        return None
+    return int.from_bytes(
+        sector[at + len(opening) : at + len(opening) + width], "little"
+    )
+
+
+def read_disk(image: bytes) -> DiskImage:
+    """Takes the first sector's statements about the disk apart."""
+    if len(image) < 2 * SECTOR:
+        raise ContainerError(f"{len(image)} octets is not a disk with anything on it")
+    if len(image) % SECTOR:
+        raise ContainerError(f"{len(image)} octets is not a whole number of sectors")
+    sector = image[:SECTOR]
+    if sector[-2:] != b"\x55\xaa":
+        raise ContainerError("the first sector does not end in a boot signature")
+    asked = _carried(sector, b"\xb8", 1)
+    if asked is None or sector[sector.find(b"\xb8") + 2] != 0x02:
+        raise ContainerError("nothing in the first sector asks a drive to read")
+    if bytes((0xCD, BIOS_READ)) not in sector:
+        raise ContainerError("nothing in the first sector calls the disk service")
+    pointer = _carried(sector, b"\x66\x0f\x01\x16", 2)
+    if pointer is None:
+        raise ContainerError("nothing in the first sector loads a descriptor table")
+    descriptor = pointer - BOOT_BASE
+    if not 0 <= descriptor <= SECTOR - 6:
+        raise ContainerError(f"the descriptor it loads is at {pointer:#x}, off the sector")
+    span, base = struct.unpack_from("<HI", sector, descriptor)
+    jump = _carried(sector, b"\x66\xea", 4)
+    if jump is None:
+        raise ContainerError("nothing in the first sector goes to sixty-four bits")
+    return DiskImage(
+        len(image), len(image) // SECTOR, asked, base - BOOT_BASE, span + 1, jump
+    )
+
+
+def disk_complaints(
+    image: bytes, payload_sectors: int | None = None
+) -> tuple[str, ...]:
+    """Everything wrong with a disk this file wrote, or nothing."""
+    try:
+        disk = read_disk(image)
+    except ContainerError as exc:
+        return (str(exc),)
+    said: list[str] = []
+    if disk.asked < 1:
+        said.append("the first sector asks for no sectors at all")
+    elif 1 + disk.asked > disk.sectors:
+        said.append(
+            f"it asks for {disk.asked} sector(s) after the first and the disk "
+            f"holds {disk.sectors - 1}"
+        )
+    if payload_sectors is not None and disk.asked != payload_sectors:
+        said.append(
+            f"it asks for {disk.asked} sector(s) and {payload_sectors} were written"
+        )
+    if disk.table_span % GDT_ENTRY:
+        said.append(f"its descriptor table is {disk.table_span} octets, not whole entries")
+    if not 0 < disk.table_at <= SECTOR - 2 - disk.table_span:
+        said.append(
+            f"its descriptor table is {disk.table_span} octets at "
+            f"{disk.table_at:#x} and does not fit before the signature"
+        )
+    elif image[disk.table_at : disk.table_at + GDT_ENTRY] != bytes(GDT_ENTRY):
+        said.append("its descriptor table does not begin with a null entry")
+    if not BOOT_BASE < disk.jump_to < BOOT_BASE + SECTOR - 2:
+        said.append(f"it enters sixty-four bits at {disk.jump_to:#x}, off the sector")
+    return tuple(said)
+
+
+def riding_complaints(image: bytes) -> tuple[str, ...]:
+    """Everything wrong with the program a kernel disk carries, or nothing.
+
+    The program states its own length in its own headers, so how much of the
+    disk is program is a question the disk answers rather than one the caller
+    has to be told.
+    """
+    riding = image[SECTOR + KERNEL_SPAN :]
+    if not riding:
+        raise ContainerError("there is nothing behind the kernel to be carried")
+    said = elf64_complaints(riding, EM_X86_64)
+    if said:
+        return tuple(f"the program it carries: {one}" for one in said)
+    carried = read_elf64(riding)
+    length = max(
+        segment.offset + segment.on_disk
+        for segment in carried.segments if segment.loadable
+    )
+    if SECTOR + KERNEL_SPAN + length > len(image):
+        return (
+            f"the program it carries says it is {length} octets and the disk "
+            f"ends {SECTOR + KERNEL_SPAN + length - len(image)} short of that",
+        )
+    return ()
+
+
 # ----------------------------------------------------------------------
 # layer 15c: whether the checks would notice
 # ----------------------------------------------------------------------
