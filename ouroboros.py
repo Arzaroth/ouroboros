@@ -25490,16 +25490,6 @@ class DiskImage:
         )
 
 
-def _carried(sector: bytes, opening: bytes, width: int) -> int | None:
-    """The number an instruction carries, or nothing if it is not there."""
-    at = sector.find(opening)
-    if at < 0 or at + len(opening) + width > len(sector):
-        return None
-    return int.from_bytes(
-        sector[at + len(opening) : at + len(opening) + width], "little"
-    )
-
-
 def read_disk(image: bytes) -> DiskImage:
     """Takes the first sector's statements about the disk apart."""
     if len(image) < 2 * SECTOR:
@@ -25509,23 +25499,18 @@ def read_disk(image: bytes) -> DiskImage:
     sector = image[:SECTOR]
     if sector[-2:] != b"\x55\xaa":
         raise ContainerError("the first sector does not end in a boot signature")
-    asked = _carried(sector, b"\xb8", 1)
-    if asked is None or sector[sector.find(b"\xb8") + 2] != 0x02:
-        raise ContainerError("nothing in the first sector asks a drive to read")
-    if bytes((0xCD, BIOS_READ)) not in sector:
-        raise ContainerError("nothing in the first sector calls the disk service")
-    pointer = _carried(sector, b"\x66\x0f\x01\x16", 2)
-    if pointer is None:
+    plan = read_boot_code_plan(sector)
+    if plan.table_at < 0:
         raise ContainerError("nothing in the first sector loads a descriptor table")
-    descriptor = pointer - BOOT_BASE
+    descriptor = plan.table_at - BOOT_BASE
     if not 0 <= descriptor <= SECTOR - 6:
-        raise ContainerError(f"the descriptor it loads is at {pointer:#x}, off the sector")
+        raise ContainerError(
+            f"the descriptor it loads is at {plan.table_at:#x}, off the sector"
+        )
     span, base = struct.unpack_from("<HI", sector, descriptor)
-    jump = _carried(sector, b"\x66\xea", 4)
-    if jump is None:
-        raise ContainerError("nothing in the first sector goes to sixty-four bits")
     return DiskImage(
-        len(image), len(image) // SECTOR, asked, base - BOOT_BASE, span + 1, jump
+        len(image), len(image) // SECTOR, plan.asked, base - BOOT_BASE,
+        span + 1, plan.entered,
     )
 
 
@@ -25538,16 +25523,10 @@ def disk_complaints(
     except ContainerError as exc:
         return (str(exc),)
     said: list[str] = []
-    if disk.asked < 1:
-        said.append("the first sector asks for no sectors at all")
-    elif 1 + disk.asked > disk.sectors:
+    if 1 + disk.asked > disk.sectors:
         said.append(
             f"it asks for {disk.asked} sector(s) after the first and the disk "
             f"holds {disk.sectors - 1}"
-        )
-    if payload_sectors is not None and disk.asked != payload_sectors:
-        said.append(
-            f"it asks for {disk.asked} sector(s) and {payload_sectors} were written"
         )
     if disk.table_span % GDT_ENTRY:
         said.append(f"its descriptor table is {disk.table_span} octets, not whole entries")
@@ -25558,8 +25537,15 @@ def disk_complaints(
         )
     elif image[disk.table_at : disk.table_at + GDT_ENTRY] != bytes(GDT_ENTRY):
         said.append("its descriptor table does not begin with a null entry")
-    if not BOOT_BASE < disk.jump_to < BOOT_BASE + SECTOR - 2:
-        said.append(f"it enters sixty-four bits at {disk.jump_to:#x}, off the sector")
+    said.extend(
+        boot_code_complaints(image[:SECTOR], payload_sectors, disk.table_span)
+    )
+    rest = disk.table_at + disk.table_span
+    if 0 < rest <= SECTOR - 2 and any(image[rest : SECTOR - 2]):
+        said.append(
+            f"there are {SECTOR - 2 - rest} octets after its table that are "
+            "neither instruction nor table nor nothing"
+        )
     return tuple(said)
 
 
@@ -26010,7 +25996,6 @@ def _pe_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
 def _disk_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
     """The disk bent one way at a time, and what each should be told."""
     disk = read_disk(image)
-    asking = image.find(b"\xb8") + 1
     descriptor = disk.table_at - 6
     return (
         ("a first sector that is not the whole of one",
@@ -26019,14 +26004,9 @@ def _disk_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
          image + b"\x00", "not a whole number of sectors"),
         ("no signature at the end of the sector",
          _bent(image, (SECTOR - 2, "<H", 0)), "does not end in a boot signature"),
-        ("nothing asking a drive to read",
-         _bent(image, (asking + 1, "<B", 0)), "asks a drive to read"),
-        ("a read of no sectors",
-         _bent(image, (asking, "<B", 0)), "asks for no sectors at all"),
         ("a read of more sectors than there are",
-         _bent(image, (asking, "<B", disk.sectors + 4)), "after the first and the disk"),
-        ("a read of one sector",
-         _bent(image, (asking, "<B", 1)), "were written"),
+         _bent(image, (read_boot_code(image[:SECTOR])[6].at + 1, "<B", disk.sectors + 4)),
+         "after the first and the disk"),
         ("a descriptor table off the sector",
          _bent(image, (image.find(b"\x66\x0f\x01\x16") + 4, "<H", 0x9000)),
          "off the sector"),
