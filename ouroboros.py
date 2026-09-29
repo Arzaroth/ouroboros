@@ -22846,6 +22846,414 @@ def run_wasm(path: Path) -> str:
 
 
 # ======================================================================
+# Layer 16b: the IR read back
+# ======================================================================
+#
+# Tier 2 is the only tier whose output was checked by nothing but the tool
+# that consumes it.  Every other one has a second opinion inside this file:
+# the machines are read back, the module is read back, and the interpreter
+# reads everything.  The IR was verified and JITted by llvmlite and taken on
+# trust, and on a runner with nothing installed it was not checked at all.
+#
+# So: a reader for exactly the instructions layer 16 writes.  That is a short
+# list and it was counted rather than guessed at - twenty shapes over the
+# catalogue, thirty generated programs and one that divides - and the one
+# thing that makes it short is that the lowering has no phi in it.  Layer 7
+# already turned the operand stack into memory, so every value that outlives a
+# block is in an alloca and the blocks need no arguments.
+
+
+class LlvmError(GlyphPlatformError):
+    """The IR reader met something layer 16 does not write."""
+
+
+LLVM_WIDTHS: Final[Mapping[str, int]] = {"i1": 1, "i8": 1, "i32": 4, "i64": 8}
+LLVM_BITS: Final[Mapping[str, int]] = {"i1": 1, "i8": 8, "i32": 32, "i64": 64}
+
+
+@dataclass(frozen=True, slots=True)
+class LlvmBlock:
+    """One basic block: its name and the lines that make it up."""
+
+    name: str
+    lines: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LlvmFunction:
+    """One function: what it is called, what it takes, and its blocks."""
+
+    name: str
+    parameters: tuple[tuple[str, str], ...]
+    blocks: tuple[LlvmBlock, ...]
+
+    @property
+    def entry(self) -> str:
+        return self.blocks[0].name
+
+    def block(self, name: str) -> LlvmBlock:
+        for one in self.blocks:
+            if one.name == name:
+                return one
+        raise LlvmError(f"no block named {name!r} in {self.name}")
+
+
+@dataclass(frozen=True, slots=True)
+class LlvmUnit:
+    """A parsed translation unit: its globals and its functions."""
+
+    globals: Mapping[str, tuple[int, int]]
+    functions: Mapping[str, LlvmFunction]
+    span: int
+
+
+def _llvm_joined(text: str) -> list[str]:
+    """The lines of a unit, with a switch put back onto one of them.
+
+    A switch is the only thing layer 16 writes across more than one line, and
+    reading it in pieces would mean carrying a state between them.
+    """
+    joined: list[str] = []
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.split(";")[0].strip()
+        if not line:
+            continue
+        if pending:
+            pending += " " + line
+            if pending.endswith("]"):
+                joined.append(pending)
+                pending = ""
+            continue
+        if line.startswith("switch ") and not line.endswith("]"):
+            pending = line
+            continue
+        joined.append(line)
+    if pending:
+        raise LlvmError("a switch that never closes")
+    return joined
+
+
+def parse_llvm(text: str) -> LlvmUnit:
+    """Reads a unit far enough to run it, and refuses the rest."""
+    globals_: dict[str, tuple[int, int]] = {}
+    functions: dict[str, LlvmFunction] = {}
+    span = 16                                  # nothing is put at address zero
+    current: str | None = None
+    parameters: tuple[tuple[str, str], ...] = ()
+    blocks: list[LlvmBlock] = []
+    name = "entry"
+    body: list[str] = []
+
+    for line in _llvm_joined(text):
+        if current is None:
+            if line.startswith("@"):
+                label, _, rest = line.partition(" = ")
+                shape = re.fullmatch(
+                    r"internal global \[(\d+) x (i\d+)\] zeroinitializer", rest
+                )
+                if shape is None:
+                    raise LlvmError(f"a global this does not read: {line}")
+                count, kind = int(shape.group(1)), shape.group(2)
+                globals_[label] = (span, count * LLVM_WIDTHS[kind])
+                span += count * LLVM_WIDTHS[kind]
+                continue
+            if line.startswith("define "):
+                head = re.fullmatch(r"define (?:internal )?\S+ (@\S+)\((.*)\) \{", line)
+                if head is None:
+                    raise LlvmError(f"a definition this does not read: {line}")
+                current = head.group(1)
+                parameters = tuple(
+                    (piece.split()[0], piece.split()[1])
+                    for piece in head.group(2).split(", ") if piece
+                )
+                blocks, body, name = [], [], "entry"
+                continue
+            if (line.startswith(("declare ", "source_filename", "target triple"))
+                    or line.startswith("!")):
+                continue
+            raise LlvmError(f"a line this does not read: {line}")
+        if line == "}":
+            blocks.append(LlvmBlock(name, tuple(body)))
+            functions[current] = LlvmFunction(current, parameters, tuple(blocks))
+            current = None
+            continue
+        if line.endswith(":") and " " not in line:
+            if body or blocks:
+                blocks.append(LlvmBlock(name, tuple(body)))
+            name, body = line[:-1], []
+            continue
+        body.append(line)
+    if current is not None:
+        raise LlvmError(f"{current} never closes")
+    return LlvmUnit(globals_, functions, span)
+
+
+class LlvmMachine:
+    """Runs the subset of LLVM IR layer 16 writes, and no more.
+
+    Values live in a dictionary because the IR is in static single assignment
+    form and nothing is ever written twice; anything that outlives a block is
+    in an alloca already, which is why there is no phi to handle.  Memory is
+    one flat span: the globals at the bottom, and a stack above them that each
+    call takes its allocas from and gives back on the way out.
+    """
+
+    STACK: ClassVar[int] = 1 << 20
+
+    def __init__(self, unit: LlvmUnit) -> None:
+        self._unit = unit
+        self._memory = bytearray(unit.span + self.STACK)
+        self._top = unit.span
+        self._written = bytearray()
+
+    @property
+    def written(self) -> bytes:
+        return bytes(self._written)
+
+    @staticmethod
+    def _signed(value: int, kind: str) -> int:
+        bits = LLVM_BITS[kind]
+        kept = value & ((1 << bits) - 1)
+        return kept - (1 << bits) if kept >> (bits - 1) else kept
+
+    def _operand(self, token: str, values: Mapping[str, int]) -> int:
+        token = token.strip().rstrip(",")
+        if token == "null":
+            return 0
+        if token.startswith("%"):
+            try:
+                return values[token]
+            except KeyError:
+                raise LlvmError(f"{token} is read before it is written") from None
+        try:
+            return int(token)
+        except ValueError:
+            raise LlvmError(f"{token} is not an operand this reads") from None
+
+    def _read(self, where: int, kind: str) -> int:
+        width = LLVM_WIDTHS[kind]
+        return self._signed(
+            int.from_bytes(self._memory[where : where + width], "little"), kind
+        )
+
+    def _write(self, where: int, kind: str, value: int) -> None:
+        width = LLVM_WIDTHS[kind]
+        bits = LLVM_BITS[kind]
+        self._memory[where : where + width] = (
+            (value & ((1 << bits) - 1)).to_bytes(width, "little")
+        )
+
+    def invoke(self, name: str, arguments: Sequence[int] = ()) -> int:
+        function = self._unit.functions.get(name)
+        if function is None:
+            raise LlvmError(f"no function named {name!r}")
+        if len(arguments) != len(function.parameters):
+            raise LlvmError(f"{name} wants {len(function.parameters)} argument(s)")
+        values: dict[str, int] = {
+            register: self._signed(given, kind)
+            for (kind, register), given in zip(
+                function.parameters, arguments, strict=True
+            )
+        }
+        was = self._top
+        try:
+            return self._walk(function, values)
+        finally:
+            self._top = was
+
+    def _walk(self, function: LlvmFunction, values: dict[str, int]) -> int:
+        here = function.entry
+        for _ in range(1 << 22):
+            block = function.block(here)
+            went: str | None = None
+            for line in block.lines:
+                went = self._one(line, values)
+                if went is not None:
+                    break
+            if went is None:
+                raise LlvmError(f"{function.name}:{here} runs off the end")
+            if went.startswith("%%"):
+                return int(went[2:])
+            here = went
+        raise LlvmError(f"{function.name} did not finish")
+
+    def _one(self, line: str, values: dict[str, int]) -> str | None:
+        """One instruction.  Answers the block to go to next, or None.
+
+        A returned value comes back as ``%%`` and the digits of it, which is
+        not a label any of these blocks can have.
+        """
+        register = None
+        if " = " in line:
+            register, _, line = line.partition(" = ")
+            register = register.strip()
+
+        head, _, rest = line.partition(" ")
+        if head == "ret":
+            if rest == "void":
+                return "%%0"
+            kind, _, token = rest.partition(" ")
+            return f"%%{self._operand(token, values)}"
+        if head == "br":
+            if rest.startswith("label "):
+                return rest[len("label ") :].strip().lstrip("%")
+            shape = re.fullmatch(
+                r"i1 (\S+), label %(\S+), label %(\S+)", rest
+            )
+            if shape is None:
+                raise LlvmError(f"a branch this does not read: {line}")
+            taken = self._operand(shape.group(1), values)
+            return shape.group(2) if taken else shape.group(3)
+        if head == "switch":
+            shape = re.fullmatch(
+                r"i32 (\S+), label %(\S+) \[(.*)\]", rest
+            )
+            if shape is None:
+                raise LlvmError(f"a switch this does not read: {line}")
+            against = self._operand(shape.group(1), values)
+            for case in re.finditer(r"i32 (-?\d+), label %(\S+?)(?:,|\s|$)", shape.group(3)):
+                if int(case.group(1)) == against:
+                    return case.group(2)
+            return shape.group(2)
+        if head in ("call", "tail"):
+            self._call(rest, register, values)
+            return None
+        if register is None:
+            if head == "store":
+                shape = re.fullmatch(
+                    r"(i\d+) (\S+), ptr (\S+), align \d+", rest
+                )
+                if shape is None:
+                    raise LlvmError(f"a store this does not read: {line}")
+                self._write(
+                    self._operand(shape.group(3), values),
+                    shape.group(1),
+                    self._operand(shape.group(2), values),
+                )
+                return None
+            raise LlvmError(f"an instruction this does not read: {line}")
+        values[register] = self._value(head, rest, values, line)
+        return None
+
+    def _value(
+        self, head: str, rest: str, values: Mapping[str, int], line: str
+    ) -> int:
+        if head == "load":
+            shape = re.fullmatch(r"(i\d+), ptr (\S+), align \d+", rest)
+            if shape is None:
+                raise LlvmError(f"a load this does not read: {line}")
+            return self._read(self._operand(shape.group(2), values), shape.group(1))
+        if head == "alloca":
+            shape = re.fullmatch(r"(?:\[(\d+) x )?(i\d+)\]?, align \d+", rest)
+            if shape is None:
+                raise LlvmError(f"an alloca this does not read: {line}")
+            count = int(shape.group(1) or 1)
+            where = self._top
+            self._top += count * LLVM_WIDTHS[shape.group(2)]
+            return where
+        if head == "getelementptr":
+            shape = re.fullmatch(
+                r"inbounds \[(\d+) x (i\d+)\], ptr (\S+), i64 (\S+), i64 (\S+)", rest
+            )
+            if shape is None:
+                raise LlvmError(f"a getelementptr this does not read: {line}")
+            base = shape.group(3)
+            start = (
+                self._unit.globals[base][0] if base.startswith("@")
+                else self._operand(base, values)
+            )
+            width = LLVM_WIDTHS[shape.group(2)]
+            outer = self._operand(shape.group(4), values) * int(shape.group(1)) * width
+            return start + outer + self._operand(shape.group(5), values) * width
+        if head == "icmp":
+            shape = re.fullmatch(r"(\w+) (i\d+) (\S+), (\S+)", rest)
+            if shape is None:
+                raise LlvmError(f"an icmp this does not read: {line}")
+            left = self._operand(shape.group(3), values)
+            right = self._operand(shape.group(4), values)
+            answers = {
+                "eq": left == right, "ne": left != right,
+                "slt": left < right, "sle": left <= right,
+                "sgt": left > right, "sge": left >= right,
+            }
+            if shape.group(1) not in answers:
+                raise LlvmError(f"a comparison this does not read: {shape.group(1)}")
+            return int(answers[shape.group(1)])
+        if head in ("add", "sub", "mul", "sdiv", "srem", "and", "or", "xor"):
+            shape = re.fullmatch(r"(?:nsw )?(i\d+) (\S+), (\S+)", rest)
+            if shape is None:
+                raise LlvmError(f"an operation this does not read: {line}")
+            kind = shape.group(1)
+            left = self._operand(shape.group(2), values)
+            right = self._operand(shape.group(3), values)
+            if head in ("sdiv", "srem") and right == 0:
+                raise LlvmError("a division by zero, which is not defined here")
+            if head == "sdiv":
+                whole = abs(left) // abs(right)
+                answer = -whole if (left < 0) != (right < 0) else whole
+            elif head == "srem":
+                whole = abs(left) // abs(right)
+                if (left < 0) != (right < 0):
+                    whole = -whole
+                answer = left - whole * right
+            else:
+                answer = {
+                    "add": left + right, "sub": left - right, "mul": left * right,
+                    "and": left & right, "or": left | right, "xor": left ^ right,
+                }[head]
+            return self._signed(answer, kind)
+        if head in ("sext", "zext", "trunc"):
+            shape = re.fullmatch(r"(i\d+) (\S+) to (i\d+)", rest)
+            if shape is None:
+                raise LlvmError(f"a conversion this does not read: {line}")
+            value = self._operand(shape.group(2), values)
+            if head == "zext":
+                value &= (1 << LLVM_BITS[shape.group(1)]) - 1
+            return self._signed(value, shape.group(3))
+        if head == "select":
+            shape = re.fullmatch(r"i1 (\S+), (i\d+) (\S+), (i\d+) (\S+)", rest)
+            if shape is None:
+                raise LlvmError(f"a select this does not read: {line}")
+            chosen = shape.group(3) if self._operand(shape.group(1), values) else shape.group(5)
+            return self._operand(chosen, values)
+        raise LlvmError(f"an instruction this does not read: {line}")
+
+    def _call(
+        self, rest: str, register: str | None, values: dict[str, int]
+    ) -> None:
+        shape = re.fullmatch(r"(?:\S+ )?(\S+) (@\S+)\((.*)\)", "x " + rest)
+        if shape is None:
+            raise LlvmError(f"a call this does not read: {rest}")
+        name = shape.group(2)
+        arguments = [
+            self._operand(piece.split()[-1], values)
+            for piece in shape.group(3).split(", ") if piece
+        ]
+        if name == "@putchar":
+            self._written.append(arguments[0] & 0xFF)
+            answer = arguments[0]
+        elif name == "@fflush":
+            answer = 0
+        else:
+            answer = self.invoke(name, arguments)
+        if register is not None:
+            values[register] = answer
+
+
+def execute_llvm(text: str) -> str:
+    """Runs the IR layer 16 wrote, on nothing but this file.
+
+    Tier 2 is the only tier that had no second opinion in here: llvmlite
+    verified the text and ran it, and that was the whole of the checking.
+    """
+    unit = parse_llvm(text)
+    machine = LlvmMachine(unit)
+    machine.invoke("@main")
+    return machine.written.decode()
+
+
+# ======================================================================
 # Layer 20: the module read back
 # ======================================================================
 #
