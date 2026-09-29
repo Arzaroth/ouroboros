@@ -131,6 +131,13 @@ jobs:
       - name: a program grown until every backend says no, and no other answer
         run: python ouroboros.py --fuzz-limits
 
+      # The other language had no generator until now, so its compilers had
+      # only ever compiled the nine programs written in it by hand.
+      - name: 40 generated GSL-2 programs, through every compiler for them
+        run: |
+          python ouroboros.py --fuzz-gsl2 40 \
+            --fuzz-seed ${{ github.run_number }}
+
       - name: the compiler builds itself, and nothing here could have helped
         run: python ouroboros.py --close-the-toolchain
 

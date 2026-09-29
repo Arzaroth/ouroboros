@@ -98,6 +98,7 @@
     python3 ouroboros.py --explain wasm   say what every instruction of it is
     python3 ouroboros.py --trace-machine  and what each one of them did
     python3 ouroboros.py --fuzz-limits   grow a program until a backend says no
+    python3 ouroboros.py --fuzz-gsl2 N   one program, every compiler for it
     python3 ouroboros.py --coverage FILE what the checks touched, as lcov
     python3 ouroboros.py --selftest      differential-test every tier
     python3 ouroboros.py --emit-everything   dump all of it at once
@@ -7148,6 +7149,354 @@ def fuzz_limits(
                 ))
             size *= 2
     return LimitReport(tuple(cases))
+
+
+# ----------------------------------------------------------------------
+# layer 17d: the other language, and the four compilers for it
+# ----------------------------------------------------------------------
+#
+# Everything above generates programs in the language of tier 1.  The language
+# of tier 3 has never had a generator, so its four compilers have only ever
+# compiled the nine programs written in it, and those nine never change.
+#
+# A fixpoint says a compiler reproduces itself.  A compiler can do that while
+# getting wrong anything it does not itself use: the miscompilation is stable,
+# so the three generations still agree, and the closure still passes.  The
+# only thing that finds it is compiling a program none of them is.
+#
+# So: generate one, hand it to the seed and to the three tails, run all four,
+# and require the same octets out of each.  The seed is a second
+# implementation of the whole language rather than a fourth back end, which is
+# what makes the disagreement worth something when it comes.
+
+
+class Gsl2ProgramGenerator:
+    """Emits random but always well-formed GSL-2 translation units.
+
+    Every program it writes terminates, reads nothing, and prints a fixed
+    number of digits, because the whole point is to compare what four
+    compilers made of the same source and a program that hangs or asks for
+    input compares nothing.
+    """
+
+    LOWEST: ClassVar[int] = 0 - 4096
+    HIGHEST: ClassVar[int] = 4096
+    CELLS: ClassVar[int] = 64
+
+    def __init__(self, entropy: random.Random) -> None:
+        self._entropy = entropy
+        self._counter = itertools.count()
+        self._globals: list[str] = []
+        self._functions: list[tuple[str, int]] = []
+
+    def _name(self, stem: str) -> str:
+        return f"{stem}{next(self._counter)}"
+
+    def _literal(self) -> str:
+        return str(self._entropy.randint(self.LOWEST, self.HIGHEST))
+
+    def _atom(self, visible: Sequence[str], depth: int) -> str:
+        choices = ["literal", "literal", "cell"]
+        if visible:
+            choices += ["name", "name"]
+        if self._functions:
+            choices.append("call")
+        what = self._entropy.choice(choices)
+        if what == "name":
+            return self._entropy.choice(visible)
+        if what == "cell":
+            return f"mem[{self._entropy.randrange(self.CELLS)}]"
+        if what == "call":
+            name, arity = self._entropy.choice(self._functions)
+            arguments = ", ".join(
+                self._expression(visible, depth + 1) for _ in range(arity)
+            )
+            return f"{name}({arguments})"
+        return self._literal()
+
+    def _expression(self, visible: Sequence[str], depth: int) -> str:
+        if depth >= 3 or self._entropy.random() < 0.3:
+            return self._atom(visible, depth)
+        left = self._expression(visible, depth + 1)
+        operator = self._entropy.choice(["+", "-", "*", "/", "%"])
+        if operator in ("/", "%"):
+            # A remainder takes the sign of its left side, so this adds more
+            # than ninety-seven rather than one: nothing here divides by zero,
+            # because the three machines do not agree about what that is and
+            # this is not the place to find out.
+            right = f"(({self._expression(visible, depth + 1)} % 97) + 98)"
+        else:
+            right = self._expression(visible, depth + 1)
+        return f"({left} {operator} {right})"
+
+    def _condition(self, visible: Sequence[str], depth: int = 0) -> str:
+        if depth < 2 and self._entropy.random() < 0.4:
+            joiner = self._entropy.choice(["&&", "||"])
+            return (f"({self._condition(visible, depth + 1)} {joiner} "
+                    f"{self._condition(visible, depth + 1)})")
+        if self._entropy.random() < 0.15:
+            return f"(!{self._condition(visible, depth + 1)})"
+        comparison = self._entropy.choice(["==", "!=", "<", "<=", ">", ">="])
+        return (f"({self._expression(visible, 2)} {comparison} "
+                f"{self._expression(visible, 2)})")
+
+    def _statements(
+        self, visible: list[str], depth: int, frozen: Sequence[str] = ()
+    ) -> list[str]:
+        """Statements over what is visible, assigning to none of ``frozen``.
+
+        A loop counter is readable inside its own body and never assignable
+        there, which is the whole of why these programs stop.
+        """
+        lines: list[str] = []
+        for _ in range(self._entropy.randint(1, 4)):
+            writable = [name for name in visible if name not in frozen]
+            what = self._entropy.choice(
+                ["assign", "assign", "cell", "if", "while", "declare"]
+                if depth < 2 else ["assign", "cell"]
+            )
+            if what == "declare":
+                name = self._name("v")
+                lines.append(f"var {name} = {self._expression(visible, 1)};")
+                visible.append(name)
+            elif what == "assign" and writable:
+                target = self._entropy.choice(writable)
+                lines.append(f"{target} = ({self._expression(visible, 1)}) % 1000;")
+            elif what == "cell":
+                where = self._entropy.randrange(self.CELLS)
+                lines.append(
+                    f"mem[{where}] = ({self._expression(visible, 1)}) % 1000;"
+                )
+            elif what == "if":
+                lines.append(f"if ({self._condition(visible)}) {{")
+                lines += [
+                    "  " + line
+                    for line in self._statements(list(visible), depth + 1, frozen)
+                ]
+                if self._entropy.random() < 0.5:
+                    lines.append("} else {")
+                    lines += [
+                        "  " + line
+                        for line in self._statements(list(visible), depth + 1, frozen)
+                    ]
+                lines.append("}")
+            elif what == "while":
+                counter = self._name("i")
+                bound = self._entropy.randint(1, 6)
+                lines.append(f"var {counter} = 0;")
+                lines.append(f"while ({counter} < {bound}) {{")
+                inner = list(visible) + [counter]
+                lines += [
+                    "  " + line
+                    for line in self._statements(
+                        inner, depth + 1, tuple(frozen) + (counter,)
+                    )
+                ]
+                lines.append(f"  {counter} = {counter} + 1;")
+                lines.append("}")
+        return lines
+
+    def _function(self, wide: bool = False) -> str:
+        """One function, or a wide one with more values than an offset reaches.
+
+        A generated program is small and the nine written by hand are not, so
+        without this the only frames these compilers would be asked for are
+        little ones.  Past a few hundred live values the third machine has to
+        work out the address of a slot rather than name it, which its own
+        source does reach and nothing generated would.
+        """
+        name = self._name("f")
+        arity = self._entropy.randint(0, 3)
+        parameters = [self._name("p") for _ in range(arity)]
+        visible = list(parameters) + list(self._globals)
+        if wide:
+            # The language allows a hundred locals to a function, so the
+            # values that make a frame wide have to come from the expressions
+            # rather than from the declarations.
+            body = []
+            # Sometimes past what any of them allows, so that the refusals
+            # get compared as well as the answers.  Four compilers refusing
+            # together is four compilers agreeing; one of them refusing alone
+            # is the thing worth having found.
+            statements = (
+                self._entropy.randint(260, 400)
+                if self._entropy.random() < 0.25
+                else self._entropy.randint(60, 110)
+            )
+            for _ in range(self._entropy.randint(30, 50)):
+                held = self._name("w")
+                body.append(f"var {held} = {self._expression(visible, 2)};")
+                visible.append(held)
+            for _ in range(statements):
+                target = self._entropy.choice(visible)
+                body.append(f"{target} = ({self._expression(visible, 1)}) % 1000;")
+            head = f"fn {name}({', '.join(parameters)}) {{"
+            answer = self._expression(visible, 2)
+            # Only now, so that nothing in the body above can call the
+            # function it is the body of.  These programs have to stop.
+            self._functions.append((name, arity))
+            return "\n".join(
+                [head] + ["  " + line for line in body]
+                + [f"  return ({answer}) % 1000;", "}"]
+            )
+        body = self._statements(list(visible), 1)
+        answer = self._expression(visible, 1)
+        self._functions.append((name, arity))
+        head = f"fn {name}({', '.join(parameters)}) {{"
+        return "\n".join(
+            [head] + ["  " + line for line in body]
+            + [f"  return ({answer}) % 1000;", "}"]
+        )
+
+    def generate(self) -> str:
+        """One translation unit, and the same one for the same seed."""
+        self._globals = []
+        self._functions = []
+        lines: list[str] = []
+        for _ in range(self._entropy.randint(1, 3)):
+            name = self._name("g")
+            self._globals.append(name)
+            lines.append(f"var {name} = {self._literal()};")
+        lines.append("")
+        for _ in range(self._entropy.randint(1, 4)):
+            lines.append(self._function())
+            lines.append("")
+        if self._entropy.random() < 0.35:
+            lines.append(self._function(wide=True))
+            lines.append("")
+
+        visible = list(self._globals)
+        body = self._statements(list(visible), 1)
+        lines.append("fn main() {")
+        lines += ["  " + line for line in body]
+        lines.append(f"  var answer = ({self._expression(visible, 1)}) % 1000;")
+        lines.append("  var at = 0;")
+        lines.append(f"  while (at < {self.CELLS}) {{")
+        lines.append("    answer = (answer + mem[at]) % 1000;")
+        lines.append("    at = at + 1;")
+        lines.append("  }")
+        lines.append("  if (answer < 0) { answer = 0 - answer; }")
+        lines.append("  putchar(48 + ((answer / 100) % 10));")
+        lines.append("  putchar(48 + ((answer / 10) % 10));")
+        lines.append("  putchar(48 + (answer % 10));")
+        lines.append("  putchar(10);")
+        lines.append("  return 0;")
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+
+@dataclass(frozen=True, slots=True)
+class Gsl2Case:
+    """One generated program, and what each compiler's answer to it was."""
+
+    source: str
+    said: Mapping[str, str]
+
+    @property
+    def agreed(self) -> bool:
+        return len(set(self.said.values())) <= 1
+
+
+@dataclass(frozen=True, slots=True)
+class Gsl2Report:
+    """Whether the four compilers for the other language are one language."""
+
+    cases: tuple[Gsl2Case, ...]
+    skipped: tuple[str, ...]
+
+    @property
+    def considered(self) -> int:
+        return len(self.cases)
+
+    @property
+    def disagreements(self) -> tuple[Gsl2Case, ...]:
+        return tuple(case for case in self.cases if not case.agreed)
+
+    @property
+    def compilers(self) -> tuple[str, ...]:
+        return tuple(self.cases[0].said) if self.cases else ()
+
+    @property
+    def clean(self) -> bool:
+        return not self.disagreements
+
+    def render(self) -> str:
+        lines = [
+            f"{self.considered} program(s) through "
+            f"{len(self.compilers)} compiler(s): {' '.join(self.compilers)}"
+        ]
+        for note in self.skipped:
+            lines.append(f"  [--]   {note}")
+        for case in self.disagreements[:2]:
+            lines.append("  [FAIL] they did not agree about this program:")
+            lines.append("    " + "\n    ".join(case.source.strip().splitlines()))
+            for name, said in case.said.items():
+                lines.append(f"    {name:<10} {said!r}")
+        lines.append(
+            "  [ok]   every compiler made the same program of every source"
+            if self.clean else
+            "  [FAIL] two compilers for one language do not agree about it"
+        )
+        return "\n".join(lines)
+
+
+def fuzz_gsl2(iterations: int = 20, seed: int = 0) -> Gsl2Report:
+    """Hands one generated program to every compiler there is for it.
+
+    The seed compiles here and so does the tail for this machine; the other
+    two tails compile for machines this one is not, and are asked only where
+    an emulator for them is registered, which is what the note says when it
+    is not.  A refusal counts as an answer, so that four compilers refusing
+    together reads as the agreement it is.
+    """
+    entropy = random.Random(seed)
+    generator = Gsl2ProgramGenerator(entropy)
+    skipped: list[str] = []
+    if not machine_code_runnable("x86-64"):
+        # The seed writes for one machine only, so on any other host there is
+        # nothing here that can be run at all, never mind compared.
+        return Gsl2Report((), ("the seed writes x86-64 and this host is not one",))
+    wanted: list[tuple[str, str, str]] = [
+        ("gslcelf", GSLCELF_GSL2, "x86-64"),
+        ("gslcarm", GSLCARM_GSL2, "aarch64"),
+        ("gslcrv", GSLCRV_GSL2, "riscv64"),
+    ]
+    cases: list[Gsl2Case] = []
+    with tempfile.TemporaryDirectory(prefix="ouroboros-gsl2-") as scratch:
+        where = Path(scratch)
+        built: list[tuple[str, Path, str]] = []
+        for name, text, architecture in wanted:
+            if not machine_code_runnable(architecture):
+                skipped.append(f"{name} was not asked: this host cannot run {architecture}")
+                continue
+            compiler = where / name
+            compiler.write_bytes(gsl2_machine_code(text))
+            compiler.chmod(0o755)
+            built.append((name, compiler, architecture))
+
+        for turn in range(iterations):
+            source = generator.generate()
+            said: dict[str, str] = {}
+            seeded = where / f"seed{turn}"
+            try:
+                seeded.write_bytes(gsl2_machine_code(source))
+            except GlyphPlatformError:
+                said["seed"] = "refused"
+            else:
+                seeded.chmod(0o755)
+                said["seed"] = _run(seeded, "")
+            for name, compiler, _ in built:
+                # A refusal is an answer.  Every compiler refusing is every
+                # compiler agreeing, and one of them refusing alone is the
+                # disagreement worth having found.
+                try:
+                    program = _compile_with(compiler, source, where / f"{name}{turn}")
+                except subprocess.CalledProcessError:
+                    said[name] = "refused"
+                    continue
+                said[name] = _run(program, "")
+            cases.append(Gsl2Case(source=source, said=said))
+    return Gsl2Report(tuple(cases), tuple(skipped))
 
 
 def fuzz_refusals(iterations: int = 100, seed: int = 0) -> RefusalReport:
@@ -24814,6 +25163,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
                          help="keep what is found here, and re-check it first")
     fuzzing.add_argument("--fuzz-refusals", type=int, metavar="N",
                          help="break N programs and check both front ends refuse")
+    fuzzing.add_argument("--fuzz-gsl2", type=int, metavar="N",
+                         help="compile N generated GSL-2 programs with every "
+                              "compiler there is for them, and compare")
     fuzzing.add_argument("--fuzz-limits", nargs="?", type=int, const=0,
                          metavar="CEILING",
                          help="grow a program until every backend says no, and "
@@ -24887,7 +25239,8 @@ def _refuses_program(namespace: argparse.Namespace) -> str | None:
         if getattr(namespace, flag):
             return f"{mode} chooses what it compiles"
     if (namespace.fuzz is not None or namespace.fuzz_refusals is not None
-            or namespace.fuzz_limits is not None):
+            or namespace.fuzz_limits is not None
+            or namespace.fuzz_gsl2 is not None):
         return "--fuzz chooses what it compiles"
     if namespace.carry:
         return "--carry says what goes on the disk, and it is not this"
@@ -24949,6 +25302,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         refusals = fuzz_refusals(namespace.fuzz_refusals, namespace.fuzz_seed)
         print(refusals.render())
         return 0 if refusals.clean else 1
+    if namespace.fuzz_gsl2 is not None:
+        agreed = fuzz_gsl2(namespace.fuzz_gsl2, namespace.fuzz_seed)
+        print(agreed.render())
+        return 0 if agreed.clean else 1
     if namespace.fuzz_limits is not None:
         limits = fuzz_limits(namespace.fuzz_limits or None)
         print(limits.render())
