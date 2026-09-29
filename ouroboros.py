@@ -25242,6 +25242,170 @@ def elf64_complaints(image: bytes, machine: int | None = None) -> tuple[str, ...
     return tuple(said)
 
 
+PE_EXECUTABLE: Final[int] = 0x2000_0000
+PE_CODE: Final[int] = 0x0000_0020
+PE32_PLUS: Final[int] = 0x20B
+
+
+@dataclass(frozen=True, slots=True)
+class PeSection:
+    """One section header of the application firmware will load."""
+
+    name: str
+    in_memory: int
+    address: int
+    on_disk: int
+    offset: int
+    traits: int
+
+    @property
+    def executable(self) -> bool:
+        return bool(self.traits & PE_EXECUTABLE)
+
+    def holds(self, address: int) -> bool:
+        return self.address <= address < self.address + max(self.in_memory, self.on_disk)
+
+    def says(self) -> str:
+        return (
+            f"{self.name} {self.address:#x}+{self.in_memory:#x} "
+            f"from {self.offset:#x}+{self.on_disk:#x} traits {self.traits:#x}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PeImage:
+    """What the headers of the UEFI application say it is."""
+
+    machine: int
+    subsystem: int
+    entry: int
+    code_at: int
+    mapped: int
+    header_span: int
+    section_align: int
+    file_align: int
+    directories: int
+    sections: tuple[PeSection, ...]
+    span: int
+
+    @property
+    def text_at(self) -> int:
+        for section in self.sections:
+            if section.holds(self.entry):
+                return section.offset + (self.entry - section.address)
+        raise ContainerError(f"no section holds the entry {self.entry:#x}")
+
+    def says(self) -> str:
+        lines = [
+            f"PE32+ for machine {self.machine:#x}, subsystem {self.subsystem}, "
+            f"entry {self.entry:#x} at offset {self.text_at:#x} of {self.span}"
+        ]
+        lines.extend(f"  section: {s.says()}" for s in self.sections)
+        return "\n".join(lines)
+
+
+def read_pe32plus(image: bytes) -> PeImage:
+    """Takes the DOS stub, the headers and the section table apart."""
+    if len(image) < 0x40:
+        raise ContainerError(f"{len(image)} octets is shorter than a stub")
+    if image[:2] != b"MZ":
+        raise ContainerError("this does not begin with a DOS stub")
+    (headers_at,) = struct.unpack_from("<I", image, 0x3C)
+    if headers_at + 24 > len(image):
+        raise ContainerError(f"the stub points at {headers_at:#x}, past the file")
+    if image[headers_at : headers_at + 4] != b"PE\x00\x00":
+        raise ContainerError(f"nothing at {headers_at:#x} says it is a PE header")
+    machine, sections, _, _, _, optional_span, _ = struct.unpack_from(
+        "<HHIIIHH", image, headers_at + 4
+    )
+    optional_at = headers_at + 24
+    if optional_span < 112:
+        raise ContainerError(f"an optional header of {optional_span} octets holds nothing")
+    if optional_at + optional_span > len(image):
+        raise ContainerError("the optional header ends past the file")
+    (magic,) = struct.unpack_from("<H", image, optional_at)
+    if magic != PE32_PLUS:
+        raise ContainerError(f"the optional header is {magic:#x} and not PE32+")
+    code_span, _, _, entry, code_at = struct.unpack_from("<IIIII", image, optional_at + 4)
+    section_align, file_align = struct.unpack_from("<II", image, optional_at + 32)
+    mapped, header_span = struct.unpack_from("<II", image, optional_at + 56)
+    (subsystem,) = struct.unpack_from("<H", image, optional_at + 68)
+    (directories,) = struct.unpack_from("<I", image, optional_at + 108)
+    table_at = optional_at + optional_span
+    if table_at + sections * 40 > len(image):
+        raise ContainerError("the section table ends past the file")
+    read: list[PeSection] = []
+    for number in range(sections):
+        fields = struct.unpack_from("<8sIIIIIIHHI", image, table_at + number * 40)
+        read.append(PeSection(
+            fields[0].rstrip(b"\x00").decode(errors="replace"),
+            fields[1], fields[2], fields[3], fields[4], fields[9],
+        ))
+    if not read:
+        raise ContainerError("it names no sections at all")
+    del code_span
+    return PeImage(
+        machine, subsystem, entry, code_at, mapped, header_span,
+        section_align, file_align, directories, tuple(read), len(image),
+    )
+
+
+def pe_complaints(image: bytes) -> tuple[str, ...]:
+    """Everything wrong with the application, or nothing."""
+    try:
+        picture = read_pe32plus(image)
+    except ContainerError as exc:
+        return (str(exc),)
+    said: list[str] = []
+    if picture.machine != 0x8664:
+        said.append(f"the header names machine {picture.machine:#x}")
+    if picture.subsystem != EFI_SUBSYSTEM:
+        said.append(f"the header names subsystem {picture.subsystem}, not {EFI_SUBSYSTEM}")
+    if picture.directories != 16:
+        said.append(f"it names {picture.directories} data directories, not 16")
+    if picture.section_align < picture.file_align:
+        said.append(
+            f"sections align to {picture.section_align:#x} and the file to "
+            f"{picture.file_align:#x}, which is the wrong way round"
+        )
+    if picture.header_span % picture.file_align:
+        said.append(f"the headers span {picture.header_span:#x}, which the file alignment forbids")
+    for section in picture.sections:
+        if section.offset % picture.file_align:
+            said.append(f"{section.name} starts at {section.offset:#x} in the file")
+        if section.address % picture.section_align:
+            said.append(f"{section.name} maps at {section.address:#x}")
+        if section.offset + section.on_disk > picture.span:
+            said.append(
+                f"{section.name} reads to {section.offset + section.on_disk} "
+                f"of a file {picture.span} long"
+            )
+        if section.offset < picture.header_span:
+            said.append(f"{section.name} starts inside the headers")
+    reach = max(
+        section.address + max(section.in_memory, section.on_disk)
+        for section in picture.sections
+    )
+    if picture.mapped < reach:
+        said.append(f"it says it maps {picture.mapped:#x} and its sections reach {reach:#x}")
+    if picture.mapped % picture.section_align:
+        said.append(f"it says it maps {picture.mapped:#x}, which the section alignment forbids")
+    try:
+        _ = picture.text_at
+    except ContainerError as exc:
+        said.append(str(exc))
+        return tuple(said)
+    holding = next(s for s in picture.sections if s.holds(picture.entry))
+    if not holding.executable:
+        said.append(f"the entry {picture.entry:#x} is in a section nothing may run")
+    if picture.code_at != holding.address:
+        said.append(
+            f"it says its code is at {picture.code_at:#x} and the entry is in "
+            f"{holding.name} at {holding.address:#x}"
+        )
+    return tuple(said)
+
+
 # ----------------------------------------------------------------------
 # layer 15c: whether the checks would notice
 # ----------------------------------------------------------------------
