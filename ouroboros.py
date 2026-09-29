@@ -97,6 +97,7 @@
     python3 ouroboros.py --run-wasm PATH  run one back, with no engine either
     python3 ouroboros.py --explain wasm   say what every instruction of it is
     python3 ouroboros.py --trace-machine  and what each one of them did
+    python3 ouroboros.py --trace-wasm    the same, for the module
     python3 ouroboros.py --fuzz-limits   grow a program until a backend says no
     python3 ouroboros.py --fuzz-gsl2 N   one program, every compiler for it
     python3 ouroboros.py --coverage FILE what the checks touched, as lcov
@@ -5180,12 +5181,19 @@ class AssuranceSuite:
                     machine_code(artifacts.module, architecture), architecture
                 )
                 steps += len(said.splitlines())
+            module = trace_wasm(wasm_module(artifacts.module))
+            if "?" in module:
+                return CheckResult(
+                    "every step it runs is one it can name", False,
+                    "the module ran an instruction the narrator has no name for",
+                )
+            steps += len(module.splitlines())
         except GlyphPlatformError as exc:
             return CheckResult("every step it runs is one it can name", False, str(exc))
         return CheckResult(
             "every step it runs is one it can name",
             True,
-            f"{steps} step(s) across {len(MACHINES)} machines",
+            f"{steps} step(s) across {len(MACHINES)} machines and a module",
         )
 
     @staticmethod
@@ -23062,13 +23070,25 @@ class WasmMachine:
     def memory(self) -> bytearray:
         return self._memory
 
-    def invoke(self, index: int, arguments: Sequence[int] = ()) -> list[int]:
+    def invoke(
+        self,
+        index: int,
+        arguments: Sequence[int] = (),
+        watch: Callable[[int, Sequence[int], Sequence[int]], None] | None = None,
+    ) -> list[int]:
         function = self._module.functions[index]
         if len(arguments) != len(function.signature.params):
             raise WasmTrap(f"function {index} wants {len(function.signature.params)} argument(s)")
-        return self._run(function, [*arguments, *([0] * len(function.locals))])
+        return self._run(
+            function, [*arguments, *([0] * len(function.locals))], watch
+        )
 
-    def _run(self, function: WasmFunction, slots: list[int]) -> list[int]:
+    def _run(
+        self,
+        function: WasmFunction,
+        slots: list[int],
+        watch: Callable[[int, Sequence[int], Sequence[int]], None] | None = None,
+    ) -> list[int]:
         code = function.code
         length = len(code)
         results = len(function.signature.results)
@@ -23079,6 +23099,8 @@ class WasmMachine:
 
         while pc < length:
             opcode, immediate = code[pc]
+            if watch is not None:
+                watch(pc, stack, slots)
 
             if opcode == 0x20:                                    # local.get
                 stack.append(slots[immediate])
@@ -23480,6 +23502,68 @@ def narrate_wasm(blob: bytes) -> str:
         for address, octets, said, depth, _ in WasmNarrator(body, origin).narrate():
             lines.append(f"  {address:#08x}  {octets.hex(' '):<20}  "
                          + "  " * depth + said)
+    return "\n".join(lines) + "\n"
+
+
+def trace_wasm(blob: bytes, patience: int = 20_000) -> str:
+    """What every instruction of the module did, in the order it did it.
+
+    The same joining the three machines got: layer 20 knows what an
+    instruction means and the narrator knows what it is called, and neither on
+    its own shows a module going.  What changes here is what is worth showing.
+    A machine has registers and a wasm function has a stack, so a step says
+    what it left on top rather than which register it wrote, and the locals
+    that moved are named beside it.
+
+    It traces the one function the host is told to call, since that is the one
+    whose steps a reader is asking about; the four it calls in turn are named
+    where they are called and not stepped into.
+    """
+    module = decode_wasm(blob)
+    index = module.exports["render"][1]
+    bodies = {at: body for at, _, _, body in _wasm_bodies(blob)}
+    named: list[tuple[str, int]] = [
+        (said, depth)
+        for _, _, said, depth, _ in WasmNarrator(bodies[index], 0).narrate()
+    ]
+    machine = WasmMachine(module)
+    lines: list[str] = []
+    waiting: list[tuple[int, str, int, tuple[int, ...]]] = []
+    stopped = False
+
+    def settle(stack: Sequence[int], slots: Sequence[int]) -> None:
+        """Says what the step before this one turned out to have done."""
+        pc, said, depth, held = waiting.pop()
+        top = f"-> {stack[-1]:#x}" if stack else "-> empty"
+        moved = [
+            f"local {at} = {value:#x}"
+            for at, value in enumerate(slots)
+            if at < len(held) and held[at] != value
+        ]
+        lines.append(
+            f"  {pc:>6}  {'  ' * depth}{said:<30}{top:>14}"
+            + ("  " + ", ".join(moved) if moved else "")
+        )
+
+    def watch(pc: int, stack: Sequence[int], slots: Sequence[int]) -> None:
+        nonlocal stopped
+        if stopped:
+            return
+        if waiting:
+            settle(stack, slots)
+        if len(lines) >= patience:
+            lines.append(f"  ... and it was still going after {patience} of them")
+            stopped = True
+            return
+        said, depth = named[pc] if pc < len(named) else ("?", 0)
+        waiting.append((pc, said, depth, tuple(slots)))
+
+    answer = machine.invoke(index, (), watch)
+    if waiting and not stopped:
+        # The last step has nothing after it to be read from, so it is said
+        # with what it answered instead.
+        pc, said, depth, _ = waiting.pop()
+        lines.append(f"  {pc:>6}  {'  ' * depth}{said:<30}{f'-> {answer}':>14}")
     return "\n".join(lines) + "\n"
 
 
@@ -25278,6 +25362,9 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     wasm = parser.add_argument_group("tier 6: WebAssembly, no host but an engine")
     wasm.add_argument("--emit-wasm", metavar="PATH", help="write a reactor module")
     wasm.add_argument("--run-wasm", metavar="PATH", help="run one, reading it back here")
+    wasm.add_argument("--trace-wasm", nargs="?", type=int, const=20000,
+                      metavar="STEPS",
+                      help="run the module and say what each instruction did")
 
     boot = parser.add_argument_group("GSL-2 self-hosting bootstrap")
     boot.add_argument("--bootstrap", action="store_true")
@@ -25627,6 +25714,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if namespace.verbose:
         print(CATALOG("report.ok", ms=artifacts.elapsed_ms), file=sys.stderr)
 
+    if namespace.trace_wasm:
+        sys.stdout.write(trace_wasm(
+            wasm_module(artifacts.module), namespace.trace_wasm
+        ))
     if namespace.trace_machine:
         sys.stdout.write(trace_machine_code(
             machine_code(artifacts.module, namespace.machine),
@@ -25688,7 +25779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if backend_requested:
         return _run_backend(namespace, artifacts)
 
-    if namespace.explain or namespace.trace_machine:
+    if namespace.explain or namespace.trace_machine or namespace.trace_wasm:
         return 0
     if STREAM not in (
         namespace.emit_elf, namespace.emit_wasm, namespace.emit_boot,
