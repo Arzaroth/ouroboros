@@ -100,16 +100,29 @@ jobs:
           python ouroboros.py --machine riscv64 --emit-elf glyph-riscv64
           file glyph-riscv64 | grep -q RISC-V
 
+      - name: and each of them is a container it can read back
+        run: |
+          python -c "
+          import pathlib, ouroboros
+          for name, machine in (('glyph', ouroboros.EM_X86_64),
+                                ('glyph-aarch64', ouroboros.EM_AARCH64),
+                                ('glyph-riscv64', ouroboros.EM_RISCV)):
+              image = pathlib.Path(name).read_bytes()
+              wrong = ouroboros.elf64_complaints(image, machine)
+              assert not wrong, f'{name}: {wrong}'
+              print(f'{name}: {ouroboros.read_elf64(image).says().splitlines()[0]}')
+          "
+
       - name: a disk image for a machine with nothing underneath it
         run: |
           python ouroboros.py --emit-boot glyph.img
           file glyph.img
           python -c "
-          import pathlib
+          import pathlib, ouroboros
           image = pathlib.Path('glyph.img').read_bytes()
-          assert image[510:512] == b'\x55\xaa', 'the sector is not bootable'
-          assert len(image) % 512 == 0, 'the image is not whole sectors'
-          print(f'{len(image)} octets, {len(image)//512} sectors, signed')
+          wrong = ouroboros.disk_complaints(image)
+          assert not wrong, wrong
+          print(ouroboros.read_disk(image).says())
           "
 
       - name: a disk that loads an executable rather than being one
@@ -120,7 +133,9 @@ jobs:
           import pathlib, ouroboros
           image = pathlib.Path('glyph-kernel.img').read_bytes()
           published = pathlib.Path('glyph').read_bytes()
-          assert image[510:512] == b'\x55\xaa', 'the sector is not bootable'
+          for wrong in (ouroboros.disk_complaints(image),
+                        ouroboros.riding_complaints(image)):
+              assert not wrong, wrong
           carried = ouroboros.kernel_passenger(image, len(published))
           assert carried == published, 'the disk is carrying a different executable'
           print(f'{len(image)} octets, and what it carries is the ELF beside it')
@@ -347,14 +362,11 @@ jobs:
         run: |
           python ouroboros.py --emit-efi glyph.efi
           python -c "
-          import pathlib
+          import pathlib, ouroboros
           image = pathlib.Path('glyph.efi').read_bytes()
-          assert image[:2] == b'MZ', 'not an image'
-          pe = int.from_bytes(image[0x3c:0x40], 'little')
-          assert image[pe:pe+4] == b'PE\\x00\\x00', 'no PE signature'
-          assert int.from_bytes(image[pe+4:pe+6], 'little') == 0x8664, 'not x86-64'
-          assert int.from_bytes(image[pe+92:pe+94], 'little') == 10, 'not an application'
-          print('PE32+, x86-64, subsystem 10')
+          wrong = ouroboros.pe_complaints(image)
+          assert not wrong, wrong
+          print(ouroboros.read_pe32plus(image).says())
           "
           python -c "
           import pathlib, ouroboros
