@@ -5209,17 +5209,17 @@ class AssuranceSuite:
         handed back to the encoder that put it together, and the octets come
         back the same or one of the two has a field wrong.
         """
-        prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
         octets = 0
         try:
             for architecture in sorted(MACHINES):
                 image = machine_code(artifacts.module, architecture)
-                if reassemble_machine_code(image, architecture) != image[prologue:]:
+                text_at = read_elf64(image).text_at
+                if reassemble_machine_code(image, architecture) != image[text_at:]:
                     return CheckResult(
                         "what it says the octets are writes them again", False,
                         f"the {architecture} text came back different",
                     )
-                octets += len(image) - prologue
+                octets += len(image) - text_at
         except GlyphPlatformError as exc:
             return CheckResult(
                 "what it says the octets are writes them again", False, str(exc)
@@ -7158,12 +7158,12 @@ def _limit_survives(name: str, blob: bytes) -> str | None:
     """
     if name not in MACHINES:
         return None
-    prologue = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE * PROGRAM_HEADERS
     try:
         again = reassemble_machine_code(blob, name)
+        text_at = read_elf64(blob).text_at
     except GlyphPlatformError as exc:
         return f"what it wrote cannot be read back: {exc}"
-    if again != blob[prologue:]:
+    if again != blob[text_at:]:
         return "what it wrote does not say what it is"
     return None
 
