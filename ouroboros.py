@@ -25589,6 +25589,167 @@ def riding_complaints(image: bytes) -> tuple[str, ...]:
     return ()
 
 
+# ----------------------------------------------------------------------
+# the first sector, which is the other width
+# ----------------------------------------------------------------------
+#
+# The sector is the one piece of code here that was written and never read.
+# It is not the width anything else reads: it starts sixteen bits wide, and at
+# its own far jump it becomes sixty-four, so a reader for it is two vocabularies
+# and a note about where one stops.  Both are small, because the sector is
+# written out rather than assembled and nothing in it recurs.
+#
+# What this buys is the claim the three machines and the module already make
+# and the disk could not: that every octet of it is an instruction.  The three
+# numbers the sector states about the disk around it were found by looking for
+# the octets that carry them, which works until an immediate happens to look
+# like the instruction being searched for.  They are read off the decoding now.
+
+SEGMENT_REGISTERS: Final[Mapping[int, str]] = {0xD8: "ds", 0xC0: "es", 0xD0: "ss"}
+WORD_REGISTERS: Final[tuple[str, ...]] = (
+    "ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
+)
+CONTROL_REGISTERS: Final[Mapping[int, str]] = {0: "cr0", 3: "cr3", 4: "cr4"}
+
+
+@dataclass(frozen=True, slots=True)
+class SectorStep:
+    """One instruction of the first sector, and how wide it was read."""
+
+    at: int
+    octets: bytes
+    said: str
+    wide: bool
+    kind: str
+    values: tuple[int, ...]
+
+    @property
+    def past(self) -> int:
+        return self.at + len(self.octets)
+
+    def says(self) -> str:
+        return f"  {self.at:04x}  {self.octets.hex(' '):<23}  {self.said}"
+
+
+def _sector_step(sector: bytes, at: int, wide: bool) -> SectorStep:
+    """The one instruction at ``at``, or a refusal naming what is there.
+
+    Sixteen bits until the far jump and sixty-four after it, which changes what
+    the operand-size prefix means and nothing else that appears here.
+    """
+
+    def octets(length: int) -> bytes:
+        if at + length > len(sector):
+            raise ContainerError(f"an instruction at {at:#x} runs off the sector")
+        return sector[at : at + length]
+
+    def step(length: int, said: str, kind: str = "", *values: int) -> SectorStep:
+        return SectorStep(at, octets(length), said, wide, kind, values)
+
+    def word(where: int) -> int:
+        return int.from_bytes(octets(where + 2)[where:], "little")
+
+    def long(where: int) -> int:
+        return int.from_bytes(octets(where + 4)[where:], "little")
+
+    head = sector[at]
+    if head == 0x66:
+        second = sector[at + 1] if at + 1 < len(sector) else 0
+        if second == 0xC7 and sector[at + 2] == 0x06:
+            return step(9, f"mov dword [{word(3):#06x}], {long(5):#010x}",
+                        "store", word(3), long(5))
+        if second == 0xEA:
+            return step(8, f"jmp {word(6):#06x}:{long(2):#010x}", "far", word(6), long(2))
+        if second == 0x89 and sector[at + 2] == 0x05:
+            return step(3, "mov [di], eax")
+        if second == 0x05:
+            return step(6, f"add eax, {long(2):#010x}")
+        if second == 0x0D:
+            return step(6, f"or eax, {long(2):#010x}")
+        if second == 0x0F and sector[at + 2 : at + 4] == b"\x01\x16":
+            return step(6, f"lgdt [{word(4):#06x}]", "lgdt", word(4))
+        if 0xB8 <= second <= 0xBF:
+            name = WORD_REGISTERS[second - 0xB8]
+            if wide:
+                return step(4, f"mov {name}, {word(2):#06x}",
+                            "imm", second - 0xB8, word(2))
+            return step(6, f"mov e{name}, {long(2):#010x}",
+                        "imm", second - 0xB8, long(2))
+        raise ContainerError(f"{sector[at:at + 3].hex(' ')} at {at:#x} is not read here")
+    if head == 0x0F:
+        second = sector[at + 1]
+        if second in (0x20, 0x22):
+            which = (sector[at + 2] >> 3) & 7
+            if which not in CONTROL_REGISTERS or sector[at + 2] & 0xC7 != 0xC0:
+                raise ContainerError(f"a control register move at {at:#x} is not read here")
+            control = CONTROL_REGISTERS[which]
+            if second == 0x20:
+                return step(3, f"mov eax, {control}", "from-control", which)
+            return step(3, f"mov {control}, eax", "to-control", which)
+        if second == 0x30:
+            return step(2, "wrmsr")
+        if second == 0x32:
+            return step(2, "rdmsr")
+        raise ContainerError(f"0f {second:02x} at {at:#x} is not read here")
+    if head == 0xFA:
+        return step(1, "cli")
+    if head == 0xFC:
+        return step(1, "cld")
+    if head == 0x31 and sector[at + 1] == 0xC0:
+        return step(2, "xor ax, ax")
+    if head == 0x8E and sector[at + 1] in SEGMENT_REGISTERS:
+        return step(2, f"mov {SEGMENT_REGISTERS[sector[at + 1]]}, ax")
+    if head == 0xF3 and sector[at + 1] == 0xAB:
+        return step(2, "rep stosw")
+    if head == 0xFF and sector[at + 1] == 0xE0:
+        return step(2, "jmp rax", "leave")
+    if head == 0xCD:
+        return step(2, f"int {sector[at + 1]:#04x}", "int", sector[at + 1])
+    if head == 0xE4:
+        return step(2, f"in al, {sector[at + 1]:#04x}")
+    if head == 0xE6:
+        return step(2, f"out {sector[at + 1]:#04x}, al")
+    if head == 0x0C:
+        return step(2, f"or al, {sector[at + 1]:#04x}")
+    if head == 0xE2:
+        leap = sector[at + 1] - 256 if sector[at + 1] > 127 else sector[at + 1]
+        return step(2, f"loop {at + 2 + leap:#06x}")
+    if head == 0x83 and sector[at + 1] == 0xC7:
+        return step(3, f"add di, {sector[at + 2]:#04x}")
+    if 0xB0 <= head <= 0xB7:
+        return step(2, f"mov {'acdb'[head & 3]}{'l' if head < 0xB4 else 'h'}, "
+                       f"{sector[at + 1]:#04x}")
+    if 0xB8 <= head <= 0xBF:
+        name = WORD_REGISTERS[head - 0xB8]
+        if wide:
+            return step(5, f"mov e{name}, {long(1):#010x}",
+                        "imm", head - 0xB8, long(1))
+        return step(3, f"mov {name}, {word(1):#06x}", "imm", head - 0xB8, word(1))
+    raise ContainerError(f"{head:#04x} at {at:#x} is not an instruction this reads")
+
+
+def read_boot_code(sector: bytes) -> tuple[SectorStep, ...]:
+    """Every instruction of the first sector, in the order it is written.
+
+    It stops at the jump into the payload, because what follows that is the
+    descriptor and the table it points at, which are not instructions and are
+    checked as what they are.
+    """
+    if len(sector) < SECTOR:
+        raise ContainerError(f"{len(sector)} octets is not a sector")
+    steps: list[SectorStep] = []
+    at, wide = 0, False
+    while at < SECTOR - 2:
+        step = _sector_step(sector, at, wide)
+        steps.append(step)
+        at = step.past
+        if step.kind == "far":
+            wide = True
+        if step.kind == "leave":
+            return tuple(steps)
+    raise ContainerError("nothing in the first sector jumps to what it loaded")
+
+
 def _bent(image: bytes, *fields: tuple[int, str, int]) -> bytes:
     """The same container with one or more of its fields wrong."""
     room = bytearray(image)
