@@ -128,6 +128,9 @@ jobs:
           python -c "import ouroboros, pathlib; pathlib.Path('run.js').write_text(ouroboros.WASM_HOST_SCRIPT)"
           diff <(node run.js "dist/glyph-$safe.wasm") <(python ouroboros.py)
           file "dist/glyph-$safe.wasm"
+
+          printf '{"lines": %d}\n' "$(wc -l < ouroboros.py)" > dist/meta.json
+          cat dist/meta.json
           ls -l dist
 
       - name: Release notes from the tag itself
@@ -148,6 +151,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/ouroboros.py
+            dist/meta.json
             dist/glyph-*
             dist/glyphc-*
             dist/glyphelf-*
