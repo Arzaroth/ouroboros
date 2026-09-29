@@ -5057,6 +5057,7 @@ class AssuranceSuite:
                 self._the_module_writes_itself_again,
                 self._the_ir_agrees_with_the_interpreter,
                 self._every_container_says_what_it_is,
+                self._a_bent_container_is_said_to_be_bent,
                 self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
@@ -5306,6 +5307,32 @@ class AssuranceSuite:
         )
 
     @staticmethod
+    def _a_bent_container_is_said_to_be_bent(
+        artifacts: CompilationArtifacts,
+    ) -> CheckResult:
+        """Whether the readers above would notice a container that is wrong.
+
+        They answer nothing on every container this writes, which is either
+        because the containers are right or because the readers do not look.
+        Bending each field in turn is the only way to tell those apart.
+        """
+        try:
+            unnoticed = container_strain(artifacts.module)
+        except (GlyphPlatformError, struct.error) as exc:
+            return CheckResult(
+                "a container bent on purpose is refused", False, str(exc)
+            )
+        if unnoticed:
+            return CheckResult(
+                "a container bent on purpose is refused", False,
+                f"{len(unnoticed)} went unnoticed, the first {unnoticed[0]}",
+            )
+        return CheckResult(
+            "a container bent on purpose is refused", True,
+            f"{container_strains(artifacts.module)} of them, one field at a time",
+        )
+
+    @staticmethod
     def _every_emitter_is_reached(artifacts: CompilationArtifacts) -> CheckResult:
         """Whether anything this file builds asks for every instruction it writes.
 
@@ -5431,6 +5458,7 @@ COVERAGE_FLOORS: Final[Mapping[str, int]] = {
     "Layer 19": 88,                      # 95
     "Layer 16b: the IR read back": 85,   # 89
     "Layer 20: the module read back": 85,  # 90
+    "Layer 21b: the containers read back": 90,  # 96
     "Layer 20 exists because": 85,       # 92
     "Layer 22": 78,                      # 84
 }
@@ -25559,6 +25587,200 @@ def riding_complaints(image: bytes) -> tuple[str, ...]:
             f"ends {SECTOR + KERNEL_SPAN + length - len(image)} short of that",
         )
     return ()
+
+
+def _bent(image: bytes, *fields: tuple[int, str, int]) -> bytes:
+    """The same container with one or more of its fields wrong."""
+    room = bytearray(image)
+    for at, shape, value in fields:
+        struct.pack_into(shape, room, at, value)
+    return bytes(room)
+
+
+def _elf_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
+    """An ELF64 bent one way at a time, and what should be said about each.
+
+    Every offset is read out of the header rather than written down, so these
+    stay pointed at the fields they mean if the writer ever moves them.  Each
+    carries the words it expects back, because a bend that trips some other
+    rule as well would otherwise let the rule it aims at be deleted unnoticed.
+    """
+    container = read_elf64(image)
+    first = container.segments_at
+    second = first + container.segment_span
+    return (
+        ("a magic that is not one",
+         _bent(image, (0, "<I", 0)), "does not begin with an ELF magic"),
+        ("a class it is not",
+         _bent(image, (4, "<B", 1)), "a class other than 64-bit"),
+        ("a byte order it is not",
+         _bent(image, (5, "<B", 2)), "a byte order other than little-endian"),
+        ("an identification version it is not",
+         _bent(image, (6, "<B", 9)), "an identification version other than one"),
+        ("a type that is not an executable",
+         _bent(image, (16, "<H", 1)), "not an executable"),
+        ("an object version it is not",
+         _bent(image, (20, "<I", 2)), "object version 2"),
+        ("a header length it is not",
+         _bent(image, (52, "<H", 65)), "says it is 65 octets long"),
+        ("a program header too small to hold one",
+         _bent(image, (54, "<H", 8)), "program header of 8 octets holds nothing"),
+        ("program headers that end past the file",
+         _bent(image, (56, "<H", 4096)), "the program headers end at"),
+        ("a section table it does not have",
+         _bent(image, (40, "<Q", 64)), "carries a section table"),
+        ("a machine it is not",
+         _bent(image, (18, "<H", 0)), "the header names machine 0"),
+        ("nothing loadable in it at all",
+         _bent(image, (first, "<I", 0), (second, "<I", 0)), "nothing in it is loadable"),
+        ("more octets on disk than in memory",
+         _bent(image, (first + 40, "<Q", 1)), "of memory"),
+        ("a segment that reads past the file",
+         _bent(image, (first + 32, "<Q", len(image) * 4),
+               (first + 40, "<Q", len(image) * 4)), "of a file"),
+        ("a segment the alignment forbids",
+         _bent(image, (first + 16, "<Q", IMAGE_BASE + 1),
+               (first + 24, "<Q", IMAGE_BASE + 1)), "which no loader can do"),
+        ("two addresses for one segment",
+         _bent(image, (first + 24, "<Q", IMAGE_BASE * 2)),
+         "asks for two different addresses"),
+        ("a text segment that is writable too",
+         _bent(image, (first + 4, "<I", 7)), "both writable and executable"),
+        ("two segments wanting the same addresses",
+         _bent(image, (second + 16, "<Q", IMAGE_BASE), (second + 24, "<Q", IMAGE_BASE)),
+         "want the same addresses"),
+        ("a text segment nothing may run",
+         _bent(image, (first + 4, "<I", 4)), "a segment nothing may run"),
+        ("an entry one octet along",
+         _bent(image, (24, "<Q", container.entry + 1)), "the headers end at"),
+        ("an entry nothing loads",
+         _bent(image, (24, "<Q", 1 << 40)), "nothing loadable holds the entry"),
+    )
+
+
+def _pe_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
+    """The application bent one way at a time, and what each should be told."""
+    (headers_at,) = struct.unpack_from("<I", image, 0x3C)
+    optional = headers_at + 24
+    (span,) = struct.unpack_from("<H", image, headers_at + 20)
+    table = optional + span
+    (offset,) = struct.unpack_from("<I", image, table + 20)
+    return (
+        ("no stub at all", _bent(image, (0, "<H", 0)), "does not begin with a DOS stub"),
+        ("a stub pointing past the file",
+         _bent(image, (0x3C, "<I", len(image) * 4)), "past the file"),
+        ("a stub pointing at nothing in particular",
+         _bent(image, (0x3C, "<I", 0x80)), "says it is a PE header"),
+        ("an optional header too small to hold one",
+         _bent(image, (headers_at + 20, "<H", 16)), "holds nothing"),
+        ("an optional header that is not PE32+",
+         _bent(image, (optional, "<H", 0x10B)), "and not PE32+"),
+        ("no sections at all",
+         _bent(image, (headers_at + 6, "<H", 0)), "names no sections at all"),
+        ("a machine it is not",
+         _bent(image, (headers_at + 4, "<H", 0x014C)), "the header names machine"),
+        ("a subsystem it is not",
+         _bent(image, (optional + 68, "<H", 11)), "names subsystem 11"),
+        ("fewer directories than there are",
+         _bent(image, (optional + 108, "<I", 8)), "data directories, not 16"),
+        ("alignments the wrong way round",
+         _bent(image, (optional + 32, "<I", 0x100)), "which is the wrong way round"),
+        ("headers the file alignment forbids",
+         _bent(image, (optional + 60, "<I", 0x100)), "the headers span"),
+        ("a section starting off the file alignment",
+         _bent(image, (table + 20, "<I", 0x300)), "in the file"),
+        ("a section mapped off the section alignment",
+         _bent(image, (table + 12, "<I", 0x900), (optional + 20, "<I", 0x900)),
+         "maps at 0x900"),
+        ("a section that reads past the file",
+         _bent(image, (table + 16, "<I", len(image) - offset + 1)), "of a file"),
+        ("a section inside the headers",
+         _bent(image, (table + 20, "<I", 0)), "starts inside the headers"),
+        ("less mapped than the sections reach",
+         _bent(image, (optional + 56, "<I", 0x1000)), "its sections reach"),
+        ("a span the section alignment forbids",
+         _bent(image, (optional + 56, "<I", 0x2001)), "which the section alignment forbids"),
+        ("an entry no section holds",
+         _bent(image, (optional + 16, "<I", 1 << 24)), "no section holds the entry"),
+        ("an entry in a section nothing may run",
+         _bent(image, (table + 36, "<I", 0x4000_0040)), "a section nothing may run"),
+        ("code said to be somewhere else",
+         _bent(image, (optional + 20, "<I", 1 << 20)), "it says its code is at"),
+    )
+
+
+def _disk_strains(image: bytes) -> tuple[tuple[str, bytes, str], ...]:
+    """The disk bent one way at a time, and what each should be told."""
+    disk = read_disk(image)
+    asking = image.find(b"\xb8") + 1
+    descriptor = disk.table_at - 6
+    return (
+        ("a first sector that is not the whole of one",
+         image[: SECTOR - 1], "not a disk with anything on it"),
+        ("a length that is not whole sectors",
+         image + b"\x00", "not a whole number of sectors"),
+        ("no signature at the end of the sector",
+         _bent(image, (SECTOR - 2, "<H", 0)), "does not end in a boot signature"),
+        ("nothing asking a drive to read",
+         _bent(image, (asking + 1, "<B", 0)), "asks a drive to read"),
+        ("a read of no sectors",
+         _bent(image, (asking, "<B", 0)), "asks for no sectors at all"),
+        ("a read of more sectors than there are",
+         _bent(image, (asking, "<B", disk.sectors + 4)), "after the first and the disk"),
+        ("a read of one sector",
+         _bent(image, (asking, "<B", 1)), "were written"),
+        ("a descriptor table off the sector",
+         _bent(image, (image.find(b"\x66\x0f\x01\x16") + 4, "<H", 0x9000)),
+         "off the sector"),
+        ("a descriptor table of part of an entry",
+         _bent(image, (descriptor, "<H", disk.table_span - 2)), "not whole entries"),
+        ("a descriptor table over the signature",
+         _bent(image, (descriptor + 2, "<I", BOOT_BASE + SECTOR - 8)),
+         "does not fit before the signature"),
+        ("a descriptor table with no null entry",
+         _bent(image, (disk.table_at, "<Q", 1)), "does not begin with a null entry"),
+        ("long mode entered off the sector",
+         _bent(image, (image.find(b"\x66\xea") + 2, "<I", 0x9000)),
+         "it enters sixty-four bits at"),
+    )
+
+
+def container_strains(module: ObjectModule) -> int:
+    """How many ways of bending a container there are to be noticed."""
+    return sum(
+        len(strains) for strains in (
+            _elf_strains(machine_code(module, "x86-64")),
+            _pe_strains(efi_image(module)),
+            _disk_strains(boot_image(module)),
+        )
+    )
+
+
+def container_strain(module: ObjectModule) -> tuple[str, ...]:
+    """Every way of bending a container that went unnoticed, or nothing.
+
+    The readers above answer nothing about every container this file writes,
+    which is either because the containers are right or because the readers do
+    not look.  Bending one field at a time is the only way to tell those apart,
+    and each bend says which words it expects back, so a rule cannot be deleted
+    and left covered by whichever neighbour happens to fire as well.
+    """
+    unnoticed: list[str] = []
+    elf = machine_code(module, "x86-64")
+    application = efi_image(module)
+    payload = BootCodeBackend(module).encode()
+    disk = boot_image(module)
+    wanted = -(-len(payload) // SECTOR)
+    asked: tuple[tuple[str, tuple[tuple[str, bytes, str], ...], Callable[[bytes], tuple[str, ...]]], ...] = (
+        ("an executable", _elf_strains(elf), lambda b: elf64_complaints(b, EM_X86_64)),
+        ("an application", _pe_strains(application), pe_complaints),
+        ("a disk", _disk_strains(disk), lambda b: disk_complaints(b, wanted)),
+    )
+    for article, strains, ask in asked:
+        for what, bent, expected in strains:
+            if not any(expected in one for one in ask(bent)):
+                unnoticed.append(f"{article} with {what}")
+    return tuple(unnoticed)
 
 
 def _every_container(
