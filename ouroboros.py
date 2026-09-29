@@ -5056,6 +5056,7 @@ class AssuranceSuite:
                 self._narration_writes_it_again,
                 self._the_module_writes_itself_again,
                 self._the_ir_agrees_with_the_interpreter,
+                self._every_container_says_what_it_is,
                 self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
@@ -5280,6 +5281,31 @@ class AssuranceSuite:
         )
 
     @staticmethod
+    def _every_container_says_what_it_is(
+        artifacts: CompilationArtifacts,
+    ) -> CheckResult:
+        """Whether the outermost thing this writes is coherent about itself.
+
+        The readers here share no constant with the writers: the entry is found
+        through the headers, and every span is measured against the length of
+        the file it says it is inside.  What a loader would refuse, this says
+        before a loader is asked.
+        """
+        try:
+            containers = _every_container(artifacts.module)
+        except GlyphPlatformError as exc:
+            return CheckResult("every container says what it is", False, str(exc))
+        for name, _, _, said in containers:
+            if said:
+                return CheckResult(
+                    "every container says what it is", False, f"the {name}: {said[0]}"
+                )
+        return CheckResult(
+            "every container says what it is", True,
+            f"{len(containers)} of them, read back through their own headers",
+        )
+
+    @staticmethod
     def _every_emitter_is_reached(artifacts: CompilationArtifacts) -> CheckResult:
         """Whether anything this file builds asks for every instruction it writes.
 
@@ -5464,6 +5490,7 @@ COVERAGE_EXERCISES: Final[tuple[tuple[str, ...], ...]] = (
     ("--close-the-toolchain",),
     ("-n", "5", "--explain"),
     ("-n", "5", "--explain", "wasm"),
+    ("-n", "5", "--explain", "container"),
     ("-n", "5", "--trace-machine"),
     ("-n", "5", "--machine", "aarch64", "--emit-machine-code"),
     ("-n", "5", "--machine", "riscv64", "--emit-machine-code"),
@@ -25534,6 +25561,75 @@ def riding_complaints(image: bytes) -> tuple[str, ...]:
     return ()
 
 
+def _every_container(
+    module: ObjectModule,
+) -> tuple[tuple[str, str, bytes, tuple[str, ...]], ...]:
+    """Every outermost thing this file writes, and what is wrong with each.
+
+    One inventory, because the check and the narrator asking different
+    questions of different lists is how a container stops being looked at.
+    """
+    found: list[tuple[str, str, bytes, tuple[str, ...]]] = []
+    for architecture in sorted(MACHINES):
+        image = machine_code(module, architecture)
+        found.append((
+            architecture, "elf", image,
+            elf64_complaints(image, MACHINES[architecture][1]),
+        ))
+    arm = arm_boot_image(module)
+    found.append(("arm boot", "elf", arm, elf64_complaints(arm, EM_AARCH64)))
+    # The third board has no container on purpose: its reset vector goes to the
+    # first octet of memory whatever is there, so a header in front of the text
+    # is an instruction as far as it is concerned.
+    third = riscv_boot_image(module)
+    found.append((
+        "riscv boot", "text", third,
+        () if third[:4] != b"\x7fELF" else
+        ("this board would run the header as though it were an instruction",),
+    ))
+    application = efi_image(module)
+    found.append(("efi", "pe", application, pe_complaints(application)))
+    payload = BootCodeBackend(module).encode()
+    boot = boot_image(module)
+    found.append(
+        ("boot disk", "disk", boot,
+         disk_complaints(boot, -(-len(payload) // SECTOR)))
+    )
+    disk = kernel_image(module)
+    found.append(("kernel disk", "disk", disk, disk_complaints(disk)))
+    found.append(
+        ("its passenger", "elf", disk[SECTOR + KERNEL_SPAN :], riding_complaints(disk))
+    )
+    return tuple(found)
+
+
+def narrate_containers(module: ObjectModule) -> str:
+    """What each container this file writes says it is, and what is wrong.
+
+    Every one of them is read back through its own headers, so what is printed
+    is what a loader would find rather than what the writer meant.
+    """
+    readers: Mapping[str, Callable[[bytes], Any]] = {
+        "elf": read_elf64, "pe": read_pe32plus, "disk": read_disk,
+    }
+    lines: list[str] = []
+    for name, kind, image, said in _every_container(module):
+        lines.append(f"--- {name} ---")
+        if kind == "text":
+            lines.append(
+                f"{len(image)} octets of instructions and no container at all"
+            )
+        else:
+            try:
+                lines.append(readers[kind](image).says())
+            except ContainerError as exc:
+                lines.append(f"  unreadable: {exc}")
+        lines.extend(f"  wrong: {one}" for one in said)
+        if not said:
+            lines.append("  nothing wrong with it")
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------------
 # layer 15c: whether the checks would notice
 # ----------------------------------------------------------------------
@@ -26545,9 +26641,10 @@ def _parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     machine.add_argument("--emit-elf", metavar="PATH", help="write a static ELF64 executable")
     machine.add_argument("--emit-machine-code", action="store_true")
     machine.add_argument("--explain", nargs="?", const="machine",
-                         choices=("machine", "wasm"),
+                         choices=("machine", "wasm", "container"),
                          help="say what every instruction is, of the text or "
-                              "of the module")
+                              "of the module; or what every container it "
+                              "writes says it is")
     machine.add_argument("--trace-machine", nargs="?", type=int, const=20000,
                          metavar="STEPS",
                          help="run the text and say what each instruction did")
@@ -26947,6 +27044,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ))
     if namespace.explain == "wasm":
         sys.stdout.write(narrate_wasm(wasm_module(artifacts.module)))
+    elif namespace.explain == "container":
+        print(narrate_containers(artifacts.module))
     elif namespace.explain:
         sys.stdout.write(narrate_machine_code(
             machine_code(artifacts.module, namespace.machine), namespace.machine
