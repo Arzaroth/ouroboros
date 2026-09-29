@@ -136,19 +136,22 @@ jobs:
       - name: Release notes from the tag itself
         env:
           REF_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git tag -l --format='%(contents)' "$REF_NAME" > release-notes.md
           if [[ ! -s release-notes.md ]]; then
             echo "::warning::$REF_NAME carries no message - falling back to generated notes."
-            : > release-notes.md
           fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$REF_NAME" -q .body >> release-notes.md
+          printf '\nLOC: %d\n' "$(wc -l < ouroboros.py)" >> release-notes.md
+          cat release-notes.md
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           body_path: release-notes.md
-          generate_release_notes: true
           files: |
             dist/ouroboros.py
             dist/meta.json
