@@ -25750,6 +25750,143 @@ def read_boot_code(sector: bytes) -> tuple[SectorStep, ...]:
     raise ContainerError("nothing in the first sector jumps to what it loaded")
 
 
+BIOS_DISK_READ: Final[int] = 0x02
+REGISTER_AX: Final[int] = 0
+REGISTER_BX: Final[int] = 3
+
+
+@dataclass(frozen=True, slots=True)
+class BootCode:
+    """What the instructions of the first sector say they are doing."""
+
+    steps: tuple[SectorStep, ...]
+    service: int
+    asked: int
+    buffer: int
+    entered: int
+    table_at: int
+    selectors: tuple[int, ...]
+    paging_at: int
+    jumped_to: int
+    cleared: tuple[int, int]
+    filled: tuple[int, ...]
+
+    @property
+    def span(self) -> int:
+        return self.steps[-1].past
+
+    def says(self) -> str:
+        return "\n".join(step.says() for step in self.steps)
+
+
+def read_boot_code_plan(sector: bytes) -> BootCode:
+    """The instructions above, read for what they say about each other.
+
+    Every number here is one instruction telling another where to look: what
+    the drive is asked for and where it is put, what is jumped to at the end,
+    where the descriptor is, which table paging is turned on with.  Checking
+    them against each other is the whole point of decoding the sector rather
+    than searching it.
+    """
+    steps = read_boot_code(sector)
+    said: dict[int, int] = {}
+    service = asked = buffer = entered = table_at = paging_at = jumped_to = -1
+    cleared = (-1, -1)
+    filled: list[int] = []
+    selectors: list[int] = []
+    wide = False
+    for step in steps:
+        if step.kind == "imm":
+            said[step.values[0]] = step.values[1]
+        elif step.kind == "int" and step.values[0] == BIOS_READ:
+            service, asked = said.get(REGISTER_AX, -1) >> 8, said.get(REGISTER_AX, -1) & 0xFF
+            buffer = said.get(REGISTER_BX, -1)
+        elif step.kind == "store":
+            filled.append(step.values[0])
+        elif step.kind == "lgdt":
+            table_at = step.values[0]
+        elif step.kind == "to-control" and step.values[0] == 3:
+            paging_at = said.get(REGISTER_AX, -1)
+        elif step.kind == "far":
+            selectors.append(step.values[0])
+            entered = step.values[1]
+            wide = True
+        elif step.kind == "leave":
+            jumped_to = said.get(REGISTER_AX, -1)
+        if step.said == "rep stosw":
+            cleared = (said.get(7, -1), said.get(1, -1) * 2)
+        if wide and step.kind == "imm" and step.values[0] == REGISTER_AX and jumped_to < 0:
+            if step.values[1] not in selectors and step.values[1] < 0x100:
+                selectors.append(step.values[1])
+    return BootCode(
+        steps, service, asked, buffer, entered, table_at, tuple(selectors),
+        paging_at, jumped_to, cleared, tuple(filled),
+    )
+
+
+def boot_code_complaints(
+    sector: bytes, payload_sectors: int | None = None, table_span: int | None = None
+) -> tuple[str, ...]:
+    """Everything the first sector's instructions disagree with, or nothing."""
+    try:
+        plan = read_boot_code_plan(sector)
+    except ContainerError as exc:
+        return (str(exc),)
+    said: list[str] = []
+    if plan.service != BIOS_DISK_READ:
+        said.append(f"it asks the disk service for {plan.service:#04x} and not a read")
+    if plan.asked < 1:
+        said.append("it asks the drive for no sectors")
+    if payload_sectors is not None and plan.asked != payload_sectors:
+        said.append(
+            f"it asks the drive for {plan.asked} sector(s) and {payload_sectors} "
+            "were written"
+        )
+    if plan.buffer != plan.jumped_to:
+        said.append(
+            f"it reads the disk to {plan.buffer:#x} and goes to {plan.jumped_to:#x}"
+        )
+    if plan.table_at - BOOT_BASE != plan.span:
+        said.append(
+            f"it loads a descriptor from {plan.table_at:#x} and its instructions "
+            f"stop at {BOOT_BASE + plan.span:#x}"
+        )
+    after = next(
+        (step.at for step in plan.steps if step.kind == "far"), None
+    )
+    if after is None:
+        said.append("nothing in it goes to sixty-four bits")
+    else:
+        landing = next(step.at for step in plan.steps if step.at > after)
+        if plan.entered - BOOT_BASE != landing:
+            said.append(
+                f"it enters sixty-four bits at {plan.entered:#x} and the "
+                f"instruction after it is at {BOOT_BASE + landing:#x}"
+            )
+    if plan.paging_at not in plan.filled:
+        said.append(
+            f"it turns paging on with {plan.paging_at:#x} and wrote no table there"
+        )
+    floor, span = plan.cleared
+    if floor < 0:
+        said.append("it fills tables it never cleared")
+    else:
+        for where in plan.filled:
+            if not floor <= where < floor + span:
+                said.append(
+                    f"it writes a table at {where:#x}, outside the {span:#x} "
+                    f"octets it cleared at {floor:#x}"
+                )
+    for selector in plan.selectors:
+        if selector % GDT_ENTRY:
+            said.append(f"it uses selector {selector:#x}, which is not an entry")
+        elif table_span is not None and selector >= table_span:
+            said.append(
+                f"it uses selector {selector:#x} of a table {table_span} octets long"
+            )
+    return tuple(said)
+
+
 def _bent(image: bytes, *fields: tuple[int, str, int]) -> bytes:
     """The same container with one or more of its fields wrong."""
     room = bytearray(image)
