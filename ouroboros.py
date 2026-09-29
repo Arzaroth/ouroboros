@@ -8594,6 +8594,13 @@ var RSP = 4;
 var RBP = 5;
 
 var TEXT_LIMIT = 339824;
+# How many values one function may have at once.  The number is not this
+# machine's to choose: a displacement here is thirty-two bits and would hold
+# any of them, but the four compilers for this language have to refuse the
+# same programs, and the one that reaches least far decides.  That is the
+# second machine, whose scaled offset stops at four thousand and thirty-one.
+var MOST_VALUES = 3000;
+
 var MAXFN = 4096;
 var LABEL_LIMIT = 40000;
 var FIX_LIMIT = 40000;
@@ -9204,7 +9211,7 @@ fn patch32(site, value) {
 
 fn new_reg() {
   regcnt = regcnt + 1;
-  if (regcnt >= 8192) {
+  if (regcnt >= MOST_VALUES) {
     fail("too many values at once in one function");
   }
   mem[SEEN + regcnt - 1] = 0;
@@ -16886,7 +16893,11 @@ def _stage0_reset() -> None:
 # is the only thing keeping it honest.
 
 GSL2_FRAME_SLOTS: Final[int] = 64
-GSL2_MOST_VALUES: Final[int] = 8192
+# The same number the three tails refuse at.  It was eight thousand here and
+# in the tail for this machine, and three thousand in the other two, so a
+# function with four thousand values compiled twice and was refused twice:
+# four compilers, and not one language between them.
+GSL2_MOST_VALUES: Final[int] = 3000
 GSL2_MEMORY_AT: Final[int] = 6291456
 GSL2_GLOBALS_AT: Final[int] = 22291456
 GSL2_OUT_AT: Final[int] = 22293504
