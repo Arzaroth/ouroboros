@@ -5372,7 +5372,7 @@ def synthesize_source(
 # the ones where being wrong is loud, or where there is nothing to measure -
 # this layer does not measure itself.
 COVERAGE_FLOORS: Final[Mapping[str, int]] = {
-    "Layer 16": 85,                     # reaches 91
+    "Layer 16: ": 85,                  # reaches 91
     "Layer 18 drops the toolchain": 85,  # 92
     "layer 18 once more": 90,            # 96
     "Layer 19": 88,                      # 95
