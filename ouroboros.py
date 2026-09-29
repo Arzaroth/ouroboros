@@ -5058,6 +5058,7 @@ class AssuranceSuite:
                 self._the_ir_agrees_with_the_interpreter,
                 self._every_container_says_what_it_is,
                 self._a_bent_container_is_said_to_be_bent,
+                self._every_octet_of_the_sector_is_spent,
                 self._every_emitter_is_reached,
                 self._forms_answer_to_grammar,
                 self._coordinate_flyweight,
@@ -5330,6 +5331,36 @@ class AssuranceSuite:
         return CheckResult(
             "a container bent on purpose is refused", True,
             f"{container_strains(artifacts.module)} of them, one field at a time",
+        )
+
+    @staticmethod
+    def _every_octet_of_the_sector_is_spent(
+        artifacts: CompilationArtifacts,
+    ) -> CheckResult:
+        """Whether the first sector is instructions all the way to its table.
+
+        The claim the three machines and the module make about their texts, of
+        the one piece of code here that is the other width.  It starts sixteen
+        bits wide and becomes sixty-four at its own far jump, and the octets it
+        does not spend on instructions are the descriptor, the table it points
+        at, and nothing.
+        """
+        try:
+            spent = sector_accounting(boot_image(artifacts.module))
+        except (GlyphPlatformError, struct.error) as exc:
+            return CheckResult(
+                "every octet of the first sector is spent", False, str(exc)
+            )
+        code, descriptor, table, blank, signature = spent
+        if descriptor != 6:
+            return CheckResult(
+                "every octet of the first sector is spent", False,
+                f"{descriptor} octets between its instructions and its table",
+            )
+        return CheckResult(
+            "every octet of the first sector is spent", sum(spent) == SECTOR,
+            f"{code} of instructions, {descriptor} of descriptor, {table} of "
+            f"table, {blank} of nothing, {signature} of signature",
         )
 
     @staticmethod
@@ -26061,6 +26092,20 @@ def container_strain(module: ObjectModule) -> tuple[str, ...]:
     return tuple(unnoticed)
 
 
+def sector_accounting(image: bytes) -> tuple[int, int, int, int, int]:
+    """How the five hundred and twelve octets of a first sector are spent.
+
+    Instructions, the descriptor that names the table, the table, the nothing
+    after it, and the signature.  A sector where those do not come to a sector
+    is one with something in it nobody here put there.
+    """
+    disk = read_disk(image)
+    code = read_boot_code(image[:SECTOR])[-1].past
+    descriptor = disk.table_at - code
+    blank = SECTOR - 2 - disk.table_at - disk.table_span
+    return code, descriptor, disk.table_span, blank, 2
+
+
 def _every_container(
     module: ObjectModule,
 ) -> tuple[tuple[str, str, bytes, tuple[str, ...]], ...]:
@@ -26122,6 +26167,14 @@ def narrate_containers(module: ObjectModule) -> str:
         else:
             try:
                 lines.append(readers[kind](image).says())
+                if kind == "disk":
+                    code, descriptor, table, blank, mark = sector_accounting(image)
+                    lines.append(read_boot_code_plan(image[:SECTOR]).says())
+                    lines.append(
+                        f"  {code} octets of instructions, {descriptor} of "
+                        f"descriptor, {table} of table, {blank} of nothing, "
+                        f"{mark} of signature"
+                    )
             except ContainerError as exc:
                 lines.append(f"  unreadable: {exc}")
         lines.extend(f"  wrong: {one}" for one in said)
