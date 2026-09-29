@@ -24569,10 +24569,17 @@ symmetry cyclic 4 about centroid ;
 let u = apothem ;
 let v = ( ( u * 3 ) / 2 ) ;
 let w = ( - v + u ) ;
+let n = ( - u - 1 ) ;
+let q = ( n / 2 ) ;
+let r = ( n / 3 ) ;
 stroke s0 = column at u span zero .. ( u * 2 ) ;
 stroke s1 = row at v span zero .. ( u + w ) ;
+stroke s2 = column at ( u + q ) span zero .. ( u * 2 ) ;
+stroke s3 = row at ( u + r ) span zero .. ( u * 2 ) ;
 emit s0 ;
 emit s1 ;
+emit s2 ;
+emit s3 ;
 """
 
 
